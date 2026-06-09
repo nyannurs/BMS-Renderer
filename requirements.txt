@@ -1,0 +1,6 @@
+soundfile
+numpy
+mutagen
+Pillow
+scipy
+sounddevice

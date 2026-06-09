@@ -4,11 +4,6 @@
 
 ---
 
-
-<img width="1655" height="1037" alt="image" src="https://github.com/user-attachments/assets/bc78ae79-0275-46fa-a3b2-8a61298145a5" />
-
-
-
 ## 1. Introduction
 
 BMS Renderer is a Windows desktop app for turning BMS charts (beatmania IIDX–style
