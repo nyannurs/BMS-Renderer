@@ -1,0 +1,7 @@
+{
+  "library": "B:/BMSDB/BeMusicSeeker difficulty tables BMS PACK ver.260501",
+  "output": "Z:/Programs/vibe coded artifacts/bms-renderer-flac/Render",
+  "render_threads": 8,
+  "same_song_threshold": 0.95,
+  "window_geometry": "1879x1055+469+200"
+}

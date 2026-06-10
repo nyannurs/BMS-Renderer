@@ -182,8 +182,11 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "1.6.6"
+APP_VERSION = "1.6.7"
 CHANGELOG = [
+    ("1.6.7", "Discovery: hovering anywhere on a tile (including the art) now "
+              "triggers the title marquee, and moving within a tile no longer "
+              "restarts it."),
     ("1.6.6", "Discovery: fixed the artist line being clipped -- tiles are now tall "
               "enough to fit the art and both text lines, with a gap between rows."),
     ("1.6.5", "Discovery: added vertical spacing between rows so artist names no "

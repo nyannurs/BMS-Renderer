@@ -1392,13 +1392,13 @@ class App(tk.Tk):
         a_lbl = tk.Label(tile, anchor="center", fg="#777", width=1)
         a_lbl.grid(row=2, column=0, sticky="ew")
         t = {"frame": tile, "art": art, "title": t_lbl, "artist": a_lbl,
-             "idx": None, "win": None}
+             "idx": None, "win": None, "hover": 0}
         for w in (tile, art, t_lbl, a_lbl):
             w.bind("<Button-1>", lambda e, t=t: self._disc_click(t))
             w.bind("<Double-Button-1>", lambda e, t=t: self._disc_dblclick(t))
             w.bind("<Button-3>", lambda e, t=t: self._disc_menu(e, t))
-        t_lbl.bind("<Enter>", lambda e, t=t: self._disc_hover(t, True))
-        t_lbl.bind("<Leave>", lambda e, t=t: self._disc_hover(t, False))
+            w.bind("<Enter>", lambda e, t=t: self._disc_hover(t, True))
+            w.bind("<Leave>", lambda e, t=t: self._disc_hover(t, False))
         return t
 
     def _disc_redraw(self):
@@ -1440,6 +1440,7 @@ class App(tk.Tk):
         t["idx"] = idx
         rep, charts = self._disc_order[idx]
         full = rep["title"] or "(unknown)"
+        self._marquee_stop(t["title"], full, None)   # clear any marquee from prior song
         t["title"].config(text=self._ellipsize(full, 22))
         t["_fulltitle"] = full
         t["artist"].config(text=self._ellipsize(rep["artist"] or "", 24))
@@ -1453,10 +1454,23 @@ class App(tk.Tk):
 
     def _disc_hover(self, t, entering):
         full = t.get("_fulltitle", "")
-        if entering and len(full) > 22:
-            self._marquee_start(t["title"], full, 22)
+        if len(full) <= 22:
+            return
+        if entering:
+            # cancel any pending stop from crossing between the tile's children
+            pend = t.get("_hover_stop")
+            if pend:
+                try: self.after_cancel(pend)
+                except Exception: pass
+                t["_hover_stop"] = None
+            if not getattr(t["title"], "_marquee_job", None):
+                self._marquee_start(t["title"], full, 22)
         else:
-            self._marquee_stop(t["title"], full, 22)
+            # defer the stop briefly; a re-Enter on a sibling widget cancels it
+            def stop():
+                t["_hover_stop"] = None
+                self._marquee_stop(t["title"], full, 22)
+            t["_hover_stop"] = self.after(60, stop)
 
     @staticmethod
     def _ellipsize(s, n):
