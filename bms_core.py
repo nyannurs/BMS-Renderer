@@ -52,6 +52,67 @@ def list_folder_images(folder, include_bmp=False):
             out.append(full)
     return out
 
+def read_stagefile(bms_path):
+    """Quickly scan a chart's header for #STAGEFILE and return the filename
+    (as written in the chart) or None."""
+    try:
+        text = read_bms_text(bms_path)
+    except Exception:
+        return None
+    for line in text.splitlines():
+        ls = line.strip()
+        if ls.upper().startswith("#STAGEFILE"):
+            val = ls[len("#STAGEFILE"):].strip()
+            return val or None
+    return None
+
+def pick_playable_chart(charts, lo=100, hi=500):
+    """Pick a chart for casual playback from a song's chart list (dicts with a
+    'notes' field): prefer the lowest notecount within [lo, hi]; if none, expand
+    the upper range (lowest notecount >= lo); if nothing reaches lo, fall back to
+    the chart with the most notes. Returns None for an empty list."""
+    if not charts:
+        return None
+    def n(c):
+        try:
+            return int(float(c.get("notes") or 0))
+        except (TypeError, ValueError):
+            return 0
+    in_range = [c for c in charts if lo <= n(c) <= hi]
+    if in_range:
+        return min(in_range, key=n)
+    above = [c for c in charts if n(c) >= lo]
+    if above:
+        return min(above, key=n)        # expand upper range: smallest >= lo
+    return max(charts, key=n)           # everything is tiny -- take the biggest
+
+def pick_discovery_art(bms_path, rng=None):
+    """Choose an image to represent a song for the Discovery grid.
+    Fallback chain: the chart's #STAGEFILE if that file exists -> a random
+    non-.bmp image in the folder -> a random .bmp (BGA frame). Returns a path
+    or None if the folder has no images at all."""
+    import random as _random
+    rng = rng or _random
+    folder = os.path.dirname(bms_path)
+    stage = read_stagefile(bms_path)
+    if stage:
+        cand = os.path.normpath(os.path.join(folder, stage))
+        if os.path.isfile(cand):
+            return cand
+        # charts often name a stagefile with the wrong extension -- try swaps
+        base = os.path.splitext(cand)[0]
+        for ext in IMAGE_EXTS:
+            if os.path.isfile(base + ext):
+                return base + ext
+    nonbmp = list_folder_images(folder, include_bmp=False)
+    if nonbmp:
+        return rng.choice(nonbmp)
+    bmps = [p for p in list_folder_images(folder, include_bmp=True)
+            if p.lower().endswith(".bmp")]
+    if bmps:
+        return rng.choice(bmps)
+    return None
+
 # Embedded window icon (64px PNG, base64). No external file needed.
 _ICON_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAF/klEQVR4nO2bXW9URRjHfzPnbLdb"
@@ -121,228 +182,39 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.6.6"
 CHANGELOG = [
-    ("1.5.4", "Fixed a serious bug where adding a song to the queue from the Playlists "
-              "tab could queue the WRONG song (whatever was selected over on the "
-              "Library tab) — the add-to-queue action now always uses the song you "
-              "actually right-clicked. Also fixed the song art resetting to the first "
-              "image when you right-click a song to queue it: right-clicking the "
-              "already-selected row no longer reloads the picker."),
-    ("1.5.3", "Fixed the song folder art selection being lost when adding a song to "
-              "the queue: the image you've scrolled to in the picker is now carried "
-              "over as that song's cover when you queue it, instead of resetting to "
-              "the first image."),
-    ("1.5.2", "Selecting a song in the Custom Playlists tab now updates the right-"
-              "hand panels (BMS information, tags preview, and the song folder art "
-              "picker) like the other tabs do — previously the playlist tab had no "
-              "selection handler, so those panels (including album art) didn't "
-              "respond there."),
-    ("1.5.1", "Fixed column-header sorting in the Custom Playlists and Tables tabs — "
-              "the headers weren't wired up before (clicking them did nothing). "
-              "Click a header to sort; click again to reverse. In Tables, songs sort "
-              "within each level group (the level grouping is preserved)."),
-    ("1.5.0", "You can now click and hold the ◀ ▶ art arrows to speed through a "
-              "folder's images — a single click still steps one at a time, but "
-              "holding ramps up and races through them (handy for folders with "
-              "hundreds of BGA frames)."),
-    ("1.4.2", "Fixed the art-picker buttons still shifting as you scrolled images: "
-              "the arrows now sit in a fixed-size centered group and the status line "
-              "(with the filename) can no longer change the panel width. Long "
-              "filenames are shortened in the status display."),
-    ("1.4.1", "Internal cleanup: removed code left orphaned by recent reworks (a "
-              "duplicate art-reload method, an unused helper, and two dead "
-              "constants) and cached the blank art-preview image instead of "
-              "rebuilding it each time. No behavior changes."),
-    ("1.4.0", "BMS information fields are now selectable/copyable (read-only text "
-              "boxes, like the library/output paths) so you can copy a title, MD5, "
-              "etc. Added a 'Go to #' box to the song folder art picker: type an "
-              "image number and press Enter to jump straight to it, handy for folders "
-              "with lots of pictures."),
-    ("1.3.3", "Song folder art preview is now a fixed 1:1 square (images are scaled "
-              "and letterboxed to fit), so the ◀ ▶ buttons no longer jump around as "
-              "you scroll through differently-sized images. You can now scroll the "
-              "preview with the arrows on any tab, not just the Queue."),
-    ("1.3.2", "The song folder art preview now shows on every tab (Library, Tables, "
-              "Queue, playlists), so you can always see a song's folder images — "
-              "previously it only worked on the Queue and looked empty everywhere "
-              "else. Default window size 1600x1000."),
-    ("1.3.0", "New per-song art picker (between BMS information and the whole-queue "
-              "album art): for a queued song, scroll through the images in that "
-              "song's own folder with ◀ ▶ and whatever's shown becomes its cover. "
-              "Has an 'ignore .bmp' toggle (on by default, to skip BGA frame-bmps). "
-              "Global whole-queue art still wins when set; the per-song picker is "
-              "only used when there's no global art."),
-    ("1.2.2", "Hid the console window that briefly flashed when ffmpeg ran (OGG / "
-              "level-8 FLAC encoding) — no more black boxes popping up during a "
-              "render."),
-    ("1.2.1", "The custom window icon is now embedded directly in the program (no "
-              "icon file needed in the folder)."),
-    ("1.2.0", "Custom window/taskbar icon (replaces the default Tk feather). The app "
-              "loads bms_icon.ico / bms_icon.png from its own folder; if they're "
-              "missing it just falls back to the default with no error."),
-    ("1.1.0", "Multi-select: select several charts in the Library (Ctrl/Shift-click) "
-              "and right-click → Add to Queue, or use the 'Add selected to Queue' "
-              "button, to queue them all at once (duplicates skipped). Right-clicking "
-              "keeps your multi-selection instead of collapsing it to one row."),
-    ("1.0.0", "First stable release. Packaged as a standalone Windows .exe (no Python "
-              "install needed) via PyInstaller. Core functionality and full feature "
-              "set verified through a manual test pass plus the automated suite. "
-              "Everything from the 0.x line — library, queue, difficulty tables, "
-              "portable playlists, tagged FLAC/WAV/OGG export, in-app playback with "
-              "shuffle/loop/skip and near-gapless advance, parallel batch rendering — "
-              "is included."),
-    ("0.27.0", "Internal restructure for testability: all non-GUI logic (parser, "
-               "render engine, cache, config, playlists, tables, safety guard) now "
-               "lives in bms_core.py, which the app imports — one shared source of "
-               "truth. Added an automated test suite (test_bms_core.py, 47 tests) "
-               "covering that logic, plus a manual test checklist for the GUI/audio/"
-               "Windows parts. No behavior or feature changes; bms_core.py and "
-               "player.py must sit next to bms_renderer.py."),
-    ("0.26.0", "Internal performance pass on the render engine: channel range "
-               "constants are computed once instead of on every note, and each "
-               "channel in a bar is classified a single time rather than re-checked "
-               "for every subdivision — faster rendering of dense charts, with "
-               "bit-identical output (verified). Removed code orphaned by the "
-               "refactor and refreshed a couple of stale comments. No behavior "
-               "changes."),
-    ("0.25.0", "Loop now repeats the current song (was a no-op before). Shuffle "
-               "follows the selection into view. Added Prev/Next (skip) buttons. "
-               "Transport buttons are now icon-only (⏮ ▶/⏸ ■ ⏭). New 'Add table by "
-               "URL…' button fetches the table's own name automatically and saves it "
-               "to tables.json — no manual naming needed."),
-    ("0.24.0", "Added Shuffle and Loop toggles at the bottom (left of the volume "
-               "slider); they apply to Queue, playlists, and Tables — not the Library. "
-               "Table playback now auto-advances down the list like the Queue, with "
-               "the same near-gapless pre-rendering. Replaced the volume emoji with a "
-               "plain 'Vol:' label to match the app's ASCII style."),
-    ("0.23.0", "Performance pass. Near-gapless playback: the previous and next song in "
-               "a queue/playlist are pre-rendered in the background while the current "
-               "one plays, so moving between them is instant (bounded in-memory cache, "
-               "one ahead + one back). Faster rendering overall — the mix step is now "
-               "vectorized, and only the keysounds a chart actually plays are decoded "
-               "(unused #WAV defs are skipped). Fixed sluggish text-caret/selection in "
-               "the Tags fields (the timeline updater no longer does any work while "
-               "idle). Minor internal cleanups."),
-    ("0.22.2", "Tag fields are now greyed out (read-only) when viewing Library or "
-               "Tables charts, since edits only save for queued songs — making it "
-               "clear where editing actually takes effect."),
-    ("0.22.1", "Threads/Format controls now read left-to-right in the right order. "
-               "The window remembers its size/position between launches. Faster "
-               "first-play playback: keysounds for a song now decode in parallel."),
-    ("0.22.0", "Batch rendering now runs in parallel across multiple worker processes "
-               "(big speedup on large queues/playlists). A 'Threads' control next to "
-               "the format dropdown sets how many to use (default = CPU count), saved "
-               "in bms_config.json as 'render_threads'. The now-playing [♪] marker now "
-               "shows on the Tables tab too. Right-click a level header in a table → "
-               "'Add all in this level to Queue' (one per song, lowest notecount)."),
-    ("0.21.0", "Tables tab: 'Add all owned to Queue' button — queues every owned chart "
-               "in the table, one per song (one per folder, keeping the lowest-"
-               "notecount chart), skipping anything already queued."),
-    ("0.20.1", "Actually fixed Tables playback: double-click now resolves the chart "
-               "under the cursor (it was reading a not-yet-updated selection), and the "
-               "Play button now correctly plays the Tables selection instead of the "
-               "Library one (tab detection now compares tab indices, not widget "
-               "pathnames)."),
-    ("0.20.0", "Playlists are now stored one JSON file per playlist in a 'Playlists' "
-               "folder (auto-created) for easy sharing — hand someone a single file. "
-               "Old playlists.json migrates automatically. Removed unused code "
-               "(keysound fingerprint/overlap, the same-song threshold, and other "
-               "dead functions); the keysound column is dropped from the cache, which "
-               "rebuilds automatically on next launch."),
-    ("0.19.2", "Playback now works from the Tables tab too: double-click an owned "
-               "chart to play it, and the Play button plays the selected table chart."),
-    ("0.19.1", "FLAC now encodes at maximum compression (level 8) via ffmpeg when "
-               "ffmpeg is on PATH (lossless, ~10-20% smaller files); falls back to "
-               "soundfile's level 5 when ffmpeg isn't present."),
-    ("0.19.0", "Play button now starts the selected song (not just double-click). "
-               "'Show all charts' groups by folder instead of keysounds. Now-playing "
-               "title scrolls (marquee) when too long. OGG export is back, via ffmpeg "
-               "(reliable, unlike the old libsndfile path) — appears in the format "
-               "dropdown only when ffmpeg is on PATH. Added a redraw nudge to help a "
-               "Tk-on-Linux/Wayland repaint quirk."),
-    ("0.18.1", "Reduced the visual 'rebuild' flicker when restoring the window from "
-               "minimized (timeline updates pause while minimized so they don't queue "
-               "up and flush noisily on restore)."),
-    ("0.18.0", "Playlists are now portable: each song is stored by MD5 hash + a "
-               "title/artist label instead of a file path, so a shared playlists.json "
-               "resolves to whatever paths the recipient has. Charts the recipient "
-               "doesn't own show greyed with their label. Existing path-based "
-               "playlists auto-migrate to hash form."),
-    ("0.17.0", "New 'Custom Playlists' tab (between Tables and Queue): create locally "
-               "stored playlists that reference charts by path (no file copies). "
-               "Right-click any song → Add to playlist. Double-click a playlist song "
-               "to play (auto-advances). 'Render playlist' renders into a subfolder of "
-               "the output path named after the playlist. Added a playback volume "
-               "slider at the bottom-right (affects playback only, not exported files)."),
-    ("0.16.0", "Cache moved from one big JSON file to a SQLite database "
-               "(bms_cache.db) — faster loads, smaller footprint, no full-file parse "
-               "on launch. Old bms_cache.json is removed automatically. Raised the "
-               "minimum window size so the right panel never clips."),
-    ("0.15.1", "Fixed transport controls getting clipped when the window was made "
-               "short: the log and transport bar are now anchored to the bottom and "
-               "keep their space, with the main area shrinking instead; added a "
-               "minimum window size."),
-    ("0.15.0", "Removed OGG export (libsndfile Vorbis encoding was unreliable / "
-               "produced corrupt files on some systems) — FLAC and WAV remain. "
-               "Library and output paths are now selectable, full-width fields. "
-               "Fixed play/stop buttons rendering inconsistently (single state-driven "
-               "label, wider button)."),
-    ("0.14.0", "Much smaller cache (keysounds stored as compact int hashes). "
-               "Same-song threshold now configurable in bms_config.json "
-               "(default 0.95). 'Exit lookup' button leaves show-all mode. Tables "
-               "auto-load when picked from the dropdown (no Fetch button). Export "
-               "format dropdown (FLAC / WAV / OGG) next to Render All."),
-    ("0.13.0", "Right-click menu now on Library and Queue too (Add to Queue greyed "
-               "out on the Queue tab). New 'BMS information' section under Tags "
-               "(Title/Artist/Genre/BPM/Notes/Play type/File/MD5); Notes moved there. "
-               "Uniform, de-bolded panel fonts. App now uses Meiryo UI for clean "
-               "Japanese text. Right panel order: Tags, BMS information, Album art."),
-    ("0.12.0", "Playback now on double-click (single-click just selects/shows tags). "
-               "Tab order is Library, Tables, Queue. Now-playing icon shown as [♪]. "
-               "Table levels are collapsible dropdown groups for faster navigation."),
-    ("0.11.1", "Fix: restored a method header accidentally dropped in 0.11.0 that "
-               "prevented the app from starting."),
-    ("0.11.0", "Difficulty Tables tab: add table URLs to tables.json, fetch them "
-               "(BMS-table standard, matched by MD5), and see your charts grouped by "
-               "level with owned vs missing (missing shown grey). Right-click a chart "
-               "for Play / Add to Queue / Show all charts (same-song variants matched "
-               "by keysound overlap). MD5 + keysound fingerprint now cached per chart."),
-    ("0.10.0", "Native playback: click a song to render+play it. Transport bar under "
-               "the log (play/pause/stop + draggable seek, no scrub preview). ♪ marks "
-               "the now-playing row. Library plays to end then stops; Queue auto-"
-               "advances to the next song. Needs the 'sounddevice' library."),
-    ("0.9.2", "Config JSON is now pretty-printed. Album art is session-only: it is "
-              "no longer saved to config and resets each time the app starts."),
-    ("0.9.1", "Moved album-art controls into the Tags panel (right side, below the "
-              "tag fields)."),
-    ("0.9.0", "High-quality polyphase resampling (scipy) for keysounds whose sample "
-              "rate isn't 44.1kHz — objectively cleaner than the old nearest-sample "
-              "method and than bmx2wav's linear interpolation. Falls back to linear "
-              "interpolation if scipy is absent."),
-    ("0.8.0", "Album art: choose one cover for the whole queue; auto-converted to a "
-              "safe square-ish JPEG (≤1000px, ≤500KB) and embedded in every FLAC. "
-              "Remembered in config. Requires Pillow."),
-    ("0.7.0", "Charts containing #RANDOM are shown in red in the Library list "
-              "(not yet evaluated at render time — flag only)."),
-    ("0.6.0", "Playable note-count column in Library and Queue, shown for the "
-              "selected chart (helps pick the simplest chart for a clean render). "
-              "Charts now parsed once per scan (faster). Sortable by clicking the "
-              "Notes column header."),
-    ("0.5.1", "Fixed hard UI freezes: all scan/render work now updates the UI only "
-              "from the main thread; library list draws in small batches with a "
-              "display cap; per-keystroke queue rebuild removed."),
-    ("0.5.0", "Library/Queue tabs, per-song tag panels, Render All (removes each "
-              "when done), remembered output folder, Album tag pinned to 'BMS'."),
-    ("0.4.0", "Engine overhaul from bmx2wav reference: correct base-36 channel "
-              "handling, per-measure resolution, mid-song BPM changes (ch 03/08), "
-              "STOP sequences (ch 09 + #STOPxx), measure-length (ch 02), long notes "
-              "(51-6Z + #LNOBJ), landmine suppression (D/E), robust error handling."),
-    ("0.3.0", "Auto-rescan on launch (remembers library), version label, "
-              "scrollbar, fast search, 7K-SP / play-type filtering."),
-    ("0.2.0", "Library cache (path+size+mtime) for fast relaunch + incremental scan."),
-    ("0.1.0", "Initial: scan, browse, auto-fill+edit tags, render to FLAC, "
-              "read-only library protection."),
+    ("1.6.6", "Discovery: fixed the artist line being clipped -- tiles are now tall "
+              "enough to fit the art and both text lines, with a gap between rows."),
+    ("1.6.5", "Discovery: added vertical spacing between rows so artist names no "
+              "longer sit flush against the next row of art."),
+    ("1.6.4", "Discovery now uses view recycling: only the tiles currently on "
+              "screen exist as widgets, reused as you scroll, so scrolling stays "
+              "smooth no matter how large your library is. Fixed the right-hand "
+              "panels being squished when toggling 'Songs only'."),
+    ("1.6.3", "Discovery scrolls smoothly now (larger scroll steps + deferred "
+              "loading fix the fast-scroll glitch) and thumbnails load in parallel "
+              "for faster fill-in. Fixed the right-hand panels getting squished when "
+              "'Songs only' was toggled on."),
+    ("1.6.2", "Discovery: fixed the grid glitching out during fast scrolling "
+              "(rapid loads could overlap); art that doesn't fill the square is "
+              "now centered on black again; taller tiles so artist names aren't "
+              "clipped, and long artist names also marquee on hover."),
+    ("1.6.1", "Discovery is now an infinite-scrolling art grid of your whole "
+              "library (no more batches); long titles marquee on hover and no longer "
+              "distort the grid; tiles frame the art without cropping. Discovery "
+              "right-click adds 'Show all charts' and 'Add to playlist'. Library: "
+              "BPM column left-aligned; the Notes column reads 'Chart count' in "
+              "Songs-only mode. Discovery sits between Library and Tables."),
+    ("1.6.0", "Library: new 'Songs only' toggle groups the list by song (one "
+              "expandable row per folder, no 2000-row cap); double-clicking a song "
+              "row plays a casual-friendly chart (100-500 notes, widening upward if "
+              "none). New Discovery tab: a grid of random songs from your library "
+              "with cover art (stagefile, falling back to any folder image or a BGA "
+              "frame) -- double-click a tile to listen, hit New batch to reroll. "
+              "Playlists: right-click now offers 'Add to playlist' so a master "
+              "playlist can be re-curated into smaller ones."),
+    ("1.5.4", "Official public release."),
 ]
 
 # ============================================================================

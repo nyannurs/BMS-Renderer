@@ -38,6 +38,7 @@ from bms_core import (
     db_connect, scan_library, file_md5,
     parse_bms, count_playable_notes, detect_mode_from_bars,
     render_bms, render_one_job, write_tags_to_file, process_cover, list_folder_images,
+    pick_playable_chart, pick_discovery_art,
     load_tables_file, save_tables_file, fetch_table,
     load_playlists, save_one_playlist, delete_playlist_file,
     _migrate_old_cache, _PIL_OK, _num,
@@ -146,13 +147,22 @@ class App(tk.Tk):
                                 # log + transport bar always keep their space
         self._mid = mid
 
-        # ---- left: notebook with Library and Queue tabs ----
+        # ---- right panel FIRST so pack reserves its fixed width before the
+        #      notebook claims the rest (prevents the tree from squishing it) ----
+        right = ttk.Frame(mid, width=340); right.pack(side="right", fill="y", padx=(8,0))
+        right.pack_propagate(False)
+        self._right = right
+
+        # ---- left: notebook with the tabs ----
         self.nb = ttk.Notebook(mid); self.nb.pack(side="left", fill="both", expand=True)
 
         # Library tab
         lib_tab = ttk.Frame(self.nb); self.nb.add(lib_tab, text="Library")
         self.lib_tab = lib_tab
         fbar = ttk.Frame(lib_tab); fbar.pack(fill="x", pady=(4,2))
+        self.songs_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fbar, text="Songs only", variable=self.songs_only,
+                        command=self.apply_filter).pack(side="left", padx=(0,10))
         ttk.Label(fbar, text="Search:").pack(side="left")
         self.search = ttk.Entry(fbar)
         self.search.pack(side="left", fill="x", expand=True, padx=(4,12))
@@ -171,7 +181,7 @@ class App(tk.Tk):
         for c in cols:
             self.tree.heading(c, text=c.title(),
                               command=lambda col=c: self.sort_library(col))
-            anchor = "e" if c in ("bpm", "notes") else "w"
+            anchor = "w"
             self.tree.column(c, width=widths[c], anchor=anchor)
         self._sort_col = None; self._sort_desc = False
         # rows for charts containing #RANDOM are shown in red
@@ -183,6 +193,7 @@ class App(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self.on_library_select)
         self.tree.bind("<Double-Button-1>", self.on_library_activate)
         self.tree.bind("<Button-3>", self._lib_rightclick)
+        self.tree.bind("<<TreeviewOpen>>", self._lib_group_open)
         libbtns = ttk.Frame(lib_tab); libbtns.pack(fill="x", pady=4)
         ttk.Button(libbtns, text="Add selected to Queue →",
                    command=self.add_to_queue).pack(side="left", fill="x", expand=True)
@@ -308,6 +319,8 @@ class App(tk.Tk):
         self._plmenu = tk.Menu(self, tearoff=0)
         self._plmenu.add_command(label="Play", command=self._pl_play)
         self._plmenu.add_command(label="Add to Queue", command=self._pl_add_queue)
+        self._pl_plmenu = tk.Menu(self._plmenu, tearoff=0)
+        self._plmenu.add_cascade(label="Add to playlist", menu=self._pl_plmenu)
         self._plmenu.add_command(label="Remove from playlist", command=self.remove_from_playlist)
         self._playlists = {}       # name -> [path, ...]
         self._pl_rows = []         # song dicts currently shown for the selected playlist
@@ -321,9 +334,40 @@ class App(tk.Tk):
         self._lqmenu.add_cascade(label="Add to playlist", menu=self._lq_plmenu)
         self._ctx_song = None      # song dict the context menu currently targets
 
-        # ---- right panel: Tags, BMS information, Album art (top to bottom) ----
-        right = ttk.Frame(mid, width=340); right.pack(side="right", fill="y", padx=(8,0))
+        # ---- Discovery tab: a virtualized art grid (view recycling) ----
+        d_tab = ttk.Frame(self.nb); self.nb.insert(1, d_tab, text="\u2726 Discovery \u2726")
+        self.disc_tab = d_tab
+        dbar = ttk.Frame(d_tab); dbar.pack(fill="x", pady=(4,2))
+        self.disc_status = ttk.Label(dbar, text="scroll through your library -- "
+                                                "double-click a tile to listen",
+                                     foreground="#666")
+        self.disc_status.pack(side="left", padx=10)
+        dwrap = ttk.Frame(d_tab); dwrap.pack(fill="both", expand=True)
+        self.disc_canvas = tk.Canvas(dwrap, highlightthickness=0, bg="#f0f0f0")
+        self.disc_vsb = ttk.Scrollbar(dwrap, orient="vertical",
+                                      command=self._disc_yview)
+        self.disc_canvas.configure(yscrollcommand=self.disc_vsb.set)
+        self.disc_vsb.pack(side="right", fill="y")
+        self.disc_canvas.pack(side="left", fill="both", expand=True)
+        self.disc_canvas.bind("<Configure>", self._disc_on_resize)
+        self.disc_canvas.bind_all("<MouseWheel>", self._disc_mousewheel)
+        # virtualization state
+        self._disc_order = []      # full shuffled library, one (rep, charts) per song
+        self._disc_pool = []       # reusable tile widgets (count ~ visible+buffer)
+        self._disc_pool_map = {}   # pool slot -> song index currently shown there
+        self._disc_thumbs = {}     # song index -> PhotoImage (LRU-capped cache)
+        self._disc_thumb_order = []# insertion order for the LRU cache
+        self._disc_pending = set() # song indices whose thumbnail is being decoded
+        self._disc_cols = 1
+        self._disc_scroll = 0      # current scroll offset in pixels
+        self._disc_token = 0       # cancels stale thumbnail decodes
+        self._disc_loaded = False  # first layout happens when the tab is first opened
+        self._DISC_TILE_H = self._DISC_TILE + 56  # art(170+2 border) + title + artist
+        self._DISC_ROW_H = self._DISC_TILE + 76   # row stride (gap below artist)
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
+
+        # ---- right panel: Tags, BMS information, Album art (top to bottom) ----
         # 1) Tags (editable)
         tags_box = ttk.LabelFrame(right, text="Tags"); tags_box.pack(fill="x")
         self.fields = {}
@@ -1085,6 +1129,7 @@ class App(tk.Tk):
         matches = [o for o in self.songs
                    if os.path.dirname(os.path.normcase(os.path.abspath(o["path"]))) == target_dir]
         matches.sort(key=lambda o: _num(o.get("notes")))
+        self.songs_only.set(False)   # show-all lists individual charts, not grouped
         self.filtered = matches
         self._reverse_lookup = True
         self.exit_lookup_btn.pack(side="left", padx=(6,0))  # show the exit button
@@ -1108,9 +1153,8 @@ class App(tk.Tk):
         # otherwise select just the clicked row (standard file-manager behaviour).
         if iid not in self.tree.selection():
             self.tree.selection_set(iid)
-        try:
-            self._ctx_song = self.filtered[int(iid)]
-        except (ValueError, IndexError):
+        self._ctx_song = self._lib_song_at(iid)
+        if not self._ctx_song:
             return
         self._popup_lqmenu(event)
 
@@ -1186,13 +1230,396 @@ class App(tk.Tk):
 
     def _selected_library_songs(self):
         """All currently-selected Library rows as song dicts (in display order)."""
-        out = []
+        out, seen = [], set()
         for iid in self.tree.selection():
-            try:
-                out.append(self.filtered[int(iid)])
-            except (ValueError, IndexError):
-                pass
+            s = self._lib_song_at(iid)
+            if s and s["path"] not in seen:
+                seen.add(s["path"])
+                out.append(s)
         return out
+
+    def _populate_grouped(self, rows, token):
+        """Songs-only mode: one parent row per song folder (expandable to its
+        charts). Grouping collapses the list enough that no row cap is needed."""
+        self.tree.config(show="tree headings")
+        self.tree.heading("#0", text="")
+        self.tree.column("#0", width=28, minwidth=28, stretch=False)
+        self.tree.heading("notes", text="Chart count")
+        groups = {}                      # folder -> [charts in filtered order]
+        order = []
+        for s in rows:
+            folder = os.path.dirname(s["path"])
+            if folder not in groups:
+                groups[folder] = []
+                order.append(folder)
+            groups[folder].append(s)
+        # rep = lowest-notecount chart; charts listed simplest-first when expanded
+        self._lib_groups = []
+        for folder in order:
+            charts = sorted(groups[folder], key=lambda s: _num(s.get("notes")))
+            self._lib_groups.append(charts)
+
+        def insert_batch(start):
+            if token != self._fill_token:
+                return
+            end = min(start + self.BATCH, len(self._lib_groups))
+            for gi in range(start, end):
+                charts = self._lib_groups[gi]
+                rep = charts[0]
+                tags = ("random",) if rep.get("random") else ()
+                self.tree.insert("", "end", iid=f"g{gi}", tags=tags,
+                                 values=(rep["title"], rep["artist"], rep["bpm"],
+                                         rep.get("mode","?"),
+                                         f"{len(charts)} chart{'s' if len(charts)!=1 else ''}"))
+                # dummy child so the expander (+) shows; filled on first open
+                self.tree.insert(f"g{gi}", "end", iid=f"g{gi}_dummy", values=("...","","","",""))
+            if end < len(self._lib_groups):
+                self.after(1, insert_batch, end)
+            else:
+                self.log(f"Showing {len(self._lib_groups):,} songs "
+                         f"({len(rows):,} charts grouped by folder).")
+
+        if self._lib_groups:
+            insert_batch(0)
+        else:
+            self.log(f"Showing 0 of {len(self.songs):,} charts.")
+
+    def _lib_group_open(self, _):
+        """Fill in a group's real chart rows the first time it's expanded."""
+        if not self.songs_only.get() or not getattr(self, "_lib_groups", None):
+            return
+        iid = self.tree.focus()
+        if not (iid.startswith("g") and "_" not in iid):
+            return
+        dummy = f"{iid}_dummy"
+        if not self.tree.exists(dummy):
+            return                       # already filled
+        self.tree.delete(dummy)
+        gi = int(iid[1:])
+        for j, s in enumerate(self._lib_groups[gi]):
+            tags = ("random",) if s.get("random") else ()
+            self.tree.insert(iid, "end", iid=f"c{gi}_{j}", tags=tags,
+                             values=(s["title"], s["artist"], s["bpm"],
+                                     s.get("mode","?"), s.get("notes","")))
+
+    def _lib_song_at(self, iid):
+        """Resolve a library tree iid to a song dict in both flat and grouped
+        modes. Group parents resolve to the chart double-click would play."""
+        try:
+            if iid.startswith("c") and "_" in iid:          # grouped child = a chart
+                gi, j = iid[1:].split("_")
+                return self._lib_groups[int(gi)][int(j)]
+            if iid.startswith("g"):                          # group parent = the song
+                return pick_playable_chart(self._lib_groups[int(iid[1:])])
+            return self.filtered[int(iid)]                   # flat row
+        except (ValueError, IndexError, AttributeError, TypeError):
+            return None
+
+    # ------------------------------------------------------------- Discovery
+    _DISC_TILE = 170     # art square size (px)
+    _DISC_PAD  = 14      # gap between tiles
+
+    def _on_tab_changed(self, _):
+        try:
+            if self.nb.select() == str(self.disc_tab) and not self._disc_loaded:
+                self._disc_loaded = True
+                self.discovery_reset()
+        except tk.TclError:
+            pass
+
+    # ---- Virtualized grid: a fixed pool of tile widgets is reused as you scroll;
+    #      only the songs currently in view (plus a small buffer) are ever drawn,
+    #      so the library can be huge without thousands of live widgets. ----
+    def discovery_reset(self):
+        import random
+        if not self.songs:
+            self.disc_status.config(text="scan a library first -- then come back to explore it")
+            return
+        self._disc_token += 1
+        groups = {}
+        for s in self.songs:
+            groups.setdefault(os.path.dirname(s["path"]), []).append(s)
+        order = []
+        for charts in groups.values():
+            charts = sorted(charts, key=lambda s: _num(s.get("notes")))
+            order.append((charts[0], charts))
+        random.shuffle(order)
+        self._disc_order = order
+        self._disc_thumbs.clear(); self._disc_thumb_order.clear()
+        self._disc_pending.clear()
+        self._disc_pool_map.clear()
+        self._disc_scroll = 0
+        self.disc_status.config(text=f"{len(order):,} songs -- scroll to explore, "
+                                     "double-click to listen")
+        self.after_idle(lambda: self._disc_relayout(rebuild_pool=True))
+
+    def _disc_cols_for_width(self, w):
+        return max(1, w // (self._DISC_TILE + self._DISC_PAD * 2))
+
+    def _disc_content_height(self):
+        if not self._disc_order:
+            return 0
+        rows = (len(self._disc_order) + self._disc_cols - 1) // self._disc_cols
+        return rows * self._DISC_ROW_H + self._DISC_PAD
+
+    def _disc_relayout(self, rebuild_pool=False):
+        """Recompute columns, size the tile pool to the viewport, and redraw."""
+        cw = self.disc_canvas.winfo_width()
+        ch = self.disc_canvas.winfo_height()
+        if cw <= 1 or ch <= 1 or not self._disc_order:
+            return
+        self._disc_cols = self._disc_cols_for_width(cw)
+        # how many rows fit, plus 2 buffer rows above/below
+        vis_rows = ch // self._DISC_ROW_H + 3
+        need = vis_rows * self._disc_cols
+        if rebuild_pool or need > len(self._disc_pool):
+            for slot in range(len(self._disc_pool), need):
+                self._disc_pool.append(self._disc_new_tile(slot))
+        # clamp scroll to content
+        max_scroll = max(0, self._disc_content_height() - ch)
+        self._disc_scroll = max(0, min(self._disc_scroll, max_scroll))
+        self._disc_redraw()
+
+    def _disc_new_tile(self, slot):
+        tile = ttk.Frame(self.disc_canvas, width=self._DISC_TILE,
+                         height=self._DISC_TILE_H)
+        tile.grid_propagate(False)
+        tile.grid_columnconfigure(0, weight=1)
+        art = tk.Label(tile, bg="#000000", bd=1, relief="solid")
+        art.grid(row=0, column=0)
+        t_lbl = tk.Label(tile, anchor="center", width=1)
+        t_lbl.grid(row=1, column=0, sticky="ew", pady=(3,0))
+        a_lbl = tk.Label(tile, anchor="center", fg="#777", width=1)
+        a_lbl.grid(row=2, column=0, sticky="ew")
+        t = {"frame": tile, "art": art, "title": t_lbl, "artist": a_lbl,
+             "idx": None, "win": None}
+        for w in (tile, art, t_lbl, a_lbl):
+            w.bind("<Button-1>", lambda e, t=t: self._disc_click(t))
+            w.bind("<Double-Button-1>", lambda e, t=t: self._disc_dblclick(t))
+            w.bind("<Button-3>", lambda e, t=t: self._disc_menu(e, t))
+        t_lbl.bind("<Enter>", lambda e, t=t: self._disc_hover(t, True))
+        t_lbl.bind("<Leave>", lambda e, t=t: self._disc_hover(t, False))
+        return t
+
+    def _disc_redraw(self):
+        """Place pool tiles over exactly the song cells now visible."""
+        ch = self.disc_canvas.winfo_height()
+        cols = self._disc_cols
+        first_row = self._disc_scroll // self._DISC_ROW_H
+        first = first_row * cols
+        slot = 0
+        y0 = -(self._disc_scroll % self._DISC_ROW_H) if False else 0
+        # absolute y of a row = row*ROW_H - scroll; place tiles by canvas window
+        used = set()
+        i = first
+        while slot < len(self._disc_pool) and i < len(self._disc_order):
+            row, col = divmod(i, cols)
+            x = self._DISC_PAD + col * (self._DISC_TILE + self._DISC_PAD * 2)
+            y = self._DISC_PAD + row * self._DISC_ROW_H - self._disc_scroll
+            if y > ch:
+                break
+            t = self._disc_pool[slot]
+            self._disc_fill_tile(t, i)
+            if t["win"] is None:
+                t["win"] = self.disc_canvas.create_window(x, y, anchor="nw",
+                                                          window=t["frame"])
+            else:
+                self.disc_canvas.coords(t["win"], x, y)
+                self.disc_canvas.itemconfigure(t["win"], state="normal")
+            used.add(slot)
+            slot += 1; i += 1
+        # hide any unused pool tiles
+        for s in range(len(self._disc_pool)):
+            if s not in used and self._disc_pool[s]["win"] is not None:
+                self.disc_canvas.itemconfigure(self._disc_pool[s]["win"], state="hidden")
+        self._disc_update_scrollbar()
+
+    def _disc_fill_tile(self, t, idx):
+        if t["idx"] == idx:
+            return
+        t["idx"] = idx
+        rep, charts = self._disc_order[idx]
+        full = rep["title"] or "(unknown)"
+        t["title"].config(text=self._ellipsize(full, 22))
+        t["_fulltitle"] = full
+        t["artist"].config(text=self._ellipsize(rep["artist"] or "", 24))
+        img = self._disc_thumbs.get(idx)
+        if img is not None:
+            t["art"].config(image=img)
+            self._disc_touch_cache(idx)
+        else:
+            t["art"].config(image=self._disc_placeholder())
+            self._disc_request_thumb(idx)
+
+    def _disc_hover(self, t, entering):
+        full = t.get("_fulltitle", "")
+        if entering and len(full) > 22:
+            self._marquee_start(t["title"], full, 22)
+        else:
+            self._marquee_stop(t["title"], full, 22)
+
+    @staticmethod
+    def _ellipsize(s, n):
+        return s if len(s) <= n else s[:n-1] + "\u2026"
+
+    def _marquee_start(self, label, full, n):
+        self._marquee_stop(label, full, None)
+        pad = full + "    "
+        def step(pos=0):
+            label.config(text=(pad[pos:] + pad[:pos])[:n])
+            label._marquee_job = self.after(180, step, (pos + 1) % len(pad))
+        step()
+
+    def _marquee_stop(self, label, full, n):
+        job = getattr(label, "_marquee_job", None)
+        if job:
+            try: self.after_cancel(job)
+            except Exception: pass
+            label._marquee_job = None
+        if n is not None:
+            label.config(text=self._ellipsize(full, n))
+
+    def _disc_placeholder(self):
+        cached = getattr(self, "_disc_ph_img", None)
+        if cached is not None:
+            return cached
+        try:
+            from PIL import Image
+            import io as _io, base64 as _b64
+            img = Image.new("RGB", (self._DISC_TILE, self._DISC_TILE), (25, 25, 25))
+            buf = _io.BytesIO(); img.save(buf, format="PNG")
+            self._disc_ph_img = tk.PhotoImage(data=_b64.b64encode(buf.getvalue()).decode("ascii"))
+        except Exception:
+            self._disc_ph_img = None
+        return self._disc_ph_img
+
+    def _disc_request_thumb(self, idx):
+        if idx in self._disc_pending or idx in self._disc_thumbs:
+            return
+        self._disc_pending.add(idx)
+        token = self._disc_token
+        threading.Thread(target=self._disc_decode, args=(token, idx), daemon=True).start()
+
+    def _disc_decode(self, token, idx):
+        try:
+            from PIL import Image
+            import io as _io, base64 as _b64
+        except Exception:
+            return
+        if token != self._disc_token:
+            return
+        rep, charts = self._disc_order[idx]
+        data = None
+        try:
+            art = pick_discovery_art(rep["path"])
+            if art:
+                img = Image.open(art).convert("RGB")
+                img.thumbnail((self._DISC_TILE - 2, self._DISC_TILE - 2), Image.LANCZOS)
+                canvas = Image.new("RGB", (self._DISC_TILE, self._DISC_TILE), (0, 0, 0))
+                canvas.paste(img, ((self._DISC_TILE - img.width) // 2,
+                                   (self._DISC_TILE - img.height) // 2))
+                buf = _io.BytesIO(); canvas.save(buf, format="PNG")
+                data = _b64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            data = None
+        self.after(0, self._disc_thumb_ready, token, idx, data)
+
+    def _disc_thumb_ready(self, token, idx, data):
+        self._disc_pending.discard(idx)
+        if token != self._disc_token or data is None:
+            return
+        try:
+            img = tk.PhotoImage(data=data)
+        except tk.TclError:
+            return
+        self._disc_thumbs[idx] = img
+        self._disc_thumb_order.append(idx)
+        # cap the cache so memory stays bounded on a huge library
+        while len(self._disc_thumb_order) > 600:
+            old = self._disc_thumb_order.pop(0)
+            if old != idx:
+                self._disc_thumbs.pop(old, None)
+        # if this song is currently on a visible tile, show it now
+        for t in self._disc_pool:
+            if t["idx"] == idx and t["win"] is not None:
+                t["art"].config(image=img)
+                break
+
+    def _disc_touch_cache(self, idx):
+        try:
+            self._disc_thumb_order.remove(idx)
+            self._disc_thumb_order.append(idx)
+        except ValueError:
+            pass
+
+    def _disc_update_scrollbar(self):
+        total = self._disc_content_height()
+        ch = self.disc_canvas.winfo_height()
+        if total <= 0:
+            self.disc_vsb.set(0, 1); return
+        top = self._disc_scroll / total
+        bot = min(1.0, (self._disc_scroll + ch) / total)
+        self.disc_vsb.set(top, bot)
+
+    def _disc_yview(self, *args):
+        total = self._disc_content_height()
+        ch = self.disc_canvas.winfo_height()
+        max_scroll = max(0, total - ch)
+        if args[0] == "moveto":
+            self._disc_scroll = int(float(args[1]) * total)
+        elif args[0] == "scroll":
+            amt = int(args[1])
+            unit = self._DISC_ROW_H if args[2] == "pages" else 60
+            self._disc_scroll += amt * unit
+        self._disc_scroll = max(0, min(self._disc_scroll, max_scroll))
+        self._disc_redraw()
+
+    def _disc_on_resize(self, event):
+        self._disc_relayout()
+
+    def _disc_mousewheel(self, event):
+        try:
+            if self.nb.select() != str(self.disc_tab):
+                return
+            self._disc_scroll -= (event.delta // 120) * 90
+            total = self._disc_content_height()
+            ch = self.disc_canvas.winfo_height()
+            self._disc_scroll = max(0, min(self._disc_scroll, max(0, total - ch)))
+            self._disc_redraw()
+        except tk.TclError:
+            pass
+
+    def _disc_click(self, t):
+        if t["idx"] is None: return
+        rep, charts = self._disc_order[t["idx"]]
+        self.selected_kind = "library"; self.selected_index = None
+        self._update_info(rep)
+        self._show_tags(self._default_tags(rep), editable=False,
+                        hint="Discovery preview (read-only) -- add to Queue to edit tags.")
+        self._load_song_art_for(rep["path"], None)
+
+    def _disc_dblclick(self, t):
+        if t["idx"] is None or not _SD_OK: return
+        rep, charts = self._disc_order[t["idx"]]
+        s = pick_playable_chart(charts)
+        if s:
+            self._start_song("library", 0, s["path"], s["title"])
+
+    def _disc_menu(self, event, t):
+        if t["idx"] is None: return
+        self._disc_click(t)
+        rep, charts = self._disc_order[t["idx"]]
+        s = pick_playable_chart(charts)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Play", command=lambda: self._disc_dblclick(t))
+        menu.add_command(label="Add to Queue",
+                         command=lambda: self._enqueue_songs([s] if s else []))
+        menu.add_command(label="Show all charts for this song",
+                         command=lambda: self._show_all_for_song(rep))
+        plmenu = tk.Menu(menu, tearoff=0)
+        self._fill_playlist_submenu(plmenu, lambda: rep)
+        menu.add_cascade(label="Add to playlist", menu=plmenu)
+        menu.tk_popup(event.x_root, event.y_root)
 
     def _ctx_show_all(self):
         self._show_all_for_song(self._ctx_song)
@@ -1414,8 +1841,11 @@ class App(tk.Tk):
             self.pltree.selection_set(iid)
         s = self._pl_rows[int(iid)]
         owned = not s.get("_missing")
-        for idx in (0, 1):
+        # entries: 0 Play, 1 Add to Queue, 2 Add to playlist (cascade), 3 Remove
+        for idx in (0, 1, 2):
             self._plmenu.entryconfig(idx, state="normal" if owned else "disabled")
+        if owned:
+            self._fill_playlist_submenu(self._pl_plmenu, self._pl_selected_song)
         self._plmenu.tk_popup(event.x_root, event.y_root)
 
     def _pl_play(self):
@@ -1506,6 +1936,14 @@ class App(tk.Tk):
         self._fill_token = getattr(self, "_fill_token", 0) + 1
         token = self._fill_token
         self.tree.delete(*self.tree.get_children())
+        if self.songs_only.get():
+            self._populate_grouped(rows, token)
+            return
+        self.tree.config(show="headings")
+        self.tree.heading("notes", text="Notes")
+        self.tree.column("title", width=300)
+        self.tree.column("#0", width=0, minwidth=0, stretch=False)
+        self._lib_groups = None
         capped = rows[:self.ROW_CAP]
 
         def insert_batch(start):
@@ -1577,8 +2015,10 @@ class App(tk.Tk):
         sel = self.tree.selection()
         if not sel:
             return
-        s = self.filtered[int(sel[0])]
-        self.selected_kind = "library"; self.selected_index = int(sel[0])
+        s = self._lib_song_at(sel[0])
+        if not s:
+            return
+        self.selected_kind = "library"; self.selected_index = None
         self._update_info(s)
         self._show_tags(self._default_tags(s), editable=False,
                         hint="Library preview (read-only) — add to Queue to edit tags.")
@@ -1589,8 +2029,14 @@ class App(tk.Tk):
         sel = self.tree.selection()
         if not sel or not _SD_OK:
             return
-        s = self.filtered[int(sel[0])]
-        self._start_song("library", int(sel[0]), s["path"], s["title"])
+        s = self._lib_song_at(sel[0])
+        if not s:
+            return
+        try:
+            idx = self.filtered.index(s)
+        except ValueError:
+            idx = 0
+        self._start_song("library", idx, s["path"], s["title"])
 
     def add_to_queue(self):
         if not self.tree.selection():
@@ -1865,8 +2311,13 @@ class App(tk.Tk):
         else:  # Library
             sel = self.tree.selection()
             if sel:
-                s = self.filtered[int(sel[0])]
-                self._start_song("library", int(sel[0]), s["path"], s["title"]); return
+                s = self._lib_song_at(sel[0])
+                if s:
+                    try:
+                        idx = self.filtered.index(s)
+                    except ValueError:
+                        idx = 0
+                    self._start_song("library", idx, s["path"], s["title"]); return
         self.log("Select a song first, then press Play (or double-click a song).")
 
     def stop_play(self):
@@ -2061,6 +2512,8 @@ class App(tk.Tk):
         ctx = self._playing_ctx
         play_lib = ctx[1] if (ctx and ctx[0] == "library") else None
         for iid in self.tree.get_children():
+            if not iid.isdigit():
+                continue   # songs-only group rows ("gN") -- no marking there
             s = self.filtered[int(iid)] if int(iid) < len(self.filtered) else None
             if s is None:
                 continue
