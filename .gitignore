@@ -8,6 +8,7 @@ bms_cache.db-shm
 bms_config.json
 Playlists/
 Render/
+Test Suite/
 tables.json
 test_bms_core.py
 *.bat
