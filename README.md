@@ -54,39 +54,3 @@ First library scan is slow; after that it's cached and fast.
   output folder you choose, and every write is checked against your source path
   first, so scanning or rendering can never modify, overwrite, or delete anything
   in your collection.
-
-## Changelog
-
-- **1.9.7** — Replaced the unreliable automatic audio-device switching with a "⟳ Audio device" button in the player bar: click it after changing your system's audio output to move playback to the new device, keeping your place in the song. Fixes the earlier playback breakage.
-- **1.9.3** — Added MP3 export at a fixed 320 kbps. Appears as a format option when ffmpeg is installed, with full tags (including Album Artist) and embedded cover art.
-- **1.9.2** — Tagging, album views, and polish.
-  - Album tag now writes what you type (it was stuck on "BMS"), and empty albums are allowed.
-  - Added an Album Artist tag — the correct way to group a render into one album in music players. Album and Album Artist are session-wide: empty at startup, applied to every queued song (and any added afterward), and reset on restart.
-  - Keyboard tagging: UP/DOWN move between songs; TAB/Shift-TAB cycle only the tag fields (Title–BPM, wrapping).
-  - Tags carry over when you send a song to another playlist or the queue (Album/Album Artist excluded).
-  - Custom Playlists: edit tags and pick art per song, saved into the playlist's .json to tag now and render later. Missing art on a shared playlist falls back gracefully instead of crashing.
-  - "Assign black square" button for a clean black cover (generated in memory, shows in the preview, persists per playlist entry).
-  - Album view for Tables, Custom Playlists, and Queue (the Discovery-style art grid), with a highlighted selected/now-playing tile; the Queue plays left-to-right. Tables album view shows level headers between rows.
-  - Shift-click to multi-select in Tables/Playlists, then right-click to add all to the queue or a playlist.
-  - The console window no longer stays open behind the app on Windows (with a fallback if it can't relaunch).
-  - Fixed Album view freezing on large tables; removed the diamonds from the Discovery tab name; no-art square is now true black.
-  - Internal cleanup: faster indexed lookups, removed dead code.
-- **1.8.0** — Added album view mode toggle for most tabs. Album tag now writes what you type (was stuck on "BMS"). Added an Album Artist tag for grouping renders into one album. Album/Album Artist are session-wide (empty on startup, applied to all queued + newly-added songs, reset on restart). TAB between tag fields, DOWN to next song. Edit tags and pick art in Custom Playlists — saved into the playlist .json to tag now and render later, with graceful fallback if a shared playlist's art file is missing.
-- **1.6.8** — Discovery now fills in correctly if opened while the library cache is still loading.
-- **1.6.7** — Discovery: hovering anywhere on a tile (including the art) triggers
-  the title marquee.
-- **1.6.6** — Discovery: fixed the artist line being clipped; tiles now fit the
-  art and both text lines with a gap between rows.
-- **1.6.5** — Discovery: added spacing between rows.
-- **1.6.4** — Discovery rebuilt with view recycling — only on-screen tiles exist
-  as widgets, so scrolling stays smooth on any library size. Fixed the right
-  panels being squished when toggling "Songs only".
-- **1.6.3** — Smoother Discovery scrolling and parallel thumbnail loading.
-- **1.6.2** — Fixed the Discovery grid glitching during fast scrolling; letterboxed
-  art centered on black; taller tiles.
-- **1.6.1** — Discovery became an infinite-scrolling grid; long titles marquee on
-  hover; added "Show all charts" and "Add to playlist" to its right-click menu.
-  Library BPM left-aligned; "Chart count" header in Songs-only mode.
-- **1.6.0** — Added the "Songs only" Library toggle and the Discovery tab.
-  Playlists can re-curate into other playlists.
-- **1.5.4** — Official public release.
