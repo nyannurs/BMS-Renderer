@@ -20,6 +20,28 @@ bms_core.py; this file is the Tkinter GUI on top of it.
 """
 
 import os, sys, threading, traceback
+
+# ---- Console-hide relaunch (must run BEFORE the heavy imports below) ----
+# Running "python bms_renderer.py" on Windows keeps a console window open behind
+# the GUI. We relaunch ourselves once under pythonw.exe (no console). Doing this
+# at the very top — before importing numpy/scipy/PIL via bms_core — means the
+# throwaway first process exits immediately instead of paying the full import cost
+# first, so the real window appears much faster. The _BMS_NOCONSOLE env guard
+# prevents an infinite relaunch loop.
+if (__name__ == "__main__" and sys.platform == "win32"
+        and not getattr(sys, "frozen", False)
+        and os.environ.get("_BMS_NOCONSOLE") != "1"
+        and "--multiprocessing-fork" not in sys.argv):   # don't disturb worker spawns
+    _pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if os.path.isfile(_pyw):
+        try:
+            import subprocess
+            subprocess.Popen([_pyw, os.path.abspath(__file__)] + sys.argv[1:],
+                             env=dict(os.environ, _BMS_NOCONSOLE="1"), close_fds=True)
+            sys.exit(0)
+        except Exception:
+            pass   # fall through and run normally if relaunch fails
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -859,8 +881,21 @@ class App(tk.Tk):
         self.redetect_btn.pack(side="left", padx=(0,12))
         self.time_lbl = ttk.Label(tp, text="0:00 / 0:00", width=14)
         self.time_lbl.pack(side="left")
-        self.seek = ttk.Scale(tp, from_=0, to=1000, orient="horizontal")
-        self.seek.pack(side="left", fill="x", expand=True, padx=8)
+        # waveform doubles as the seek bar: filled amplitude envelope with a
+        # progress fill; click or drag to seek
+        self.wave = tk.Canvas(tp, height=34, highlightthickness=0)
+        try:                        # match the system/ttk window background so it blends in
+            self.wave.config(bg=ttk.Style(self).lookup("TFrame", "background")
+                             or self.cget("background"))
+        except tk.TclError:
+            pass
+        self.wave.pack(side="left", fill="x", expand=True, padx=8)
+        self.wave.bind("<Configure>", lambda e: self._draw_wave())
+        self.wave.bind("<ButtonPress-1>", self._wave_grab)
+        self.wave.bind("<B1-Motion>", self._wave_drag)
+        self.wave.bind("<ButtonRelease-1>", self._wave_release)
+        self._wave_env = None      # cached amplitude envelope (list of 0..1)
+        self._wave_pos = 0.0       # 0..1 progress for the fill overlay
         # volume control (bottom-right); items pack right-to-left
         self.vol = ttk.Scale(tp, from_=0, to=100, orient="horizontal", length=110,
                              command=self._on_volume)
@@ -873,9 +908,6 @@ class App(tk.Tk):
         ttk.Checkbutton(tp, text="Shuffle", variable=self.shuffle_on).pack(side="right", padx=(8,4))
         self.now_lbl = ttk.Label(tp, text="", foreground="#2a7", width=22)
         self.now_lbl.pack(side="right", padx=(0,12))
-        # seek interactions: drag freely (no sound), seek on release
-        self.seek.bind("<ButtonPress-1>", self._seek_grab)
-        self.seek.bind("<ButtonRelease-1>", self._seek_release)
         if not _SD_OK:
             self.play_btn.config(state="disabled")
             self.prev_btn.config(state="disabled")
@@ -2828,6 +2860,7 @@ class App(tk.Tk):
 
     def _begin_playback(self, audio):
         self.player.load(audio)
+        self._build_wave_envelope(audio)
         self.player.play()
         self._refresh_play_btn()
 
@@ -2892,7 +2925,8 @@ class App(tk.Tk):
         self.player.stop()
         self._rendering_play = False
         self._refresh_play_btn()
-        self.seek.set(0)
+        self._wave_pos = 0.0
+        self._draw_wave()
         self.time_lbl.config(text="0:00 / 0:00")
         self._playing_ctx = None
         self._update_now_playing(None)
@@ -2909,17 +2943,81 @@ class App(tk.Tk):
             self.log("Couldn't open the current default audio device.")
             self._refresh_play_btn()
 
-    # seek: drag freely with no sound, jump on release
-    def _seek_grab(self, _):
-        self._seeking = True
+    # seek via the waveform: drag updates the fill, release jumps the audio
+    def _wave_frac(self, x):
+        w = max(1, self.wave.winfo_width())
+        return min(1.0, max(0.0, x / w))
 
-    def _seek_release(self, _):
+    def _wave_grab(self, e):
+        self._seeking = True
+        self._wave_pos = self._wave_frac(e.x)
+        self._draw_wave()
+
+    def _wave_drag(self, e):
+        if self._seeking:
+            self._wave_pos = self._wave_frac(e.x)
+            self._draw_wave()
+
+    def _wave_release(self, e):
         if self.player is None or self.player.duration_seconds() <= 0:
             self._seeking = False
             return
-        frac = self.seek.get() / 1000.0
+        frac = self._wave_frac(e.x)
         self.player.seek_seconds(frac * self.player.duration_seconds())
+        self._wave_pos = frac
         self._seeking = False
+        self._draw_wave()
+
+    def _build_wave_envelope(self, audio):
+        """Downsample a stereo buffer to a small amplitude envelope (peaks per
+        bucket, 0..1) for the filled waveform graph. Cheap and resolution-capped."""
+        try:
+            import numpy as np
+            mono = np.abs(np.asarray(audio)).mean(axis=1) if audio.ndim > 1 \
+                else np.abs(np.asarray(audio))
+            buckets = 600
+            if len(mono) < buckets:
+                env = mono
+            else:
+                env = mono[:len(mono) // buckets * buckets].reshape(buckets, -1).max(axis=1)
+            peak = float(env.max()) or 1.0
+            self._wave_env = (env / peak).tolist()
+        except Exception:
+            self._wave_env = None
+        self._wave_pos = 0.0
+        self._draw_wave()
+
+    def _draw_wave(self):
+        """Draw the filled amplitude graph; the portion before the playhead is
+        drawn in the accent colour, the rest dim."""
+        c = getattr(self, "wave", None)
+        if c is None:
+            return
+        c.delete("all")
+        w = max(1, c.winfo_width()); h = int(c.winfo_height())
+        mid = h / 2
+        env = self._wave_env
+        if not env:
+            return
+        n = len(env)
+        played_x = self._wave_pos * w
+        # one (x, top, bottom) per sample bucket
+        cols = []
+        for i, a in enumerate(env):
+            x = (i / (n - 1) * w) if n > 1 else 0.0
+            amp = a * (mid - 2)
+            cols.append((x, mid - amp, mid + amp))
+        def poly(lo, hi, color):
+            seg = [col for col in cols if lo <= col[0] <= hi]
+            if len(seg) < 2:
+                return
+            pts = [(x, t) for x, t, b in seg] + [(x, b) for x, t, b in reversed(seg)]
+            flat = [v for xy in pts for v in xy]
+            c.create_polygon(flat, fill=color, outline="")
+        poly(0, w, "#c2c2c2")                 # full envelope, soft grey (unplayed)
+        if played_x > 0:
+            poly(0, played_x, "#2d7dff")      # played portion, accent blue
+        c.create_line(played_x, 0, played_x, h, fill="#1a1a1a")
 
     def _on_volume(self, val):
         if self.player is not None:
@@ -2943,7 +3041,8 @@ class App(tk.Tk):
                 if self.state() != "iconic" and not self._seeking:
                     dur = p.duration_seconds(); pos = p.position_seconds()
                     if dur > 0:
-                        self.seek.set(int(pos / dur * 1000))
+                        self._wave_pos = pos / dur
+                        self._draw_wave()
                         self.time_lbl.config(text=f"{self._fmt(pos)} / {self._fmt(dur)}")
             except tk.TclError:
                 pass
@@ -3188,7 +3287,8 @@ class App(tk.Tk):
             with ProcessPoolExecutor(max_workers=workers) as ex:
                 futs = {}
                 for (p, o, f), it in jobs.items():
-                    job = (p, o, f, it["tags"], cover_for(it), ff, bms_core._LIBRARY_ROOT)
+                    job = (p, o, f, it["tags"], cover_for(it), ff,
+                           bms_core._LIBRARY_ROOT)
                     futs[ex.submit(render_one_job, job)] = it
                 for fut in as_completed(futs):
                     it = futs[fut]
@@ -3254,23 +3354,5 @@ if __name__ == "__main__":
     # the executable; freeze_support() intercepts that so they run the worker
     # function instead of opening a second GUI window.
     multiprocessing.freeze_support()
-
-    # On Windows, running "python bms_renderer.py" keeps a console window open
-    # behind the GUI. If we're attached to a console and pythonw.exe is available,
-    # relaunch ourselves detached with pythonw so only the GUI window shows. The
-    # _BMS_NOCONSOLE guard prevents an infinite relaunch loop.
-    if (sys.platform == "win32" and not getattr(sys, "frozen", False)
-            and os.environ.get("_BMS_NOCONSOLE") != "1"):
-        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        if os.path.isfile(pyw):
-            try:
-                import subprocess
-                env = dict(os.environ, _BMS_NOCONSOLE="1")
-                subprocess.Popen([pyw, os.path.abspath(__file__)] + sys.argv[1:],
-                                 env=env, close_fds=True)
-                sys.exit(0)
-            except Exception:
-                pass   # fall through and run normally if relaunch fails
-
     App().mainloop()
 

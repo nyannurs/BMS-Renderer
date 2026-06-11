@@ -18,11 +18,20 @@ try:
     _PIL_OK = True
 except Exception:
     _PIL_OK = False
-try:
-    from scipy.signal import resample_poly
-    _SCIPY_OK = True
-except Exception:
-    _SCIPY_OK = False
+_SCIPY_OK = None          # tri-state: None = not yet probed, True/False after first use
+resample_poly = None
+def _ensure_scipy():
+    """Import scipy lazily — it's a slow import and is only needed when a keysound
+    has to be resampled, not at startup. Returns True if available."""
+    global _SCIPY_OK, resample_poly
+    if _SCIPY_OK is None:
+        try:
+            from scipy.signal import resample_poly as _rp
+            resample_poly = _rp
+            _SCIPY_OK = True
+        except Exception:
+            _SCIPY_OK = False
+    return _SCIPY_OK
 try:
     from player import Player, SD_OK as _SD_OK
 except Exception:
@@ -182,7 +191,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "1.9.7"
+APP_VERSION = "1.9.8"
 CHANGELOG = []
 
 # ============================================================================
@@ -758,7 +767,7 @@ def _resample_to_sr(audio, sr):
     nearest-neighbor) if scipy isn't installed."""
     if sr == SR:
         return audio
-    if _SCIPY_OK:
+    if _ensure_scipy():
         g = gcd(int(SR), int(sr))
         up, down = int(SR) // g, int(sr) // g
         # resample_poly applies an anti-aliasing FIR filter internally
