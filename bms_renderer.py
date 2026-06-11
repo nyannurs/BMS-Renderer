@@ -854,6 +854,9 @@ class App(tk.Tk):
         ttk.Button(tp, text="■", width=3, command=self.stop_play).pack(side="left", padx=(4,0))
         self.next_btn = ttk.Button(tp, text="⏭", width=3, command=self.next_track)
         self.next_btn.pack(side="left", padx=(4,12))
+        self.redetect_btn = ttk.Button(tp, text="⟳ Audio device", width=14,
+                                       command=self.redetect_audio_device)
+        self.redetect_btn.pack(side="left", padx=(0,12))
         self.time_lbl = ttk.Label(tp, text="0:00 / 0:00", width=14)
         self.time_lbl.pack(side="left")
         self.seek = ttk.Scale(tp, from_=0, to=1000, orient="horizontal")
@@ -2893,6 +2896,18 @@ class App(tk.Tk):
         self.time_lbl.config(text="0:00 / 0:00")
         self._playing_ctx = None
         self._update_now_playing(None)
+
+    def redetect_audio_device(self):
+        """Switch playback to the current default output device (after the user
+        changes their Windows audio output). Keeps the playhead where it is."""
+        if not _SD_OK or self.player is None:
+            return
+        ok = self.player.redetect_device()
+        if ok:
+            self.log("Audio output switched to the current default device.")
+        else:
+            self.log("Couldn't open the current default audio device.")
+            self._refresh_play_btn()
 
     # seek: drag freely with no sound, jump on release
     def _seek_grab(self, _):

@@ -35,6 +35,7 @@ class Player:
         self._cursor = 0                    # next sample frame to output
         self._lock = threading.Lock()
         self._stream = None
+        self._stream_device = None           # device index the stream was opened on
         self._state = "stopped"             # stopped | playing | paused
         self._finished_pending = False
         self._volume = 1.0                   # 0.0–1.0, applied in the callback
@@ -83,13 +84,66 @@ class Player:
             else:
                 self._cursor = end
 
+    def _query_default_device(self):
+        """Current default output device index."""
+        if not SD_OK:
+            return None
+        try:
+            dev = sd.default.device
+            out = dev[1] if isinstance(dev, (list, tuple)) else dev
+            if out is None or out < 0:
+                return sd.query_hostapis(sd.default.hostapi)["default_output_device"]
+            return out
+        except Exception:
+            return None
+
     def _ensure_stream(self):
+        if not SD_OK:
+            raise RuntimeError("sounddevice/PortAudio not available")
         if self._stream is None:
-            if not SD_OK:
-                raise RuntimeError("sounddevice/PortAudio not available")
+            want = self._query_default_device()
             self._stream = sd.OutputStream(
                 samplerate=self.sr, channels=2, dtype="float32",
-                callback=self._callback)
+                device=want, callback=self._callback)
+            self._stream_device = want
+
+    def redetect_device(self):
+        """Re-read the system audio devices and move playback to the current default
+        output, preserving the playhead. Called manually (button) after the user
+        switches their Windows output device. Safe whether playing, paused, or
+        stopped. Returns True if it switched without error."""
+        if not SD_OK:
+            return False
+        was_playing = (self._state == "playing")
+        with self._lock:
+            pos = self._cursor
+        # close the stream first, THEN reinit PortAudio (terminating with a live
+        # stream open would crash) so it sees the newly-selected default device
+        if self._stream is not None:
+            try:
+                self._stream.stop(); self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        try:
+            sd._terminate(); sd._initialize()
+        except Exception:
+            pass
+        want = self._query_default_device()
+        try:
+            self._stream = sd.OutputStream(
+                samplerate=self.sr, channels=2, dtype="float32",
+                device=want, callback=self._callback)
+            self._stream_device = want
+            with self._lock:
+                self._cursor = pos
+            if was_playing:
+                self._stream.start()
+            return True
+        except Exception:
+            self._stream = None
+            self._state = "stopped"
+            return False
 
     def play(self):
         """Start or resume playback from the current cursor."""

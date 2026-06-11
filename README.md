@@ -57,6 +57,7 @@ First library scan is slow; after that it's cached and fast.
 
 ## Changelog
 
+- **1.9.7** — Replaced the unreliable automatic audio-device switching with a "⟳ Audio device" button in the player bar: click it after changing your system's audio output to move playback to the new device, keeping your place in the song. Fixes the earlier playback breakage.
 - **1.9.3** — Added MP3 export at a fixed 320 kbps. Appears as a format option when ffmpeg is installed, with full tags (including Album Artist) and embedded cover art.
 - **1.9.2** — Tagging, album views, and polish.
   - Album tag now writes what you type (it was stuck on "BMS"), and empty albums are allowed.
