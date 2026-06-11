@@ -1,5 +1,7 @@
 # BMS Renderer
 
+![Screenshot](https://i.imgur.com/NI21a1S.png)
+
 This program is vibe coded, JSYK.
 
 BMS Renderer turns a BMS library into a tagged music collection. It scans your
@@ -43,7 +45,7 @@ First library scan is slow; after that it's cached and fast.
 - **Custom Playlists** — build playlists, render them to their own folder, or
   re-curate songs from one playlist into another. Each playlist is a portable
   JSON file that resolves on anyone's library by hash.
-- **Queue** — collect songs, edit tags (Album is always "BMS"), set per-song or
+- **Queue** — collect songs, edit tags, set per-song or
   whole-queue cover art, then render everything. Batch rendering uses multiple
   CPU cores.
 - **Player** — seek, volume, shuffle, loop, prev/next, near-gapless auto-advance.
@@ -55,6 +57,23 @@ First library scan is slow; after that it's cached and fast.
 
 ## Changelog
 
+- **1.9.3** — Added MP3 export at a fixed 320 kbps. Appears as a format option when ffmpeg is installed, with full tags (including Album Artist) and embedded cover art.
+- **1.9.2** — Tagging, album views, and polish.
+  - Album tag now writes what you type (it was stuck on "BMS"), and empty albums are allowed.
+  - Added an Album Artist tag — the correct way to group a render into one album in music players. Album and Album Artist are session-wide: empty at startup, applied to every queued song (and any added afterward), and reset on restart.
+  - Keyboard tagging: UP/DOWN move between songs; TAB/Shift-TAB cycle only the tag fields (Title–BPM, wrapping).
+  - Tags carry over when you send a song to another playlist or the queue (Album/Album Artist excluded).
+  - Custom Playlists: edit tags and pick art per song, saved into the playlist's .json to tag now and render later. Missing art on a shared playlist falls back gracefully instead of crashing.
+  - "Assign black square" button for a clean black cover (generated in memory, shows in the preview, persists per playlist entry).
+  - Album view for Tables, Custom Playlists, and Queue (the Discovery-style art grid), with a highlighted selected/now-playing tile; the Queue plays left-to-right. Tables album view shows level headers between rows.
+  - Shift-click to multi-select in Tables/Playlists, then right-click to add all to the queue or a playlist.
+  - The console window no longer stays open behind the app on Windows (with a fallback if it can't relaunch).
+  - Fixed Album view freezing on large tables; removed the diamonds from the Discovery tab name; no-art square is now true black.
+  - Internal cleanup: faster indexed lookups, removed dead code.
+- **1.8.0** — Added album view mode toggle for most tabs. Album tag now writes what you type (was stuck on "BMS"). Added an Album Artist tag for grouping renders into one album. Album/Album Artist are session-wide (empty on startup, applied to all queued + newly-added songs, reset on restart). TAB between tag fields, DOWN to next song. Edit tags and pick art in Custom Playlists — saved into the playlist .json to tag now and render later, with graceful fallback if a shared playlist's art file is missing.
+- **1.6.8** — Discovery now fills in correctly if opened while the library cache is still loading.
+- **1.6.7** — Discovery: hovering anywhere on a tile (including the art) triggers
+  the title marquee.
 - **1.6.6** — Discovery: fixed the artist line being clipped; tiles now fit the
   art and both text lines with a gap between rows.
 - **1.6.5** — Discovery: added spacing between rows.

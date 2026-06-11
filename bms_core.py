@@ -182,43 +182,8 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "1.6.7"
-CHANGELOG = [
-    ("1.6.7", "Discovery: hovering anywhere on a tile (including the art) now "
-              "triggers the title marquee, and moving within a tile no longer "
-              "restarts it."),
-    ("1.6.6", "Discovery: fixed the artist line being clipped -- tiles are now tall "
-              "enough to fit the art and both text lines, with a gap between rows."),
-    ("1.6.5", "Discovery: added vertical spacing between rows so artist names no "
-              "longer sit flush against the next row of art."),
-    ("1.6.4", "Discovery now uses view recycling: only the tiles currently on "
-              "screen exist as widgets, reused as you scroll, so scrolling stays "
-              "smooth no matter how large your library is. Fixed the right-hand "
-              "panels being squished when toggling 'Songs only'."),
-    ("1.6.3", "Discovery scrolls smoothly now (larger scroll steps + deferred "
-              "loading fix the fast-scroll glitch) and thumbnails load in parallel "
-              "for faster fill-in. Fixed the right-hand panels getting squished when "
-              "'Songs only' was toggled on."),
-    ("1.6.2", "Discovery: fixed the grid glitching out during fast scrolling "
-              "(rapid loads could overlap); art that doesn't fill the square is "
-              "now centered on black again; taller tiles so artist names aren't "
-              "clipped, and long artist names also marquee on hover."),
-    ("1.6.1", "Discovery is now an infinite-scrolling art grid of your whole "
-              "library (no more batches); long titles marquee on hover and no longer "
-              "distort the grid; tiles frame the art without cropping. Discovery "
-              "right-click adds 'Show all charts' and 'Add to playlist'. Library: "
-              "BPM column left-aligned; the Notes column reads 'Chart count' in "
-              "Songs-only mode. Discovery sits between Library and Tables."),
-    ("1.6.0", "Library: new 'Songs only' toggle groups the list by song (one "
-              "expandable row per folder, no 2000-row cap); double-clicking a song "
-              "row plays a casual-friendly chart (100-500 notes, widening upward if "
-              "none). New Discovery tab: a grid of random songs from your library "
-              "with cover art (stagefile, falling back to any folder image or a BGA "
-              "frame) -- double-click a tile to listen, hit New batch to reroll. "
-              "Playlists: right-click now offers 'Add to playlist' so a master "
-              "playlist can be re-curated into smaller ones."),
-    ("1.5.4", "Official public release."),
-]
+APP_VERSION = "1.9.3"
+CHANGELOG = []
 
 # ============================================================================
 #  LIBRARY PROTECTION  --  this section guarantees the library is never written
@@ -1008,11 +973,15 @@ def render_bms(path, log=lambda s: None):
 
 def write_tags_to_file(path, fmt, tags, cover):
     """Write format-appropriate tags. FLAC/OGG get full tags + cover; WAV basic only.
-    Module-level so both the GUI and render worker processes can call it."""
+    Module-level so both the GUI and render worker processes can call it.
+    Album and Album Artist are written as given (may be empty)."""
+    album = tags.get("Album", "")
+    album_artist = tags.get("AlbumArtist", "")
     if fmt == "FLAC":
         f = FLAC(path)
         f["title"] = tags.get("Title",""); f["artist"] = tags.get("Artist","")
-        f["album"] = "BMS"; f["genre"] = tags.get("Genre","")
+        f["album"] = album; f["genre"] = tags.get("Genre","")
+        if album_artist: f["albumartist"] = album_artist
         if tags.get("BPM"): f["bpm"] = tags["BPM"]
         if cover:
             pic = Picture(); pic.type = 3; pic.mime = "image/jpeg"
@@ -1021,13 +990,15 @@ def write_tags_to_file(path, fmt, tags, cover):
         f.save()
     elif fmt == "WAV":
         from mutagen.wave import WAVE
-        from mutagen.id3 import TIT2, TPE1, TALB, TCON
+        from mutagen.id3 import TIT2, TPE1, TPE2, TALB, TCON
         f = WAVE(path)
         if f.tags is None:
             f.add_tags()
         f.tags.add(TIT2(encoding=3, text=tags.get("Title","")))
         f.tags.add(TPE1(encoding=3, text=tags.get("Artist","")))
-        f.tags.add(TALB(encoding=3, text="BMS"))
+        f.tags.add(TALB(encoding=3, text=album))
+        if album_artist:
+            f.tags.add(TPE2(encoding=3, text=album_artist))
         f.tags.add(TCON(encoding=3, text=tags.get("Genre","")))
         f.save()
     elif fmt == "OGG":
@@ -1036,13 +1007,33 @@ def write_tags_to_file(path, fmt, tags, cover):
         from mutagen.flac import Picture as _Pic
         f = OggVorbis(path)
         f["title"] = tags.get("Title",""); f["artist"] = tags.get("Artist","")
-        f["album"] = "BMS"; f["genre"] = tags.get("Genre","")
+        f["album"] = album; f["genre"] = tags.get("Genre","")
+        if album_artist: f["albumartist"] = album_artist
         if tags.get("BPM"): f["bpm"] = tags["BPM"]
         if cover:
             pic = _Pic(); pic.type = 3; pic.mime = "image/jpeg"
             pic.desc = "Cover"; pic.data = cover
             f["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
         f.save()
+
+    elif fmt == "MP3":
+        from mutagen.id3 import (ID3, TIT2, TPE1, TPE2, TALB, TCON, TBPM, APIC,
+                                 ID3NoHeaderError)
+        try:
+            f = ID3(path)
+        except ID3NoHeaderError:
+            f = ID3()
+        f.add(TIT2(encoding=3, text=tags.get("Title","")))
+        f.add(TPE1(encoding=3, text=tags.get("Artist","")))
+        f.add(TALB(encoding=3, text=album))
+        if album_artist:
+            f.add(TPE2(encoding=3, text=album_artist))
+        f.add(TCON(encoding=3, text=tags.get("Genre","")))
+        if tags.get("BPM"):
+            f.add(TBPM(encoding=3, text=str(tags["BPM"])))
+        if cover:
+            f.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover))
+        f.save(path)
 
 def _encode_ogg_ffmpeg(ff, audio, out_path):
     import subprocess
@@ -1075,6 +1066,22 @@ def _encode_flac_ffmpeg(ff, audio, out_path):
             try: os.remove(tmp_wav)
             except OSError: pass
 
+def _encode_mp3_ffmpeg(ff, audio, out_path):
+    import subprocess
+    tmp_wav = out_path + ".tmp.wav"
+    try:
+        sf.write(tmp_wav, audio, SR, format="WAV")
+        proc = subprocess.run([ff, "-y", "-i", tmp_wav, "-c:a", "libmp3lame",
+                               "-b:a", "320k", out_path],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              **_no_window_kwargs())
+        if proc.returncode != 0:
+            raise RuntimeError("ffmpeg failed: " + proc.stderr.decode("utf-8","replace")[-300:])
+    finally:
+        if os.path.exists(tmp_wav):
+            try: os.remove(tmp_wav)
+            except OSError: pass
+
 def render_one_job(job):
     """Render ONE song to its final tagged file. Runs in a worker process.
     `job` = (in_path, out_path, fmt, tags, cover_bytes, ffmpeg, library_root).
@@ -1088,6 +1095,8 @@ def render_one_job(job):
         assert_safe_output(out_path)
         if fmt == "OGG":
             _encode_ogg_ffmpeg(ff, audio, out_path)
+        elif fmt == "MP3":
+            _encode_mp3_ffmpeg(ff, audio, out_path)
         elif fmt == "FLAC" and ff:
             _encode_flac_ffmpeg(ff, audio, out_path)
         else:
