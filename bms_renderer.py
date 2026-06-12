@@ -681,12 +681,12 @@ class App(tk.Tk):
         qbtns = ttk.Frame(q_tab); qbtns.pack(fill="x", pady=4)
         ttk.Button(qbtns, text="Remove from Queue", command=self.remove_from_queue).pack(side="left")
         ttk.Button(qbtns, text="Clear Queue", command=self.clear_queue).pack(side="left", padx=6)
+        self.render_btn = ttk.Button(qbtns, text="▶ Render All in Queue", command=self.render_all)
+        self.render_btn.pack(side="right")
         self.bga_btn = ttk.Button(qbtns, text="▶ Render All BGA in Queue",
                                   command=self.render_all_bga)
         if ffmpeg_path():
-            self.bga_btn.pack(side="right", padx=(6,0))
-        self.render_btn = ttk.Button(qbtns, text="▶ Render All in Queue", command=self.render_all)
-        self.render_btn.pack(side="right")
+            self.bga_btn.pack(side="right", padx=(0,6))
         # render controls, packed left-to-right in reading order, before the button
         ctrls = ttk.Frame(qbtns); ctrls.pack(side="right", padx=(0,8))
         cpu = os.cpu_count() or 4
@@ -2865,7 +2865,10 @@ class App(tk.Tk):
         composites still images."""
         from concurrent.futures import ProcessPoolExecutor, as_completed
         ff = ffmpeg_path()
-        fps, size = 30, (640, 480)        # output framerate and frame size
+        # fps and a target size CAP. The actual video dimensions are derived from
+        # each BGA's own aspect ratio (so square BGAs stay square, no letterboxing);
+        # this just caps the largest side.
+        fps, size = 30, (720, 720)
         try:
             items = list(self.queue)
             # decide which charts are eligible (have an image BGA we can composite)
@@ -2886,7 +2889,8 @@ class App(tk.Tk):
                 return
             workers = self._render_worker_count()
             total = len(jobs); done = 0
-            self.log(f"Rendering {total} BGA video(s) at {size[0]}x{size[1]} {fps}fps "
+            self.log(f"Rendering {total} BGA video(s) at up to {max(size)}px {fps}fps "
+                     f"(sized to each BGA's aspect ratio) "
                      f"with {workers} worker process(es)… "
                      f"({skipped} chart(s) skipped — video/no BGA)")
             with ProcessPoolExecutor(max_workers=workers) as ex:

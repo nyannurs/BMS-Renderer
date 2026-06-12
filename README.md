@@ -20,7 +20,7 @@ a `Playlists` folder.
 
 1. Install Python from <https://www.python.org/downloads/> (tick **"Add
    python.exe to PATH"**).
-2. Install `ffmpeg`.
+2. Install `ffmpeg` (don't forget to **add it to PATH**).
 3. Install the dependencies:
    ```
    pip install soundfile numpy mutagen Pillow scipy sounddevice

@@ -192,7 +192,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "1.9.17"
+APP_VERSION = "1.9.20"
 CHANGELOG = []
 
 # ============================================================================
@@ -1296,29 +1296,70 @@ def render_bga_video_job(job):
         events, bga_seconds, _missing = bga_timeline(in_path)
         duration = max(audio_seconds, bga_seconds)
 
-        # 3) pre-load & letterbox each distinct image onto a black canvas once
-        W, H = size
+        # 3) choose output dimensions from the BGA's OWN aspect ratio so the image
+        #    fills the frame with no letterboxing and no cropping. We don't trust the
+        #    FIRST image (it's often a wide title/loading card while the real animated
+        #    BGA is square). Instead we measure every distinct BGA image and pick the
+        #    dimensions that dominate the timeline (most events use them).
+        target = max(size)
+        from collections import Counter
+        dim_time = Counter()           # (w,h) -> number of events using it
+        dim_seen = {}                  # path -> (w,h), measured once
+        for _t, p in events:
+            if not p:
+                continue
+            if p not in dim_seen:
+                try:
+                    with Image.open(p) as _im:
+                        dim_seen[p] = _im.size
+                except Exception:
+                    dim_seen[p] = None
+            wh = dim_seen[p]
+            if wh and wh[0] > 0 and wh[1] > 0:
+                dim_time[wh] += 1
+        if dim_time:
+            iw, ih = dim_time.most_common(1)[0][0]    # the dominant frame size
+        else:
+            iw, ih = target, target
+        if iw >= ih:
+            W = target; H = max(2, round(target * ih / iw))
+        else:
+            H = target; W = max(2, round(target * iw / ih))
+        W -= W % 2; H -= H % 2                  # H.264 needs even width/height
         black = Image.new("RGB", (W, H), (0, 0, 0))
         cache = {}
         def frame_for(img_path):
             if img_path in cache:
                 return cache[img_path]
+            if img_path is None:
+                raw = black.tobytes()
+                cache[img_path] = raw
+                return raw
             canvas = black.copy()
-            if img_path:
-                try:
-                    im = Image.open(img_path).convert("RGB")
-                    im.thumbnail((W, H), Image.LANCZOS)
-                    canvas.paste(im, ((W - im.width) // 2, (H - im.height) // 2))
-                except Exception:
-                    pass
+            try:
+                im = Image.open(img_path).convert("RGB")
+                # scale to fill the frame, preserving aspect, NEVER cropping. We must
+                # scale UP as well as down (thumbnail() only shrinks), so small source
+                # BGAs (e.g. 256x256) fill the 720px frame instead of sitting tiny in
+                # a sea of black. Fit = min ratio so the whole image stays visible.
+                iw, ih = im.size
+                if iw > 0 and ih > 0:
+                    scale = min(W / iw, H / ih)
+                    nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
+                    im = im.resize((nw, nh), Image.LANCZOS)
+                canvas.paste(im, ((W - im.width) // 2, (H - im.height) // 2))
+            except Exception:
+                pass
             raw = canvas.tobytes()
             cache[img_path] = raw
             return raw
 
-        # 4) build a per-output-frame image lookup: at time t, show the last BGA
-        #    event whose time <= t
-        ev = [(t, p) for t, p in events] or [(0.0, None)]
-        ev.sort(key=lambda x: x[0])
+        # 4) per-output-frame lookup: show the last BGA event whose time <= t.
+        #    Prepend a blank (None) at t=0 so nothing shows BEFORE the first real
+        #    BGA event instead of freezing on frame 1.
+        ev = sorted(((t, p) for t, p in events), key=lambda x: x[0])
+        if not ev or ev[0][0] > 0.0:
+            ev = [(0.0, None)] + ev
         total_frames = max(1, int(duration * fps))
 
         # 5) pipe raw frames to ffmpeg, muxing the wav; ffmpeg encodes H.264 + AAC
