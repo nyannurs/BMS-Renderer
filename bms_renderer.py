@@ -19,7 +19,7 @@ All pure logic (parser, render engine, cache, playlists, config, tables) lives i
 bms_core.py; this file is the Tkinter GUI on top of it.
 """
 
-import os, sys, threading, traceback
+import os, sys, time, threading, traceback
 
 # ---- Console-hide relaunch (must run BEFORE the heavy imports below) ----
 # Running "python bms_renderer.py" on Windows keeps a console window open behind
@@ -533,10 +533,31 @@ class App(tk.Tk):
         self._mid = mid
 
         # ---- right panel FIRST so pack reserves its fixed width before the
-        #      notebook claims the rest (prevents the tree from squishing it) ----
-        right = ttk.Frame(mid, width=340); right.pack(side="right", fill="y", padx=(8,0))
-        right.pack_propagate(False)
-        self._right = right
+        #      notebook claims the rest (prevents the tree from squishing it).
+        #      Its contents live in a scrollable canvas so everything stays
+        #      reachable on short screens (e.g. 1080p laptops). ----
+        right_outer = ttk.Frame(mid, width=340); right_outer.pack(side="right", fill="y", padx=(8,0))
+        right_outer.pack_propagate(False)
+        self._right = right_outer
+        right_canvas = tk.Canvas(right_outer, highlightthickness=0, width=340)
+        right_vsb = ttk.Scrollbar(right_outer, orient="vertical",
+                                  command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_vsb.set)
+        right_vsb.pack(side="right", fill="y")
+        right_canvas.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(right_canvas)          # the actual content parent
+        self._right_inner = right
+        self._right_canvas = right_canvas
+        _rwin = right_canvas.create_window((0, 0), window=right, anchor="nw", width=326)
+        def _right_scrollregion(_=None):
+            right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+        right.bind("<Configure>", _right_scrollregion)
+        # scroll the right panel with the wheel only when the pointer is over it
+        right_canvas.bind("<Enter>", lambda e: setattr(self, "_right_hot", True))
+        right_canvas.bind("<Leave>", lambda e: setattr(self, "_right_hot", False))
+        right.bind("<Enter>", lambda e: setattr(self, "_right_hot", True))
+        right.bind("<Leave>", lambda e: setattr(self, "_right_hot", False))
+        self._right_hot = False
 
         # ---- left: notebook with the tabs ----
         self.nb = ttk.Notebook(mid); self.nb.pack(side="left", fill="both", expand=True)
@@ -920,9 +941,9 @@ class App(tk.Tk):
 
         # Pack the main area LAST so it fills whatever's left above the log/transport.
         self._mid.pack(fill="both", expand=True, padx=8, pady=(4,0))
-        # Minimum size chosen so the right panel (Tags + BMS information + Album art)
-        # always fits without clipping.
-        self.minsize(980, 720)
+        # The right panel scrolls, so the window can be shorter than the panel's
+        # full height without clipping anything (helps on 1080p laptops).
+        self.minsize(980, 560)
 
         self.log(f"BMS Renderer v{APP_VERSION} ready.")
         self._now_full = ""
@@ -1029,15 +1050,8 @@ class App(tk.Tk):
         self.log("Album art set: solid black square (resets when you close the app).")
         # if a playlist song is selected, persist the black square to its entry too,
         # so it survives reboots just like a normal art pick does there
-        if self.selected_kind == "playlist" and self.selected_index is not None:
-            name = self.pl_pick.get()
-            i = self.selected_index
-            if name in self._playlists and i < len(self._playlists[name]):
-                entry = self._playlists[name][i]
-                if isinstance(entry, dict):
-                    entry["art"] = "__BLACK__"
-                    save_one_playlist(name, self._playlists[name])
-                    self.log("Saved black square to this playlist entry.")
+        if self._save_pl_entry_art("__BLACK__"):
+            self.log("Saved black square to this playlist entry.")
 
     # ---------------- per-song folder art picker ----------------
     def _load_song_art_for(self, song_path, queue_item=None):
@@ -1147,14 +1161,7 @@ class App(tk.Tk):
         qi = self._song_art_qitem
         if qi is not None:
             qi["art"] = art                       # queued song: in-memory cover pick
-        if self.selected_kind == "playlist" and self.selected_index is not None:
-            name = self.pl_pick.get()
-            i = self.selected_index
-            if name in self._playlists and i < len(self._playlists[name]):
-                entry = self._playlists[name][i]
-                if isinstance(entry, dict):
-                    entry["art"] = art
-                    save_one_playlist(name, self._playlists[name])
+        self._save_pl_entry_art(art)              # playlist song: persist to its JSON
 
     _ART_BOX = 200   # fixed square size for the preview (keeps the layout from shifting)
 
@@ -1562,12 +1569,7 @@ class App(tk.Tk):
                  if r.get("owned") and r.get("song") and r["entry"].get("level") == level]
         if not owned:
             self.log(f"No owned charts in level {level}."); return
-        best = {}
-        for s in owned:
-            folder = os.path.dirname(os.path.normcase(os.path.abspath(s["path"])))
-            cur = best.get(folder)
-            if cur is None or _num(s.get("notes")) < _num(cur.get("notes")):
-                best[folder] = s
+        best = self._lowest_per_folder(owned)
         queued = {q["path"] for q in self.queue}
         added = 0
         for s in best.values():
@@ -1631,12 +1633,7 @@ class App(tk.Tk):
         if not owned:
             self.log("No owned charts in this table to queue."); return
         # one per folder: keep the chart with the fewest notes
-        best = {}
-        for s in owned:
-            folder = os.path.dirname(os.path.normcase(os.path.abspath(s["path"])))
-            cur = best.get(folder)
-            if cur is None or _num(s.get("notes")) < _num(cur.get("notes")):
-                best[folder] = s
+        best = self._lowest_per_folder(owned)
         queued_paths = {q["path"] for q in self.queue}
         added = 0
         for s in best.values():
@@ -1887,6 +1884,9 @@ class App(tk.Tk):
             if g is not None and g._hot:
                 g.on_mousewheel(event)
                 return
+        # otherwise, if the pointer is over the (scrollable) right panel, scroll it
+        if getattr(self, "_right_hot", False) and getattr(self, "_right_canvas", None):
+            self._right_canvas.yview_scroll(-(event.delta // 120), "units")
 
     def _album_click(self, idx, rep, charts):
         self.selected_kind = "library"; self.selected_index = None
@@ -1916,6 +1916,18 @@ class App(tk.Tk):
         menu.tk_popup(event.x_root, event.y_root)
 
     # ---- Album-view toggles for Tables / Playlists / Queue ----
+    @staticmethod
+    def _lowest_per_folder(songs):
+        """One song per folder: the chart with the fewest notes. Used when adding a
+        whole table/level to the queue (one representative chart per song folder)."""
+        best = {}
+        for s in songs:
+            folder = os.path.dirname(os.path.normcase(os.path.abspath(s["path"])))
+            cur = best.get(folder)
+            if cur is None or _num(s.get("notes")) < _num(cur.get("notes")):
+                best[folder] = s
+        return best
+
     def _charts_for_folder(self, path):
         """All charts in the same folder as `path` (a song's difficulties),
         via the prebuilt folder index — O(1) instead of scanning the library."""
@@ -2337,6 +2349,28 @@ class App(tk.Tk):
                 self._pl_plmenu, self._pl_selected_song,
                 get_tags=lambda i=int(iid): self._pl_saved_tags(i))
         self._plmenu.tk_popup(event.x_root, event.y_root)
+
+    def _current_pl_entry(self):
+        """The (name, entry-dict) for the currently-selected playlist song, or
+        (None, None) if no playlist song is selected / the entry isn't a dict."""
+        if self.selected_kind != "playlist" or self.selected_index is None:
+            return None, None
+        name = self.pl_pick.get(); i = self.selected_index
+        if name in self._playlists and i < len(self._playlists[name]):
+            entry = self._playlists[name][i]
+            if isinstance(entry, dict):
+                return name, entry
+        return None, None
+
+    def _save_pl_entry_art(self, value):
+        """Persist an art value (a path or the "__BLACK__" sentinel) onto the
+        currently-selected playlist entry and write the file. Returns True if saved."""
+        name, entry = self._current_pl_entry()
+        if entry is not None:
+            entry["art"] = value
+            save_one_playlist(name, self._playlists[name])
+            return True
+        return False
 
     def _pl_saved_tags(self, i):
         """The saved tags dict for playlist row i (for tag inheritance)."""

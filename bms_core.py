@@ -8,7 +8,7 @@ application (bms_renderer.py) imports from this module, so there is a single
 source of truth shared by the app and the test suite.
 """
 
-import os, re, sys, json, time, io, threading, traceback
+import os, re, sys, json, io, traceback
 from math import gcd
 import numpy as np
 import soundfile as sf
@@ -191,7 +191,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "1.9.8"
+APP_VERSION = "1.9.9"
 CHANGELOG = []
 
 # ============================================================================
