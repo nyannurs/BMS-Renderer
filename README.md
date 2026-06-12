@@ -20,14 +20,12 @@ a `Playlists` folder.
 
 1. Install Python from <https://www.python.org/downloads/> (tick **"Add
    python.exe to PATH"**).
-2. Install the dependencies:
+2. Install ffmpeg.
+3. Install the dependencies:
    ```
    pip install soundfile numpy mutagen Pillow scipy sounddevice
    ```
-3. Run `bms_renderer.py` (double-click it, or `python bms_renderer.py`).
-
-Optional: if `ffmpeg` is on your PATH you also get OGG export and
-maximum-compression FLAC. Without it, FLAC and WAV still work.
+4. Run `bms_renderer.py` (double-click it, or `python bms_renderer.py`).
 
 First library scan is slow; after that it's cached and fast.
 
@@ -48,6 +46,7 @@ First library scan is slow; after that it's cached and fast.
 - **Queue** — collect songs, edit tags, set per-song or
   whole-queue cover art, then render everything. Batch rendering uses multiple
   CPU cores.
+- **Render Sequence BGA** — you can choose to render BMP/JPG/PNG sequence BGAs together with the song. Needs `ffmpeg` to work.
 - **Player** — seek, volume, shuffle, loop, prev/next, near-gapless auto-advance.
 - **Your BMS files are never touched** — the app only ever reads your charts,
   sound files, and folders. Rendered audio is written exclusively to the separate

@@ -42,6 +42,7 @@ SR = 44100
 BMS_EXTS = (".bms", ".bme", ".bml", ".pms")
 AUDIO_EXTS = (".ogg", ".wav", ".flac", ".mp3", ".aiff", ".aif")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+VIDEO_EXTS = (".mpg", ".mpeg", ".mp4", ".avi", ".wmv", ".webm", ".flv", ".m4v", ".mov", ".mkv")
 
 def list_folder_images(folder, include_bmp=False):
     """Return image file paths in `folder`, sorted by name. When include_bmp is
@@ -191,7 +192,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "1.9.14"
+APP_VERSION = "1.9.17"
 CHANGELOG = []
 
 # ============================================================================
@@ -328,6 +329,65 @@ def parse_bms(path):
 # ---- channel classification (mirrors the bmx2wav reference) ----
 def _ch(s):  # base-36 value of a 2-char channel string
     return int(s, 36)
+
+def detect_bga(path):
+    """Inspect a BMS chart for a BGA, WITHOUT rendering anything. Returns a dict:
+        {"type": "sequence" | "static" | "video" | "none",
+         "frames": int,        # number of distinct base-layer (ch 04) image changes
+         "images": int}        # count of #BMP defs that point to images
+
+    Only the base BGA layer (channel 04) is considered — overlay (07) and
+    poor/miss (0A) layers are intentionally ignored, since the goal is the main
+    animated visual. 'sequence' means the base layer switches images at 2+ points
+    in time (an animation); 'static' means a single image shown the whole song;
+    'video' means at least one referenced BGA file is a video format.
+    """
+    bmp_table = {}            # id(int) -> filename (from #BMPxx)
+    for line in read_bms_text(path).splitlines():
+        line = line.strip()
+        if not line.startswith("#"):
+            continue
+        m = re.match(r"#BMP([0-9A-Za-z]{2})\s+(.+)", line, re.IGNORECASE)
+        if m:
+            try:
+                bmp_table[b36(m.group(1).upper())] = m.group(2).strip()
+            except ValueError:
+                pass
+    if not bmp_table:
+        return {"type": "none", "frames": 0, "images": 0}
+
+    # collect base-layer (channel 04) events: each measure's payload is a run of
+    # 2-char base-36 objects; a non-"00" object is an image-change at that slot
+    base_objs = []            # list of bmp ids actually placed on the timeline
+    for line in read_bms_text(path).splitlines():
+        line = line.strip()
+        mm = re.match(r"#(\d{3})04:(.*)", line)
+        if not mm:
+            continue
+        payload = mm.group(2).strip()
+        for i in range(0, len(payload) - 1, 2):
+            obj = payload[i:i+2]
+            if obj != "00":
+                try:
+                    base_objs.append(b36(obj.upper()))
+                except ValueError:
+                    pass
+
+    # which referenced BMP files are videos vs images?
+    used_ids = set(base_objs) or set(bmp_table)
+    has_video = any(os.path.splitext(bmp_table.get(i, ""))[1].lower() in VIDEO_EXTS
+                    for i in used_ids)
+    image_count = sum(1 for fn in bmp_table.values()
+                      if os.path.splitext(fn)[1].lower() in IMAGE_EXTS)
+
+    if has_video:
+        return {"type": "video", "frames": len(base_objs), "images": image_count}
+    if not base_objs:
+        return {"type": "none", "frames": 0, "images": image_count}
+    if len(base_objs) >= 2:
+        return {"type": "sequence", "frames": len(base_objs), "images": image_count}
+    return {"type": "static", "frames": 1, "images": image_count}
+
 
 def _num(v):
     """Coerce a possibly-blank, possibly-string value to a float for sorting.
@@ -737,6 +797,19 @@ def find_audio(folder, name):
             return cand
     return None
 
+def find_image(folder, name):
+    """BGA often names a .bmp but ships .png (or vice versa). Try exact, then swap
+    among known image extensions."""
+    exact = os.path.join(folder, name)
+    if os.path.exists(exact):
+        return exact
+    stem = os.path.splitext(name)[0]
+    for ext in IMAGE_EXTS:
+        cand = os.path.join(folder, stem + ext)
+        if os.path.exists(cand):
+            return cand
+    return None
+
 def process_cover(path, max_px=1000, max_bytes=500_000):
     """Load a JPEG/PNG and return safe-spec JPEG bytes for embedding:
        RGB, at most max_px on the long edge, at most max_bytes.
@@ -1090,6 +1163,214 @@ def _encode_mp3_ffmpeg(ff, audio, out_path):
         if os.path.exists(tmp_wav):
             try: os.remove(tmp_wav)
             except OSError: pass
+
+def bga_timeline(path):
+    """Extract the base-layer (channel 04) BGA as a list of (seconds, image_path)
+    events, using the SAME tempo/measure-length/STOP accumulator as render_bms so
+    the visuals line up with the audio. Returns (events, total_seconds, missing):
+      events  : [(t_seconds, abs_image_path_or_None), ...] in time order
+      total_seconds : length of the chart in seconds (for the final frame hold)
+      missing : count of referenced BGA images not found on disk
+    Only images are resolved; video-format BGA files resolve to None (skipped)."""
+    d = parse_bms(path)
+    header, bars = d["header"], d["bars"]
+    bpm_table, stop_table = d["bpm_table"], d["stop_table"]
+    folder = os.path.dirname(path)
+
+    # #BMPxx table (re-read; parse_bms doesn't keep it)
+    bmp_table = {}
+    for line in read_bms_text(path).splitlines():
+        line = line.strip()
+        m = re.match(r"#BMP([0-9A-Za-z]{2})\s+(.+)", line, re.IGNORECASE)
+        if m:
+            try:
+                bmp_table[b36(m.group(1).upper())] = m.group(2).strip()
+            except ValueError:
+                pass
+
+    try:
+        base_bpm = float(header.get("BPM", 120)) or 120.0
+    except (ValueError, TypeError):
+        base_bpm = 120.0
+    if not bars:
+        return [], 0.0, 0
+
+    max_measure = max(bars.keys())
+    events = []           # (sample_pos, bmp_id)
+    bpm = base_bpm
+    sample_pos = 0.0
+
+    for measure in range(max_measure + 1):
+        bar = bars.get(measure, {})
+        ratio = 1.0
+        if "02" in bar:
+            try:
+                ratio = float(bar["02"][-1]) or 1.0
+            except (ValueError, IndexError):
+                ratio = 1.0
+        # resolution must account for tempo channels (03/08/09) AND the BGA
+        # channel (04) so timing matches render_bms exactly
+        resolution = 1
+        tracked = {}      # chan -> [pairs,...]
+        for chan, payloads in bar.items():
+            if chan == "02":
+                continue
+            if chan not in ("03", "08", "09", "04"):
+                continue
+            for payload in payloads:
+                pairs = [payload[i:i+2] for i in range(0, len(payload) - len(payload) % 2, 2)]
+                n = len(pairs)
+                if n == 0:
+                    continue
+                resolution = resolution * n // gcd(resolution, n)
+                tracked.setdefault(chan, []).append(pairs)
+
+        for step in range(resolution):
+            stop_here = 0.0
+            for chan, lines in tracked.items():
+                for pairs in lines:
+                    n = len(pairs)
+                    if (step * n) % resolution != 0:
+                        continue
+                    pair = pairs[(step * n) // resolution]
+                    if pair == "00" or pair == "":
+                        continue
+                    try:
+                        val = b36(pair.upper())
+                    except ValueError:
+                        continue
+                    if chan == "03":                      # inline hex BPM
+                        try: bpm = float(int(pair.upper(), 16))
+                        except ValueError: pass
+                    elif chan == "08":                    # extended BPM
+                        if val in bpm_table: bpm = bpm_table[val]
+                    elif chan == "09":                    # STOP
+                        stop_here = stop_table.get(val, 0.0)
+                    elif chan == "04":                    # BGA base layer
+                        events.append((sample_pos, val))
+            if bpm <= 0:
+                bpm = base_bpm
+            sample_pos += (SR * 60.0 / bpm) / (resolution / 4.0) * ratio
+            if stop_here != 0.0:
+                sample_pos += (SR * 60.0 / bpm) * (stop_here / 192.0 * 4.0)
+
+    total_seconds = sample_pos / SR
+    # resolve bmp ids to image paths (videos → None/skip)
+    out, missing = [], 0
+    for sp, bid in events:
+        fn = bmp_table.get(bid)
+        img = None
+        if fn:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in IMAGE_EXTS:
+                img = find_image(folder, fn)
+                if img is None:
+                    missing += 1
+        out.append((sp / SR, img))
+    return out, total_seconds, missing
+
+
+def render_bga_video_job(job):
+    """Render ONE chart to an MP4 with its image-sequence BGA synced to the audio.
+    Runs in a worker process. job = (in_path, out_path, ffmpeg, library_root, fps, size).
+    Returns (out_path, title, None) on success or (out_path, title, error_str).
+    Strategy: render audio with render_bms; build the channel-04 BGA timeline; feed
+    raw RGB frames to ffmpeg at a fixed fps while muxing the audio in one pass."""
+    in_path, out_path, ff, lib_root, fps, size = job
+    title = os.path.basename(in_path)
+    try:
+        import subprocess
+        from PIL import Image
+        set_library_root(lib_root)
+        assert_safe_output(out_path)
+        if not ff:
+            raise RuntimeError("ffmpeg is required for BGA video export")
+
+        # 1) audio
+        audio, _ = render_bms(in_path)
+        tmp_wav = out_path + ".tmp.wav"
+        sf.write(tmp_wav, audio, SR, format="WAV")
+        audio_seconds = len(audio) / SR
+
+        # 2) BGA timeline (image events in seconds)
+        events, bga_seconds, _missing = bga_timeline(in_path)
+        duration = max(audio_seconds, bga_seconds)
+
+        # 3) pre-load & letterbox each distinct image onto a black canvas once
+        W, H = size
+        black = Image.new("RGB", (W, H), (0, 0, 0))
+        cache = {}
+        def frame_for(img_path):
+            if img_path in cache:
+                return cache[img_path]
+            canvas = black.copy()
+            if img_path:
+                try:
+                    im = Image.open(img_path).convert("RGB")
+                    im.thumbnail((W, H), Image.LANCZOS)
+                    canvas.paste(im, ((W - im.width) // 2, (H - im.height) // 2))
+                except Exception:
+                    pass
+            raw = canvas.tobytes()
+            cache[img_path] = raw
+            return raw
+
+        # 4) build a per-output-frame image lookup: at time t, show the last BGA
+        #    event whose time <= t
+        ev = [(t, p) for t, p in events] or [(0.0, None)]
+        ev.sort(key=lambda x: x[0])
+        total_frames = max(1, int(duration * fps))
+
+        # 5) pipe raw frames to ffmpeg, muxing the wav; ffmpeg encodes H.264 + AAC
+        cmd = [ff, "-y", "-loglevel", "error",
+               "-f", "rawvideo", "-pixel_format", "rgb24",
+               "-video_size", f"{W}x{H}", "-framerate", str(fps), "-i", "pipe:0",
+               "-i", tmp_wav,
+               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+               "-c:a", "aac", "-b:a", "192k", "-shortest", out_path]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                **_no_window_kwargs())
+        # CRITICAL: drain ffmpeg's stdout/stderr on background threads while we feed
+        # frames to stdin. If we don't, ffmpeg's stderr pipe fills, ffmpeg blocks,
+        # it stops reading stdin, and our writes block too — a deadlock (0-byte file).
+        import threading as _th
+        captured = {"err": b"", "out": b""}
+        def _drain(stream, key):
+            try:
+                captured[key] = stream.read()
+            except Exception:
+                pass
+        t_err = _th.Thread(target=_drain, args=(proc.stderr, "err"), daemon=True)
+        t_out = _th.Thread(target=_drain, args=(proc.stdout, "out"), daemon=True)
+        t_err.start(); t_out.start()
+        ei = 0
+        try:
+            try:
+                for fno in range(total_frames):
+                    t = fno / fps
+                    while ei + 1 < len(ev) and ev[ei + 1][0] <= t:
+                        ei += 1
+                    proc.stdin.write(frame_for(ev[ei][1]))
+            except BrokenPipeError:
+                pass                       # ffmpeg exited early; error captured below
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            proc.wait()
+            t_err.join(timeout=5); t_out.join(timeout=5)
+            if proc.returncode != 0:
+                msg = captured["err"].decode("utf-8", "replace")[-300:]
+                raise RuntimeError("ffmpeg failed: " + msg)
+        finally:
+            if os.path.exists(tmp_wav):
+                try: os.remove(tmp_wav)
+                except OSError: pass
+        return (out_path, title, None)
+    except Exception:
+        return (out_path, title, traceback.format_exc())
+
 
 def render_one_job(job):
     """Render ONE song to its final tagged file. Runs in a worker process.

@@ -60,6 +60,7 @@ from bms_core import (
     db_connect, scan_library, file_md5,
     parse_bms, count_playable_notes, detect_mode_from_bars,
     render_bms, render_one_job, write_tags_to_file, process_cover, list_folder_images,
+    render_bga_video_job, detect_bga,
     pick_playable_chart, pick_discovery_art,
     load_tables_file, save_tables_file, fetch_table,
     load_playlists, save_one_playlist, delete_playlist_file,
@@ -680,6 +681,10 @@ class App(tk.Tk):
         qbtns = ttk.Frame(q_tab); qbtns.pack(fill="x", pady=4)
         ttk.Button(qbtns, text="Remove from Queue", command=self.remove_from_queue).pack(side="left")
         ttk.Button(qbtns, text="Clear Queue", command=self.clear_queue).pack(side="left", padx=6)
+        self.bga_btn = ttk.Button(qbtns, text="▶ Render All BGA in Queue",
+                                  command=self.render_all_bga)
+        if ffmpeg_path():
+            self.bga_btn.pack(side="right", padx=(6,0))
         self.render_btn = ttk.Button(qbtns, text="▶ Render All in Queue", command=self.render_all)
         self.render_btn.pack(side="right")
         # render controls, packed left-to-right in reading order, before the button
@@ -2840,6 +2845,67 @@ class App(tk.Tk):
         self.render_btn.config(state="disabled")
         fmt = self.fmt_pick.get().upper()
         threading.Thread(target=self._render_queue, args=(out_dir, fmt), daemon=True).start()
+
+    def render_all_bga(self):
+        if not self.queue:
+            messagebox.showinfo("Queue empty", "Add songs to the queue first."); return
+        out_dir = load_config().get("output")
+        if not out_dir or not os.path.isdir(out_dir):
+            messagebox.showinfo("No output folder", "Choose an output folder first."); return
+        if not ffmpeg_path():
+            messagebox.showinfo("ffmpeg required",
+                                "BGA video export needs ffmpeg on your PATH."); return
+        self.bga_btn.config(state="disabled")
+        threading.Thread(target=self._render_bga_queue, args=(out_dir,), daemon=True).start()
+
+    def _render_bga_queue(self, out_dir):
+        """Render each queued chart that has an image-sequence (or static) BGA to an
+        MP4 with the audio synced, in parallel across worker processes. Charts whose
+        BGA is video-format or absent are skipped (logged), since this path only
+        composites still images."""
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        ff = ffmpeg_path()
+        fps, size = 30, (640, 480)        # output framerate and frame size
+        try:
+            items = list(self.queue)
+            # decide which charts are eligible (have an image BGA we can composite)
+            jobs = []
+            skipped = 0
+            for it in items:
+                info = detect_bga(it["path"])
+                if info["type"] in ("sequence", "static"):
+                    title = it["tags"].get("Title", "untitled")
+                    out_path = os.path.join(out_dir, self._safe_filename(title) + ".mp4")
+                    jobs.append(((it["path"], out_path, ff,
+                                  bms_core._LIBRARY_ROOT, fps, size), it))
+                else:
+                    skipped += 1
+            if not jobs:
+                self.log("No queued charts have an image BGA to render "
+                         f"({skipped} skipped: video/none).")
+                return
+            workers = self._render_worker_count()
+            total = len(jobs); done = 0
+            self.log(f"Rendering {total} BGA video(s) at {size[0]}x{size[1]} {fps}fps "
+                     f"with {workers} worker process(es)… "
+                     f"({skipped} chart(s) skipped — video/no BGA)")
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(render_bga_video_job, job): it for job, it in jobs}
+                for fut in as_completed(futs):
+                    it = futs[fut]; done += 1
+                    try:
+                        out_path, title, err = fut.result()
+                    except Exception:
+                        self.log(f"  [{done}/{total}] worker crashed: "
+                                 f"{it['tags'].get('Title')}")
+                        continue
+                    if err:
+                        self.log(f"  [{done}/{total}] FAILED: {title}\n{err}")
+                    else:
+                        self.log(f"  [{done}/{total}] done -> {out_path}")
+            self.log("BGA render complete.")
+        finally:
+            self.after(0, lambda: self.bga_btn.config(state="normal"))
 
     def _safe_filename(self, name):
         bad = '<>:"/\\|?*'
