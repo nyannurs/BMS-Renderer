@@ -191,7 +191,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "1.9.9"
+APP_VERSION = "1.9.14"
 CHANGELOG = []
 
 # ============================================================================

@@ -120,6 +120,7 @@ class AlbumGrid:
         self._token = 0
         self._selected = None
         self._ph = None
+        self._collapsed = set()      # section labels currently collapsed
 
     def refresh(self, reset_scroll=True):
         self._token += 1
@@ -149,34 +150,53 @@ class AlbumGrid:
 
     def _layout(self):
         """Compute (x, y) for every item plus header bands, accounting for section
-        breaks. Cached per (cols, item-count, sections) so it's cheap to reuse."""
+        breaks and collapsed sections. Cached per (cols, items, sections, collapsed)."""
         items = self._items()
         cols = self._cols
         sections = (self.get_sections() or {}) if self.get_sections else {}
-        key = (cols, len(items), tuple(sorted(sections.items())))
+        collapsed = getattr(self, "_collapsed", set())
+        key = (cols, len(items), tuple(sorted(sections.items())),
+               tuple(sorted(collapsed)))
         if getattr(self, "_layout_key", None) == key and getattr(self, "_layout_cache", None):
             return self._layout_cache
-        positions = []          # positions[i] = (x, y) for item i
-        headers = []            # (y, label)
+        # map each item index to the label of the section it belongs to
+        starts = sorted(sections.items())            # [(start_idx, label), ...]
+        positions = [None] * len(items)              # None ⇒ hidden (collapsed)
+        headers = []            # (y, label, collapsed_bool)
         y = self.PAD
         col = 0
+        cur_label = None
+        cur_collapsed = False
         for i in range(len(items)):
             if i in sections:
-                if col != 0:                      # finish the current row first
-                    y += self.ROW_H
-                    col = 0
-                headers.append((y, sections[i]))
+                if col != 0:
+                    y += self.ROW_H; col = 0
+                cur_label = sections[i]
+                cur_collapsed = cur_label in collapsed
+                headers.append((y, cur_label, cur_collapsed))
                 y += self.SECTION_H
+            if cur_collapsed:
+                positions[i] = None                  # item hidden under collapsed header
+                continue
             x = self.PAD + col * (self.TILE + self.PAD * 2)
-            positions.append((x, y))
+            positions[i] = (x, y)
             col += 1
             if col >= cols:
-                col = 0
-                y += self.ROW_H
+                col = 0; y += self.ROW_H
         total = y + (self.ROW_H if col != 0 else 0) + self.PAD
         self._layout_key = key
         self._layout_cache = (positions, headers, total)
         return self._layout_cache
+
+    def toggle_section(self, label):
+        if not hasattr(self, "_collapsed"):
+            self._collapsed = set()
+        if label in self._collapsed:
+            self._collapsed.discard(label)
+        else:
+            self._collapsed.add(label)
+        self._layout_key = None
+        self._clamp(); self._redraw()
 
     def _content_h(self):
         if not self._items():
@@ -225,20 +245,29 @@ class AlbumGrid:
             self.canvas.delete("section")
             self._update_sb(); return
         positions, headers, _total = self._layout()
-        # draw header bands (cheap canvas items, redrawn each pass)
+        # draw header bands; each is clickable to collapse/expand its section
         self.canvas.delete("section")
-        for hy, label in headers:
+        for hy, label, is_collapsed in headers:
             yy = hy - self._scroll
             if yy > ch or yy + self.SECTION_H < 0:
                 continue
-            self.canvas.create_text(self.PAD, yy + self.SECTION_H // 2,
-                                    anchor="w", text=label, fill="#333",
-                                    font=("", 11, "bold"), tags="section")
+            arrow = "\u25b8 " if is_collapsed else "\u25be "   # ▸ collapsed / ▾ expanded
+            tid = self.canvas.create_text(
+                self.PAD, yy + self.SECTION_H // 2, anchor="w",
+                text=arrow + label, fill="#333",
+                font=("", 11, "bold"), tags=("section", "sechdr"))
+            # bind the click on this specific header text to toggle its section
+            self.canvas.tag_bind(tid, "<Button-1>",
+                                 lambda e, lb=label: self.toggle_section(lb))
             self.canvas.create_line(self.PAD, yy + self.SECTION_H - 2,
                                     self.canvas.winfo_width() - self.PAD,
-                                    yy + self.SECTION_H - 2, fill="#ccc", tags="section")
+                                    yy + self.SECTION_H - 2,
+                                    fill="#ccc", tags="section")
         used = set(); slot = 0
-        for i, (x, ay) in enumerate(positions):
+        for i, pos in enumerate(positions):
+            if pos is None:               # item is under a collapsed section
+                continue
+            x, ay = pos
             y = ay - self._scroll
             if y + self.ROW_H < 0:
                 continue
@@ -550,8 +579,20 @@ class App(tk.Tk):
         self._right_canvas = right_canvas
         _rwin = right_canvas.create_window((0, 0), window=right, anchor="nw", width=326)
         def _right_scrollregion(_=None):
-            right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+            # use the inner frame's REAL required height, not bbox("all") (which can
+            # include stretched/empty window-item space and create phantom scroll room)
+            content_h = right.winfo_reqheight()
+            view_h = right_canvas.winfo_height()
+            # if everything fits, scrollregion == viewport so the bar stays inactive
+            # and there's no empty space to scroll into
+            region_h = max(content_h, view_h)
+            right_canvas.configure(scrollregion=(0, 0, 326, region_h))
         right.bind("<Configure>", _right_scrollregion)
+        right_canvas.bind("<Configure>", _right_scrollregion)
+        # compute the scrollregion once the panel is fully laid out, so the
+        # scrollbar reflects the real content height immediately (not greyed out)
+        self.after_idle(_right_scrollregion)
+        self.after(300, _right_scrollregion)
         # scroll the right panel with the wheel only when the pointer is over it
         right_canvas.bind("<Enter>", lambda e: setattr(self, "_right_hot", True))
         right_canvas.bind("<Leave>", lambda e: setattr(self, "_right_hot", False))
@@ -858,6 +899,11 @@ class App(tk.Tk):
         self.song_art_next.pack(side="left")
         self._bind_art_hold(self.song_art_next, 1)
         self._art_repeat_job = None   # pending auto-repeat timer, if any
+        # scrubber: drag to flip through the folder's images (kept in sync with ◀ ▶)
+        self.song_art_slider = ttk.Scale(pic, from_=1, to=1, orient="horizontal",
+                                         command=self._on_art_slider)
+        self.song_art_slider.pack(fill="x", padx=10, pady=(2,0))
+        self._art_slider_sync = False   # guard so programmatic .set() doesn't recurse
         brow = ttk.Frame(pic); brow.pack(fill="x", padx=6, pady=(0,6))
         # fixed width + clipping so a long filename can't change the panel width
         self.song_art_status = ttk.Label(brow, text="", foreground="#666",
@@ -866,11 +912,6 @@ class App(tk.Tk):
         self.ignore_bmp = tk.BooleanVar(value=True)
         ttk.Checkbutton(brow, text="ignore .bmp", variable=self.ignore_bmp,
                         command=self._reload_song_art).pack(side="right")
-        # type-in jump: enter an image number and press Enter to go straight to it
-        self.song_art_jump = ttk.Entry(brow, width=5, justify="center")
-        self.song_art_jump.pack(side="right", padx=(0,6))
-        self.song_art_jump.bind("<Return>", lambda e: self._song_art_goto())
-        ttk.Label(brow, text="Go to #:").pack(side="right")
         # per-song picker state
         self._song_art_files = []   # image paths in the current song's folder
         self._song_art_idx = 0      # which one is shown/selected
@@ -917,11 +958,19 @@ class App(tk.Tk):
         self.wave.bind("<ButtonRelease-1>", self._wave_release)
         self._wave_env = None      # cached amplitude envelope (list of 0..1)
         self._wave_pos = 0.0       # 0..1 progress for the fill overlay
-        # volume control (bottom-right); items pack right-to-left
-        self.vol = ttk.Scale(tp, from_=0, to=100, orient="horizontal", length=110,
-                             command=self._on_volume)
-        self.vol.set(100)
-        self.vol.pack(side="right", padx=(0,4))
+        # volume control: a horizontally-stretched triangle that fills left→right,
+        # styled like the waveform (blue fill over grey). Click/drag to set.
+        self.vol_level = 1.0       # 0..1
+        self.vol = tk.Canvas(tp, width=110, height=24, highlightthickness=0)
+        try:
+            self.vol.config(bg=ttk.Style(self).lookup("TFrame", "background")
+                            or self.cget("background"))
+        except tk.TclError:
+            pass
+        self.vol.pack(side="right", padx=(0,6))
+        self.vol.bind("<Configure>", lambda e: self._draw_vol())
+        self.vol.bind("<ButtonPress-1>", self._vol_set_from_event)
+        self.vol.bind("<B1-Motion>", self._vol_set_from_event)
         # shuffle / loop toggles (left of volume). Checkbuttons read as on/off.
         self.loop_on = tk.BooleanVar(value=False)
         self.shuffle_on = tk.BooleanVar(value=False)
@@ -1135,22 +1184,30 @@ class App(tk.Tk):
         self._on_art_selected()
         self._render_song_art()
 
-    def _song_art_goto(self):
-        """Jump to the image number typed in the 'Go to #' box (1-based, matching the
-        '2 / 7' display). Ignores junk / out-of-range input."""
-        n = len(self._song_art_files)
-        if n == 0:
+    def _on_art_slider(self, val):
+        """Scrub to the image the slider points at (1-based). Guarded so the
+        programmatic .set() done while rendering doesn't recurse."""
+        if self._art_slider_sync or not self._song_art_files:
             return
-        raw = self.song_art_jump.get().strip()
-        try:
-            idx = int(raw) - 1            # display is 1-based
-        except ValueError:
+        idx = int(round(float(val))) - 1
+        idx = max(0, min(idx, len(self._song_art_files) - 1))
+        if idx == self._song_art_idx:
             return
-        idx = max(0, min(idx, n - 1))     # clamp into range
         self._song_art_idx = idx
         self._on_art_selected()
-        self.song_art_jump.delete(0, "end")   # clear the box after jumping
         self._render_song_art()
+
+    def _sync_art_slider(self):
+        """Point the slider at the current image without re-triggering its command."""
+        n = len(self._song_art_files)
+        self._art_slider_sync = True
+        try:
+            self.song_art_slider.config(from_=1, to=max(1, n),
+                                        state=("normal" if n > 1 else "disabled"))
+            self.song_art_slider.set(self._song_art_idx + 1)
+        except tk.TclError:
+            pass
+        self._art_slider_sync = False
 
     def _on_art_selected(self):
         """Record the currently-shown art as the selection for whatever is active:
@@ -1175,6 +1232,7 @@ class App(tk.Tk):
             self.song_art_canvas.config(image=self._song_art_thumb,
                                         text="(no images)", compound="center")
             self.song_art_status.config(text="")
+            self._sync_art_slider()
             return
         path = self._song_art_files[self._song_art_idx]
         name = os.path.basename(path)
@@ -1182,6 +1240,7 @@ class App(tk.Tk):
             name = name[:13] + "…"
         self.song_art_status.config(
             text=f"{self._song_art_idx+1} / {n}  ·  {name}")
+        self._sync_art_slider()
         try:
             from PIL import Image
             import io as _io, base64 as _b64
@@ -1218,7 +1277,7 @@ class App(tk.Tk):
         state = "normal" if enabled else "disabled"
         self.song_art_prev.config(state=state)
         self.song_art_next.config(state=state)
-        self.song_art_jump.config(state=state)
+        self.song_art_slider.config(state=state)
 
     def _update_cfg(self, **kw):
         cfg = load_config(); cfg.update(kw); save_config(cfg)
@@ -3052,6 +3111,34 @@ class App(tk.Tk):
         if played_x > 0:
             poly(0, played_x, "#2d7dff")      # played portion, accent blue
         c.create_line(played_x, 0, played_x, h, fill="#1a1a1a")
+
+    def _draw_vol(self):
+        """Draw a horizontal triangle (thin at left, tall at right); fill it blue up
+        to the current level over a grey base — same palette as the waveform."""
+        c = getattr(self, "vol", None)
+        if c is None:
+            return
+        c.delete("all")
+        w = max(1, c.winfo_width()); h = int(c.winfo_height())
+        base = h - 2
+        # full triangle outline shape: (0,base) → (w,base) → (w, top)
+        def tri(x_to, color):
+            if x_to <= 0:
+                return
+            y_at = base - (x_to / w) * (base - 2)   # height of the hypotenuse at x_to
+            pts = [0, base, x_to, base, x_to, y_at]
+            c.create_polygon(pts, fill=color, outline="")
+        tri(w, "#c2c2c2")                       # full triangle, grey
+        tri(self.vol_level * w, "#2d7dff")      # filled portion, blue
+        # thin level marker
+        x = self.vol_level * w
+        c.create_line(x, base, x, base - (x / w) * (base - 2), fill="#1a1a1a")
+
+    def _vol_set_from_event(self, e):
+        w = max(1, self.vol.winfo_width())
+        self.vol_level = min(1.0, max(0.0, e.x / w))
+        self._draw_vol()
+        self._on_volume(self.vol_level * 100.0)
 
     def _on_volume(self, val):
         if self.player is not None:
