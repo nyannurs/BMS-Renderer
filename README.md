@@ -24,7 +24,7 @@ a `Playlists` folder.
 1. Install Python from <https://www.python.org/downloads/> (tick **"Add
    python.exe to PATH"**).
 2. Install `ffmpeg` (don't forget to **add it to PATH**).
-3. Install the dependencies (you can ignore `pypresence` if you don't want Discord RPC:
+3. Install the dependencies (you can ignore `pypresence` if you don't want Discord RPC):
    ```
    pip install PyQt5 soundfile numpy mutagen Pillow scipy sounddevice pypresence
    ```
