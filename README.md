@@ -1,17 +1,20 @@
 # BMS Renderer
 
-![Screenshot](https://i.imgur.com/NI21a1S.png)
+![Screenshot](https://i.imgur.com/dvwTJp9.png)
 
 This program is vibe coded, JSYK.
 
 BMS Renderer turns a BMS library into a tagged music collection. It scans your
 charts, lets you browse and play them like a music player, and renders them to
-FLAC, WAV, or OGG with proper tags and cover art — keysounds, BPM changes, and
-stops are handled the way bmx2wav does it.
+FLAC, WAV, or OGG with proper tags and cover art — keysounds, BPM changes, stops,
+and `#RANDOM`/`#SWITCH` charts are handled the way bmx2wav does it.
+
+Version 2.0 moves the interface to a Qt frontend and follows your OS light/dark
+theme.
 
 ## Folder structure
 
-Keep `bms_renderer.py`, `bms_core.py`, and `player.py` together in one folder.
+Keep `bms_renderer_qt.py`, `bms_core.py`, and `player.py` together in one folder.
 That folder is also where the app writes its own files: the cache
 (`bms_cache.db`), settings (`bms_config.json`), saved tables (`tables.json`), and
 a `Playlists` folder.
@@ -23,9 +26,9 @@ a `Playlists` folder.
 2. Install `ffmpeg` (don't forget to **add it to PATH**).
 3. Install the dependencies:
    ```
-   pip install soundfile numpy mutagen Pillow scipy sounddevice
+   pip install PyQt5 soundfile numpy mutagen Pillow scipy sounddevice
    ```
-4. Run `bms_renderer.py` (double-click it, or `python bms_renderer.py`).
+4. Run `bms_renderer_qt.py` (double-click it, or `python bms_renderer_qt.py`).
 
 First library scan is slow; after that it's cached and fast.
 
@@ -39,7 +42,8 @@ First library scan is slow; after that it's cached and fast.
   Double-click a tile to listen; right-click to queue, jump to its charts, or add
   it to a playlist.
 - **Tables** — paste a difficulty-table URL and it loads and saves itself,
-  matched to your library by chart hash. Charts are grouped by level.
+  matched to your library by chart hash. Charts are grouped by level, with an
+  album view and collapse/expand controls.
 - **Custom Playlists** — build playlists, render them to their own folder, or
   re-curate songs from one playlist into another. Each playlist is a portable
   JSON file that resolves on anyone's library by hash.

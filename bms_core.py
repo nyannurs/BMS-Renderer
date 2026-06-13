@@ -192,7 +192,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "1.9.20"
+APP_VERSION = "2.0.0"
 CHANGELOG = []
 
 # ============================================================================
@@ -273,18 +273,146 @@ def parse_bms(path):
     bars = {}
     has_random = False
 
+    # ---- #RANDOM / #SWITCH control-flow state ----
+    # We evaluate control flow deterministically so the audio render and the BGA
+    # timeline always pick the SAME branch (a seeded RNG keyed to the file path).
+    # Spec block structure (hitkey BMS command memo, <CONTROL FLOW>):
+    #   #RANDOM n / #SETRANDOM n   -> choose an integer in [1,n] (SETRANDOM forces n)
+    #   #IF n .. [#ELSEIF n ..] [#ELSE ..] #ENDIF   -> branch on the active value
+    #   #ENDRANDOM                 -> close the RANDOM scope
+    #   #SWITCH n / #SETSWITCH n   -> choose [1,n]; C-style switch with fall-through
+    #   #CASE n .. [#SKIP] / #DEF  -> a matching #CASE starts execution and FALLS
+    #                                 THROUGH later cases until #SKIP (like break)
+    #   #ENDSW                     -> close the SWITCH scope
+    # Lines inside a scope but outside any #IF/#CASE always apply. Blocks nest.
+    import random as _random
+    rng = _random.Random(os.path.basename(path))   # deterministic per chart
+
+    rand_stack = []        # stack of active #RANDOM values
+    if_stack = []          # stack of #IF dicts: {"active": bool, "matched": bool}
+    # stack of #SWITCH dicts: {"value": int, "active": bool, "matched": bool,
+    #                          "skipped": bool}
+    sw_stack = []
+
+    def _emitting():
+        # emit only if every enclosing #IF and #CASE level is currently active
+        return (all(f["active"] for f in if_stack) and
+                all(s["active"] for s in sw_stack))
+
     for line in read_bms_text(path).splitlines():
         line = line.strip()
         if not line.startswith("#"):
             continue
         body = line[1:]
-
-        # flag the #RANDOM control family (we don't evaluate it yet, just detect it)
         up = body.upper()
-        if (up.startswith("RANDOM") or up.startswith("SETRANDOM") or
-                up.startswith("IF") or up.startswith("ELSEIF") or
-                up.startswith("ENDIF") or up.startswith("ENDRANDOM")):
+
+        # ---- control-flow commands (consumed here, never stored) ----
+        cf = up.split(None, 1)
+        head = cf[0] if cf else ""
+        arg = cf[1].strip() if len(cf) > 1 else ""
+
+        if head in ("RANDOM", "SETRANDOM"):
             has_random = True
+            try:
+                n = int(float(arg))
+            except (ValueError, IndexError):
+                n = 1
+            if n < 1:
+                n = 1
+            val = n if head == "SETRANDOM" else rng.randint(1, n)
+            rand_stack.append(val)
+            continue
+        if head == "ENDRANDOM":
+            if rand_stack:
+                rand_stack.pop()
+            continue
+        if head == "IF":
+            has_random = True
+            cur = rand_stack[-1] if rand_stack else None
+            try:
+                want = int(float(arg))
+            except (ValueError, IndexError):
+                want = None
+            match = (cur is not None and want == cur)
+            if_stack.append({"active": match, "matched": match})
+            continue
+        if head == "ELSEIF":
+            if if_stack:
+                cur = rand_stack[-1] if rand_stack else None
+                try:
+                    want = int(float(arg))
+                except (ValueError, IndexError):
+                    want = None
+                top = if_stack[-1]
+                if top["matched"]:
+                    top["active"] = False           # a previous branch already won
+                else:
+                    top["active"] = (cur is not None and want == cur)
+                    if top["active"]:
+                        top["matched"] = True
+            continue
+        if head == "ELSE":
+            if if_stack:
+                top = if_stack[-1]
+                top["active"] = not top["matched"]
+                top["matched"] = True
+            continue
+        if head == "ENDIF" or up.replace(" ", "") == "ENDIF":
+            if if_stack:
+                if_stack.pop()
+            continue
+        if head in ("SWITCH", "SETSWITCH"):
+            has_random = True
+            try:
+                n = int(float(arg))
+            except (ValueError, IndexError):
+                n = 1
+            if n < 1:
+                n = 1
+            val = n if head == "SETSWITCH" else rng.randint(1, n)
+            # a new switch starts inactive until a #CASE/#DEF matches
+            sw_stack.append({"value": val, "active": False,
+                             "matched": False, "skipped": False})
+            continue
+        if head == "CASE":
+            if sw_stack:
+                top = sw_stack[-1]
+                try:
+                    want = int(float(arg))
+                except (ValueError, IndexError):
+                    want = None
+                if top["skipped"]:
+                    top["active"] = False          # a #SKIP already closed this switch
+                elif top["active"]:
+                    pass                           # fall-through: stay active
+                elif want is not None and want == top["value"]:
+                    top["active"] = True           # this case matches -> start emitting
+                    top["matched"] = True
+            continue
+        if head == "DEF":
+            if sw_stack:
+                top = sw_stack[-1]
+                if top["skipped"]:
+                    top["active"] = False
+                elif top["active"]:
+                    pass                           # fell through into #DEF
+                elif not top["matched"]:
+                    top["active"] = True           # default branch
+                    top["matched"] = True
+            continue
+        if head == "SKIP":
+            if sw_stack and sw_stack[-1]["active"]:   # break out only from a taken case
+                sw_stack[-1]["active"] = False
+                sw_stack[-1]["skipped"] = True
+            continue
+        if head == "ENDSW":
+            if sw_stack:
+                sw_stack.pop()
+            continue
+
+        # outside an active branch? skip this line entirely
+        if (if_stack or sw_stack) and not _emitting():
+            continue
 
         # channel data: mmmCC:payload  (mmm=measure base-10, CC=channel base-36)
         m = re.match(r"(\d{3})([0-9A-Za-z]{2}):(.*)", body)
@@ -661,10 +789,21 @@ def delete_playlist_file(name):
         pass
 
 def _http_get(url, timeout=20):
-    import urllib.request
+    import urllib.request, ssl
     req = urllib.request.Request(url, headers={"User-Agent": "BMS-Renderer"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", errors="replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as e:
+        # some table hosts (e.g. stellabms.xyz) serve expired/self-signed certs;
+        # other BMS players accept them, so fall back to an unverified context
+        if isinstance(getattr(e, "reason", None), ssl.SSLError) or "CERTIFICATE" in str(e).upper():
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                return r.read().decode("utf-8", errors="replace")
+        raise
 
 def _resolve(base, ref):
     import urllib.parse
@@ -676,6 +815,9 @@ def fetch_table(url, log=lambda s: None):
     The page's meta-bmstable points to a header JSON; the header's data_url
     points to the data JSON (an array of chart entries keyed by md5)."""
     import re as _re, json as _json
+    url = url.strip()
+    if not _re.match(r"^https?://", url, _re.IGNORECASE):
+        url = "https://" + url          # user typed "stellabms.xyz/..." with no scheme
     header_url = url
     # If given the HTML page, find <meta name="bmstable" content="header.json">
     if not url.lower().endswith(".json"):

@@ -24,8 +24,6 @@ except Exception:
     sd = None
     SD_OK = False
 
-import numpy as np
-
 
 class Player:
     def __init__(self, samplerate=44100, on_finished=None):
@@ -57,7 +55,23 @@ class Player:
 
     # ---- core control ----
     def load(self, buffer):
-        """Load a new song buffer and reset to the start (does not auto-play)."""
+        """Load a new song buffer and reset to the start (does not auto-play). The
+        buffer is normalized to contiguous float32 stereo here so the realtime audio
+        callback never converts dtype/shape/layout (a common cause of stutter)."""
+        try:
+            import numpy as np
+            a = np.asarray(buffer)
+            if a.dtype != np.float32:
+                a = a.astype(np.float32)
+            if a.ndim == 1:
+                a = np.column_stack([a, a])
+            elif a.ndim == 2 and a.shape[1] == 1:
+                a = np.repeat(a, 2, axis=1)
+            elif a.ndim == 2 and a.shape[1] > 2:
+                a = a[:, :2]
+            buffer = np.ascontiguousarray(a, dtype=np.float32)
+        except Exception:
+            pass
         self.stop()
         with self._lock:
             self._buf = buffer
@@ -104,7 +118,7 @@ class Player:
             want = self._query_default_device()
             self._stream = sd.OutputStream(
                 samplerate=self.sr, channels=2, dtype="float32",
-                device=want, callback=self._callback)
+                device=want, callback=self._callback, latency="high")
             self._stream_device = want
 
     def redetect_device(self):
@@ -133,7 +147,7 @@ class Player:
         try:
             self._stream = sd.OutputStream(
                 samplerate=self.sr, channels=2, dtype="float32",
-                device=want, callback=self._callback)
+                device=want, callback=self._callback, latency="high")
             self._stream_device = want
             with self._lock:
                 self._cursor = pos
