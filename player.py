@@ -5,17 +5,28 @@ Wraps sounddevice in a small state machine with:
   - sample-accurate playback position (for the timeline)
   - play / pause / resume / stop
   - seek to an arbitrary position (used on drag-release)
-  - an on-finished callback (so the queue can auto-advance)
+  - an on-finished flag (so the queue can auto-advance)
 
-Design notes:
+Design notes (why a feeder thread, not a callback):
   * The whole song is a numpy float32 stereo array already in memory (the render
     engine produces it), so "seek" is just moving an integer sample cursor.
-  * We use an OutputStream with a callback that copies frames out of the buffer
-    starting at the cursor, advancing it. Position = cursor / samplerate.
-  * Everything that touches the cursor is guarded by a lock, because the audio
-    callback runs on PortAudio's own thread.
+  * Instead of giving PortAudio a Python *callback* (which then runs ON PortAudio's
+    realtime thread and is therefore at the mercy of the GIL — any Python/GC pause
+    starves it and you hear a stutter), we open a PLAIN OutputStream and push audio
+    to it from our OWN dedicated feeder thread using the blocking `stream.write()`.
+  * PortAudio keeps a sizeable internal buffer (we ask for latency="high"). The
+    feeder races ahead to keep that buffer full; PortAudio drains it at the hardware
+    clock independently of Python. So if Python briefly stalls, PortAudio just keeps
+    playing out of its cushion — the hiccup is absorbed instead of becoming a gap.
+  * The feeder owns the cursor while playing. The GUI only reads it (atomic int) for
+    the timeline and writes it on a (rare) seek.
 """
 import threading
+
+try:
+    import numpy as np
+except Exception:
+    np = None
 
 try:
     import sounddevice as sd
@@ -26,40 +37,57 @@ except Exception:
 
 
 class Player:
+    # Frames per write block. ~93ms at 44.1kHz: large enough that per-block Python
+    # overhead is negligible and the feeder stays well ahead of the hardware drain,
+    # small enough that pause/seek still feel responsive.
+    BLOCKSIZE = 4096
+
     def __init__(self, samplerate=44100, on_finished=None):
         self.sr = samplerate
-        self.on_finished = on_finished      # called (from main thread ideally) at end
+        self.on_finished = on_finished
         self._buf = None                    # current song: (N, 2) float32
         self._cursor = 0                    # next sample frame to output
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()       # guards _buf/_cursor for seek vs feeder
         self._stream = None
-        self._stream_device = None           # device index the stream was opened on
+        self._stream_device = None
         self._state = "stopped"             # stopped | playing | paused
         self._finished_pending = False
-        self._volume = 1.0                   # 0.0–1.0, applied in the callback
+        self._volume = 1.0
+
+        # feeder-thread machinery
+        self._feeder = None
+        self._run = False                   # feeder keeps looping while True
+        self._resume = threading.Event()    # set = play, clear = pause (feeder waits)
 
     def set_volume(self, v):
         self._volume = max(0.0, min(1.0, float(v)))
+
     # ---- queries ----
     @property
     def state(self):
         return self._state
 
     def duration_seconds(self):
-        with self._lock:
-            return 0.0 if self._buf is None else len(self._buf) / self.sr
+        b = self._buf
+        return 0.0 if b is None else len(b) / self.sr
 
     def position_seconds(self):
-        with self._lock:
-            return self._cursor / self.sr
+        # The feeder races ahead of the speaker by roughly the stream's output
+        # latency; subtract it so the timeline reflects what's actually being heard.
+        pos = self._cursor / self.sr
+        try:
+            if self._stream is not None and self._state == "playing":
+                pos -= float(self._stream.latency)
+        except Exception:
+            pass
+        return max(0.0, pos)
 
     # ---- core control ----
     def load(self, buffer):
         """Load a new song buffer and reset to the start (does not auto-play). The
-        buffer is normalized to contiguous float32 stereo here so the realtime audio
-        callback never converts dtype/shape/layout (a common cause of stutter)."""
+        buffer is normalized to contiguous float32 stereo up-front so the feeder
+        never has to convert dtype/shape/layout while playing."""
         try:
-            import numpy as np
             a = np.asarray(buffer)
             if a.dtype != np.float32:
                 a = a.astype(np.float32)
@@ -70,6 +98,9 @@ class Player:
             elif a.ndim == 2 and a.shape[1] > 2:
                 a = a[:, :2]
             buffer = np.ascontiguousarray(a, dtype=np.float32)
+            # clip ONCE here so the feeder can hand PortAudio direct slices at full
+            # volume without per-block clipping work
+            np.clip(buffer, -1.0, 1.0, out=buffer)
         except Exception:
             pass
         self.stop()
@@ -77,29 +108,7 @@ class Player:
             self._buf = buffer
             self._cursor = 0
 
-    def _callback(self, outdata, frames, time_info, status):
-        # Runs on PortAudio's thread. Fill outdata from the buffer at the cursor.
-        with self._lock:
-            if self._buf is None:
-                outdata.fill(0)
-                return
-            start = self._cursor
-            end = min(start + frames, len(self._buf))
-            n = end - start
-            if n > 0:
-                outdata[:n] = self._buf[start:end]
-                if self._volume != 1.0:
-                    outdata[:n] *= self._volume
-            if n < frames:
-                outdata[n:].fill(0)          # pad tail with silence
-                self._cursor = len(self._buf)
-                # mark finished; the main loop polls this and fires the callback
-                self._finished_pending = True
-            else:
-                self._cursor = end
-
     def _query_default_device(self):
-        """Current default output device index."""
         if not SD_OK:
             return None
         try:
@@ -111,53 +120,75 @@ class Player:
         except Exception:
             return None
 
+    def _open_stream(self, device):
+        """Open a plain (callback-less) blocking output stream with a deliberately
+        deep buffer. blocksize=0 lets PortAudio choose its optimal internal size, and
+        a concrete high latency (~0.25s) gives a fat cushion so a late feeder refill
+        is absorbed instead of heard as a gap."""
+        return sd.OutputStream(
+            samplerate=self.sr, channels=2, dtype="float32",
+            device=device, blocksize=0, latency=0.25)
+
     def _ensure_stream(self):
         if not SD_OK:
             raise RuntimeError("sounddevice/PortAudio not available")
         if self._stream is None:
             want = self._query_default_device()
-            self._stream = sd.OutputStream(
-                samplerate=self.sr, channels=2, dtype="float32",
-                device=want, callback=self._callback, latency="high")
+            self._stream = self._open_stream(want)
             self._stream_device = want
+            self._stream.start()
 
-    def redetect_device(self):
-        """Re-read the system audio devices and move playback to the current default
-        output, preserving the playhead. Called manually (button) after the user
-        switches their Windows output device. Safe whether playing, paused, or
-        stopped. Returns True if it switched without error."""
-        if not SD_OK:
-            return False
-        was_playing = (self._state == "playing")
-        with self._lock:
-            pos = self._cursor
-        # close the stream first, THEN reinit PortAudio (terminating with a live
-        # stream open would crash) so it sees the newly-selected default device
-        if self._stream is not None:
-            try:
-                self._stream.stop(); self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
-        try:
-            sd._terminate(); sd._initialize()
-        except Exception:
-            pass
-        want = self._query_default_device()
-        try:
-            self._stream = sd.OutputStream(
-                samplerate=self.sr, channels=2, dtype="float32",
-                device=want, callback=self._callback, latency="high")
-            self._stream_device = want
+    def _feed_loop(self):
+        """Runs on our own thread. Pushes blocks into PortAudio's buffer via blocking
+        write(); PortAudio drains them at the hardware clock. A brief Python stall
+        just means we refill a little late — PortAudio keeps playing from its cushion,
+        so the stall is absorbed rather than heard as a gap.
+
+        We write fairly large chunks and, at full volume, hand PortAudio a direct
+        slice of the song (no per-block copy/scale/clip) to keep the feeder well ahead
+        of the drain rate even under GIL contention."""
+        bs = self.BLOCKSIZE
+        while self._run:
+            if not self._resume.wait(timeout=0.1):
+                continue
+            if not self._run:
+                break
+
             with self._lock:
-                self._cursor = pos
-            if was_playing:
-                self._stream.start()
-            return True
-        except Exception:
-            self._stream = None
-            self._state = "stopped"
-            return False
+                buf = self._buf
+                start = self._cursor
+                if buf is None:
+                    self._resume.clear()
+                    continue
+                total = len(buf)
+                if start >= total:
+                    self._finished_pending = True
+                    self._resume.clear()
+                    continue
+                end = min(start + bs, total)
+                self._cursor = end
+                vol = self._volume
+                block = buf[start:end]
+
+            if vol >= 0.999:
+                # full volume: the rendered audio is already float32 and pre-clipped
+                # at render time, so write the slice directly — no allocation at all
+                out = block
+            else:
+                out = block * vol
+                np.clip(out, -1.0, 1.0, out=out)
+
+            try:
+                self._stream.write(out)      # blocks until PortAudio has room
+            except Exception:
+                self._run = False
+                break
+
+    def _start_feeder(self):
+        if self._feeder is None or not self._feeder.is_alive():
+            self._run = True
+            self._feeder = threading.Thread(target=self._feed_loop, daemon=True)
+            self._feeder.start()
 
     def play(self):
         """Start or resume playback from the current cursor."""
@@ -166,19 +197,26 @@ class Player:
         self._ensure_stream()
         self._finished_pending = False
         self._state = "playing"
-        if not self._stream.active:
-            self._stream.start()
+        self._start_feeder()
+        self._resume.set()                   # let the feeder run
 
     def pause(self):
-        if self._state == "playing" and self._stream is not None:
-            self._stream.stop()             # stops the callback; cursor stays put
+        if self._state == "playing":
+            self._resume.clear()             # feeder parks itself at the next block
             self._state = "paused"
 
     def stop(self):
+        # tell the feeder to exit, wake it, and wait for it to finish
+        self._run = False
+        self._resume.set()
+        if self._feeder is not None and self._feeder.is_alive() \
+                and threading.current_thread() is not self._feeder:
+            self._feeder.join(timeout=1.0)
+        self._feeder = None
+        self._resume.clear()
         if self._stream is not None:
             try:
-                self._stream.stop()
-                self._stream.close()
+                self._stream.stop(); self._stream.close()
             except Exception:
                 pass
             self._stream = None
@@ -200,6 +238,51 @@ class Player:
                 return
             target = int(max(0.0, seconds) * self.sr)
             self._cursor = min(target, len(self._buf))
+
+    def redetect_device(self):
+        """Re-read the system audio devices and move playback to the current default
+        output, preserving the playhead. Safe whether playing, paused, or stopped.
+        Returns True if it switched without error."""
+        if not SD_OK:
+            return False
+        was_playing = (self._state == "playing")
+        with self._lock:
+            pos = self._cursor
+        # tear down feeder + stream first, THEN reinit PortAudio (terminating with a
+        # live stream open would crash) so it sees the newly-selected default device
+        self._run = False
+        self._resume.set()
+        if self._feeder is not None and self._feeder.is_alive():
+            self._feeder.join(timeout=1.0)
+        self._feeder = None
+        self._resume.clear()
+        if self._stream is not None:
+            try:
+                self._stream.stop(); self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        try:
+            sd._terminate(); sd._initialize()
+        except Exception:
+            pass
+        want = self._query_default_device()
+        try:
+            self._stream = self._open_stream(want)
+            self._stream_device = want
+            self._stream.start()
+            with self._lock:
+                self._cursor = pos
+            if was_playing:
+                self._state = "playing"
+                self._finished_pending = False
+                self._start_feeder()
+                self._resume.set()
+            return True
+        except Exception:
+            self._stream = None
+            self._state = "stopped"
+            return False
 
     def poll_finished(self):
         """Called periodically by the GUI. Returns True once when the song ends."""

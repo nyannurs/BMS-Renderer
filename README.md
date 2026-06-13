@@ -24,9 +24,9 @@ a `Playlists` folder.
 1. Install Python from <https://www.python.org/downloads/> (tick **"Add
    python.exe to PATH"**).
 2. Install `ffmpeg` (don't forget to **add it to PATH**).
-3. Install the dependencies:
+3. Install the dependencies (you can ignore `pypresence` if you don't want Discord RPC:
    ```
-   pip install PyQt5 soundfile numpy mutagen Pillow scipy sounddevice
+   pip install PyQt5 soundfile numpy mutagen Pillow scipy sounddevice pypresence
    ```
 4. Run `bms_renderer_qt.py` (double-click it, or `python bms_renderer_qt.py`).
 
@@ -57,3 +57,4 @@ First library scan is slow; after that it's cached and fast.
   output folder you choose, and every write is checked against your source path
   first, so scanning or rendering can never modify, overwrite, or delete anything
   in your collection.
+- **Completely optional Discord RPC** — don't want it? delete `discord_rpc.py` and don't worry about it!

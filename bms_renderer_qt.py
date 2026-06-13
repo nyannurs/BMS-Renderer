@@ -58,6 +58,14 @@ try:
 except Exception:
     Player, _SD_OK = None, False
 
+# Optional Discord Rich Presence. If discord_rpc.py isn't in the folder (or fails
+# to import for any reason), the app runs exactly as before — RPC is purely opt-in.
+try:
+    import discord_rpc as _discord_rpc
+    _RPC_OK = True
+except Exception:
+    _discord_rpc, _RPC_OK = None, False
+
 
 # ----------------------------------------------------------------------------
 # Background render worker (Qt signals replace Tkinter's after() polling)
@@ -398,6 +406,10 @@ class RenderWorker(QThread):
         return None
 
     def run(self):
+        try:
+            self.setPriority(QThread.LowestPriority)
+        except Exception:
+            pass
         ext = {"FLAC": ".flac", "WAV": ".wav", "OGG": ".ogg", "MP3": ".mp3"}.get(self.fmt, ".flac")
         ff = ffmpeg_path() if self.fmt in ("OGG", "MP3", "FLAC") else None
         jobs = {}
@@ -441,6 +453,10 @@ class BGAWorker(QThread):
         self.items, self.out_dir, self.workers = items, out_dir, workers
 
     def run(self):
+        try:
+            self.setPriority(QThread.LowestPriority)
+        except Exception:
+            pass
         ff = ffmpeg_path()
         fps, size = 30, (720, 720)
         jobs = []; skipped = 0
@@ -483,6 +499,10 @@ class ScanWorker(QThread):
 
     def run(self):
         import time
+        try:
+            self.setPriority(QThread.LowestPriority)
+        except Exception:
+            pass
         from bms_core import _migrate_old_cache, db_connect, scan_library
         t0 = time.time()
         try:
@@ -513,6 +533,10 @@ class PlayWorker(QThread):
         super().__init__(); self.path = path
 
     def run(self):
+        try:
+            self.setPriority(QThread.LowestPriority)
+        except Exception:
+            pass
         try:
             audio, _ = render_bms(self.path)
             self.ready.emit(audio, self.path)
@@ -571,6 +595,14 @@ class MainWindow(QMainWindow):
         self.player = Player(samplerate=SR) if (_SD_OK and Player) else None
         self._play_cache = {}           # path -> rendered audio buffer (session cache)
         self._play_worker = None
+        # optional Discord Rich Presence client (None unless discord_rpc.py is present)
+        self._rpc = None
+        if _RPC_OK:
+            try:
+                self._rpc = _discord_rpc.RichPresence()
+                self._rpc.connect()
+            except Exception:
+                self._rpc = None
         # which song the right-panel tag fields are bound to: ("queue"|"playlist", index)
         self._sel_kind = None
         self._sel_index = None
@@ -637,6 +669,11 @@ class MainWindow(QMainWindow):
         if ffmpeg_path() is None:
             self.log("WARNING: ffmpeg not found — OGG/MP3 export and BGA video are "
                      "disabled (FLAC/WAV still work). Install ffmpeg and add it to PATH.")
+        if self._rpc is not None and getattr(self._rpc, "connected", False):
+            self.log("Discord Rich Presence enabled.")
+        elif _RPC_OK and self._rpc is not None:
+            reason = getattr(self._rpc, "last_error", "") or "is Discord running?"
+            self.log(f"Discord RPC not active: {reason}. Continuing without it.")
 
     def _sync_render_settings(self):
         """Keep the Queue and Custom Playlists tabs' Threads/Format controls in lock-step
@@ -899,6 +936,7 @@ class MainWindow(QMainWindow):
         self._mark_now_row()
         if hasattr(self, "now_lbl"):
             self.now_lbl.setSong(title)
+        self._rpc_now_playing(path, title)
         cached = self._play_cache.get(path)
         if cached is not None:
             self._begin_playback(cached); return
@@ -1093,6 +1131,17 @@ class MainWindow(QMainWindow):
             return
         self.player.toggle()
         self._update_play_icon()
+        # reflect pause/resume in Discord presence
+        if self._rpc is not None:
+            try:
+                state = getattr(self.player, "state", None)
+                if state == "paused":
+                    self._rpc.set_paused()
+                elif state == "playing":
+                    self._rpc_now_playing(getattr(self, "_now_path", None),
+                                          self._now_title())
+            except Exception:
+                pass
 
     def _stop_play(self):
         if self.player is None:
@@ -1100,6 +1149,28 @@ class MainWindow(QMainWindow):
         self.player.stop()
         self.time_lbl.setText("0:00 / 0:00")
         self._update_play_icon()
+        if self._rpc is not None:
+            try:
+                self._rpc.clear()
+            except Exception:
+                pass
+
+    def _now_title(self):
+        s = getattr(self, "_path_index", {}).get(getattr(self, "_now_path", None), {})
+        return s.get("title", "") if s else ""
+
+    def _rpc_now_playing(self, path, title):
+        """Push the current song to Discord (no-op if RPC isn't installed)."""
+        if self._rpc is None or not path:
+            return
+        try:
+            s = getattr(self, "_path_index", {}).get(path, {})
+            artist = s.get("artist", "") if s else ""
+            dur = self.player.duration_seconds() if self.player else 0
+            self._rpc.set_playing(title or (s.get("title", "") if s else ""),
+                                  artist, duration=dur)
+        except Exception:
+            pass
 
     def _next_track(self):
         self._advance(+1)
@@ -1123,6 +1194,12 @@ class MainWindow(QMainWindow):
             QStyle.SP_MediaPause if playing else QStyle.SP_MediaPlay))
 
     def closeEvent(self, e):
+        # close the Discord RPC connection cleanly if it's running
+        if getattr(self, "_rpc", None) is not None:
+            try:
+                self._rpc.close()
+            except Exception:
+                pass
         # persist window geometry (Qt's own format) like the Tk app saves geometry
         try:
             cfg = load_config()
