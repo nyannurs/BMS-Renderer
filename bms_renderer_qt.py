@@ -21,7 +21,7 @@ try:
         QPushButton, QLineEdit, QLabel, QTabWidget,
         QSpinBox, QComboBox, QPlainTextEdit, QFileDialog, QHeaderView,
         QAbstractItemView, QMessageBox, QGroupBox, QFormLayout, QCheckBox,
-        QScrollArea, QSizePolicy, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator,
+        QScrollArea, QSizePolicy, QTreeWidget, QTreeWidgetItem,
         QListWidget, QListWidgetItem,
     )
 except ImportError:
@@ -1402,17 +1402,6 @@ class MainWindow(QMainWindow):
             it.setSizeHint(QSize(self.TILE + self.PAD * 2, self.TILE + 56))
             grid.addItem(it); jobs.append((row, s["path"]))
         self._start_grid_thumbs(grid, jobs)
-
-    def _tgrid_context(self, grid, pos):
-        sel = [getattr(self, "_path_index", {}).get(i.data(Qt.UserRole))
-               for i in grid.selectedItems()]
-        sel = [s for s in sel if s]
-        if not sel:
-            it = grid.itemAt(pos)
-            s = getattr(self, "_path_index", {}).get(it.data(Qt.UserRole)) if it else None
-            sel = [s] if s else []
-        if sel:
-            self._song_context_menu(grid.viewport().mapToGlobal(pos), sel)
 
     def _toggle_q_album(self):
         if self.q_album.isChecked():
