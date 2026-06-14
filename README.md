@@ -9,9 +9,6 @@ charts, lets you browse and play them like a music player, and renders them to
 FLAC, WAV, or OGG with proper tags and cover art — keysounds, BPM changes, stops,
 and `#RANDOM`/`#SWITCH` charts are handled the way bmx2wav does it.
 
-Version 2.0 moves the interface to a Qt frontend and follows your OS light/dark
-theme.
-
 ## Folder structure
 
 Keep `bms_renderer_qt.py`, `bms_core.py`, and `player.py` together in one folder.
