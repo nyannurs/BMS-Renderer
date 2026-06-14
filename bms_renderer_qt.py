@@ -695,7 +695,9 @@ class BGAExportDialog(QDialog):
 
         # codec performance guide
         self.perf = _CodecPerfGraphic()
-        vlay.addWidget(QLabel("Codec guide (quality · file size · speed):"))
+        guide_lbl = QLabel("Codec guide — longer bar is better:")
+        guide_lbl.setStyleSheet("color:#888;")
+        vlay.addWidget(guide_lbl)
         vlay.addWidget(self.perf)
         vlay.addStretch(1)
         cols.addWidget(vbox, 1)
@@ -832,7 +834,10 @@ class _CodecPerfGraphic(QWidget):
     def paintEvent(self, _e):
         from PyQt5.QtGui import QPainter, QColor
         q, s, sp = self._perf
-        labels = ["Quality", "Size", "Speed"]
+        # all three bars read the same way: a LONGER bar is always better. The middle
+        # metric is file-size EFFICIENCY (longer = smaller files for the same quality),
+        # so AV1's strong compression shows as a long bar, not a misleading "big size".
+        labels = ["Quality", "Efficiency", "Speed"]
         vals = [q, s, sp]
         colors = ["#4caf50", "#2196f3", "#ff9800"]
         p = QPainter(self)
@@ -840,7 +845,7 @@ class _CodecPerfGraphic(QWidget):
         w = self.width(); rowh = self.height() // 3
         track = self.palette().color(self.palette().AlternateBase)
         txtcol = self.palette().color(self.palette().WindowText)
-        bar_x = 60; bar_w = w - bar_x - 30
+        bar_x = 86; bar_w = w - bar_x - 24
         for i, (lab, val, col) in enumerate(zip(labels, vals, colors)):
             y = i * rowh + 4; h = rowh - 8
             p.setPen(txtcol); p.drawText(0, y, bar_x - 6, h,
