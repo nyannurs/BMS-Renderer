@@ -1188,11 +1188,17 @@ def render_bms(path, log=lambda s: None):
                 last_end = e
     out = np.zeros((last_end + SR, 2), dtype=np.float32)  # +1s tail
 
-    # bucket onsets per wav-id
+    # bucket onsets per wav-id. A chart often places the SAME keysound on both the
+    # BGM autoplay channel (01) AND a player lane at the SAME instant — in-game the
+    # player either hits the note OR it autoplays, never both, so it sounds once. A
+    # renderer has no player, so without de-duping we'd play both copies and that
+    # note would be 2x as loud. Collapsing identical (position, wav) pairs fixes that
+    # spurious doubling while leaving genuine musical layering (different sounds, or
+    # the same sound at different times) untouched.
     onsets = {}
     for pos, wid in schedule:
         if wid in clips:
-            onsets.setdefault(wid, []).append(int(pos))
+            onsets.setdefault(wid, set()).add(int(pos))
     for wid, positions in onsets.items():
         clip = clips[wid]; clen = len(clip)
         for s in positions:

@@ -479,11 +479,31 @@ class RenderWorker(QThread):
 # ----------------------------------------------------------------------------
 # Main window
 # ----------------------------------------------------------------------------
+class _BGADetectWorker(QThread):
+    """Runs detect_bga off the GUI thread (it parses the whole chart) and reports the
+    BGA type for the right-panel indicator."""
+    result = pyqtSignal(str, str)       # (path, kind)
+
+    def __init__(self, path):
+        super().__init__(); self.path = path; self._cancelled = False
+
+    def run(self):
+        try:
+            info = detect_bga(self.path)
+            kind = info.get("type", "none")
+        except Exception:
+            kind = "none"
+        if not self._cancelled:
+            self.result.emit(self.path, kind)
+
+
 class BGAWorker(QThread):
     """Renders queued charts that have an image BGA to MP4s, in parallel. Video/none
     BGAs are skipped. Mirrors the Tk app's _render_bga_queue."""
     log = pyqtSignal(str)
     done = pyqtSignal()
+    total_known = pyqtSignal(int)       # emitted once the skip-filter decides the count
+    item_done = pyqtSignal(int)         # emitted as each BGA finishes
 
     def __init__(self, items, out_dir, workers, encode_opts=None, priority="Normal"):
         super().__init__()
@@ -513,6 +533,7 @@ class BGAWorker(QThread):
         if not jobs:
             self.log.emit(f"No queued charts have an image BGA ({skipped} skipped)."); self.done.emit(); return
         total = len(jobs); done = 0
+        self.total_known.emit(total)
         self.log.emit(f"Rendering {total} BGA video(s) with {self.workers} worker(s)… "
                       f"({skipped} skipped — video/no BGA)")
         with ProcessPoolExecutor(max_workers=self.workers) as ex:
@@ -522,8 +543,10 @@ class BGAWorker(QThread):
                 try:
                     out_path, title, err = fut.result()
                 except Exception as e:
-                    self.log.emit(f"  [{done}/{total}] worker crashed: {e}"); continue
+                    self.log.emit(f"  [{done}/{total}] worker crashed: {e}")
+                    self.item_done.emit(done); continue
                 self.log.emit(f"  [{done}/{total}] {'FAILED: '+title if err else 'done -> '+out_path}")
+                self.item_done.emit(done)
         self.log.emit("BGA render complete.")
         self.done.emit()
 
@@ -855,6 +878,57 @@ class _CodecPerfGraphic(QWidget):
         p.end()
 
 
+class RenderProgressDialog(QDialog):
+    """A small modal dialog with a green progress bar shown during a render job.
+    The owner calls step() as each item finishes and finish() when the job ends."""
+    def __init__(self, parent, title, total):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(420)
+        self._total = max(1, total); self._done = 0
+        from PyQt5.QtWidgets import QProgressBar
+        lay = QVBoxLayout(self)
+        self.label = QLabel(f"Rendering 0 of {total}…")
+        lay.addWidget(self.label)
+        self.bar = QProgressBar(); self.bar.setRange(0, self._total); self.bar.setValue(0)
+        self.bar.setStyleSheet(
+            "QProgressBar { border:1px solid #999; border-radius:3px; text-align:center;"
+            " height:20px; }"
+            "QProgressBar::chunk { background-color:#4caf50; }")   # green
+        lay.addWidget(self.bar)
+        self._closable = False
+
+    def set_total(self, total):
+        self._total = max(1, total); self._done = min(self._done, self._total)
+        self.bar.setRange(0, self._total); self.bar.setValue(self._done)
+        self.label.setText(f"Rendering {self._done} of {total}…")
+
+    def set_value(self, done):
+        """Set absolute progress (used by the BGA worker which counts up itself)."""
+        self._done = min(self._total, done)
+        self.bar.setValue(self._done)
+        self.label.setText(f"Rendering {self._done} of {self._total}…")
+
+    def step(self, n=1):
+        self._done = min(self._total, self._done + n)
+        self.bar.setValue(self._done)
+        self.label.setText(f"Rendering {self._done} of {self._total}…")
+
+    def finish(self):
+        self._done = self._total
+        self.bar.setValue(self._total)
+        self.label.setText(f"Done — {self._total} rendered.")
+        self._closable = True
+        self.accept()
+
+    def closeEvent(self, e):
+        # don't let the user close mid-render by accident; finish() closes it
+        if self._closable:
+            e.accept()
+        else:
+            e.ignore()
+
+
 class AudioExportDialog(QDialog):
     """Settings dialog for 'Render All in Queue': threads, output format, format-
     specific quality, and process priority. Defaults reproduce the app's current
@@ -908,9 +982,11 @@ class AudioExportDialog(QDialog):
         s.blockSignals(True)
         if fmt == "FLAC":
             self.q_lbl.setText("Compression:")
-            s.setEnabled(True); s.setRange(0, 12); s.setValue(8)
+            # FLAC's standard maximum is 8 (ffmpeg accepts higher but they're
+            # non-standard and give no real benefit), so cap at 8.
+            s.setEnabled(True); s.setRange(0, 8); s.setValue(8)
             self.hint.setText("FLAC is lossless. Higher compression = smaller files, "
-                              "slower encode. Default is 8.")
+                              "slower encode. Default (and max) is 8.")
         elif fmt == "WAV":
             self.q_lbl.setText("Quality:")
             s.setEnabled(False); s.setRange(0, 1); s.setValue(0)
@@ -918,13 +994,16 @@ class AudioExportDialog(QDialog):
         elif fmt == "OGG":
             self.q_lbl.setText("Quality (VBR):")
             s.setEnabled(True); s.setRange(0, 10); s.setValue(6)
-            self.hint.setText("OGG Vorbis VBR quality (0–10). Default 6 ≈ 192 kbps.")
+            self.hint.setText("OGG Vorbis VBR quality (left = smallest file … "
+                              "right = best). Default 6 ≈ 192 kbps.")
         elif fmt == "MP3":
-            self.q_lbl.setText("Bitrate:")
-            # 0 is a sentinel meaning "default 320k CBR"; 1..9 = LAME VBR quality
-            s.setEnabled(True); s.setRange(0, 9); s.setValue(0)
-            self.hint.setText("MP3: default is 320 kbps CBR (slider at 0). Move right "
-                              "for VBR (1 = highest quality VBR … 9 = smallest).")
+            self.q_lbl.setText("Quality:")
+            # left → right = smallest file → best quality, matching OGG. The slider
+            # is 0..9 where 0 = V9 (smallest VBR) and 9 = 320 kbps CBR (best). The
+            # default sits at the far right (320 CBR), preserving current behavior.
+            s.setEnabled(True); s.setRange(0, 9); s.setValue(9)
+            self.hint.setText("MP3 quality (left = smallest VBR … right = best). "
+                              "Far right is 320 kbps CBR (the default).")
         s.blockSignals(False)
         self._update_q_label(s.value())
 
@@ -933,7 +1012,8 @@ class AudioExportDialog(QDialog):
         if fmt == "WAV":
             self.q_value.setText("—")
         elif fmt == "MP3":
-            self.q_value.setText("320k CBR" if v == 0 else f"VBR q{v}")
+            # 9 = 320 CBR (best), 1..8 = VBR (V8..V1), 0 = V9 (smallest)
+            self.q_value.setText("320k CBR" if v == 9 else f"V{9 - v}")
         else:
             self.q_value.setText(str(v))
 
@@ -947,8 +1027,9 @@ class AudioExportDialog(QDialog):
             quality = {"flac_level": v}
         elif fmt == "OGG" and v != 6:
             quality = {"ogg_q": v}
-        elif fmt == "MP3" and v != 0:
-            quality = {"mp3_vbr_q": v}
+        elif fmt == "MP3" and v != 9:
+            # slider: 0 = V9 (smallest) … 8 = V1; LAME -q:a is 9-v. 9 = 320 CBR (None).
+            quality = {"mp3_vbr_q": 9 - v}
         return fmt, self.threads.value(), quality, self.prio.currentText()
 
 
@@ -993,6 +1074,11 @@ class MainWindow(QMainWindow):
                 pass
         self._build()
         self._sync_render_settings()
+        # remember the app's default palette, then apply the saved theme choice
+        from PyQt5.QtWidgets import QApplication
+        self._default_palette = QApplication.instance().palette()
+        if bool(load_config().get("dark_mode", False)):
+            self._apply_theme(True)
 
     # ---- layout ----
     def _build(self):
@@ -1085,12 +1171,10 @@ class MainWindow(QMainWindow):
         import base64
         logo = QLabel()
         pm = QPixmap(); pm.loadFromData(base64.b64decode(LOGO_B64))
+        self._logo_raw = pm                      # keep the original for theme toggles
         if not pm.isNull():
-            # on a dark (e.g. KDE Night) theme the black wordmark would vanish, so
-            # invert its RGB to white while keeping the alpha channel intact
-            if self._is_dark_theme():
-                pm = self._invert_pixmap(pm)
-            logo.setPixmap(pm.scaledToHeight(40, Qt.SmoothTransformation))
+            shown = self._invert_pixmap(pm) if self._is_dark_theme() else pm
+            logo.setPixmap(shown.scaledToHeight(40, Qt.SmoothTransformation))
         self.logo_label = logo
         logo.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         logo.setCursor(Qt.PointingHandCursor)
@@ -1100,9 +1184,52 @@ class MainWindow(QMainWindow):
             from PyQt5.QtCore import QUrl
             QDesktopServices.openUrl(QUrl("https://github.com/nyannurs/BMS-Renderer"))
         logo.mousePressEvent = _open_repo
-        grid.addWidget(logo, 0, 2, 2, 1)
+        # native dark-mode toggle (persisted); placed left of the logo
+        self.dark_toggle = QCheckBox("Dark mode")
+        self.dark_toggle.setChecked(bool(load_config().get("dark_mode", False)))
+        self.dark_toggle.toggled.connect(self._on_dark_toggled)
+        grid.addWidget(self.dark_toggle, 0, 2, 2, 1, Qt.AlignRight | Qt.AlignTop)
+        grid.addWidget(logo, 0, 3, 2, 1)
         grid.setColumnStretch(1, 1)
         return grid
+
+    def _on_dark_toggled(self, on):
+        self._update_cfg(dark_mode=bool(on))
+        self._apply_theme(on)
+
+    def _apply_theme(self, dark):
+        """Apply or remove a native dark palette (Fusion + dark colors) and re-invert
+        the logo to match."""
+        from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtGui import QPalette, QColor
+        app = QApplication.instance()
+        if dark:
+            app.setStyle("Fusion")
+            pal = QPalette()
+            pal.setColor(QPalette.Window, QColor(45, 45, 48))
+            pal.setColor(QPalette.WindowText, QColor(230, 230, 230))
+            pal.setColor(QPalette.Base, QColor(30, 30, 32))
+            pal.setColor(QPalette.AlternateBase, QColor(55, 55, 58))
+            pal.setColor(QPalette.ToolTipBase, QColor(45, 45, 48))
+            pal.setColor(QPalette.ToolTipText, QColor(230, 230, 230))
+            pal.setColor(QPalette.Text, QColor(230, 230, 230))
+            pal.setColor(QPalette.Button, QColor(55, 55, 58))
+            pal.setColor(QPalette.ButtonText, QColor(230, 230, 230))
+            pal.setColor(QPalette.Highlight, QColor(45, 125, 255))
+            pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+            pal.setColor(QPalette.Disabled, QPalette.Text, QColor(120, 120, 120))
+            pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(120, 120, 120))
+            app.setPalette(pal)
+        else:
+            app.setPalette(self._default_palette)
+        self._refresh_logo_for_theme()
+
+    def _refresh_logo_for_theme(self):
+        if getattr(self, "_logo_raw", None) is None or self._logo_raw.isNull():
+            return
+        shown = self._invert_pixmap(self._logo_raw) if self._is_dark_theme() \
+            else self._logo_raw
+        self.logo_label.setPixmap(shown.scaledToHeight(40, Qt.SmoothTransformation))
 
     def _is_dark_theme(self):
         """True when the window background is darker than its text — i.e. a dark/Night
@@ -1591,6 +1718,7 @@ class MainWindow(QMainWindow):
             bind("Ctrl+Up", lambda: self._nudge_volume(+0.05)),
             bind("Ctrl+Down", lambda: self._nudge_volume(-0.05)),
             bind("Ctrl+M", self._toggle_mute),
+            bind("Ctrl+Space", self._toggle_play),
         ]
 
     def _nudge_volume(self, delta):
@@ -2178,6 +2306,43 @@ class MainWindow(QMainWindow):
         self.info_fields["MD5"].setText(s.get("md5", "—") or "—")
         # also load the song's folder art into the picker
         self._load_song_art(s.get("path"))
+        # update the sequence-BGA indicator (off the GUI thread — detect_bga parses
+        # the whole chart, which can be large)
+        self._update_bga_indicator(s.get("path"))
+
+    def _update_bga_indicator(self, path):
+        if not hasattr(self, "bga_indicator"):
+            return
+        if not path:
+            self.bga_indicator.setText(""); return
+        self.bga_indicator.setText("Checking for BGA…")
+        self.bga_indicator.setStyleSheet("color:#888;")
+        # cancel a prior check and start a fresh one
+        prev = getattr(self, "_bga_probe", None)
+        if prev is not None and prev.isRunning():
+            prev._cancelled = True
+        probe = _BGADetectWorker(path)
+        probe.result.connect(self._on_bga_detected)
+        self._bga_probe = probe
+        probe.start()
+
+    def _on_bga_detected(self, path, kind):
+        # ignore stale results (selection moved on)
+        cur = self.info_fields["File"].text() if hasattr(self, "info_fields") else ""
+        if path != cur:
+            return
+        if kind == "sequence":
+            self.bga_indicator.setText("● Sequence BGA — can be rendered to video")
+            self.bga_indicator.setStyleSheet("color:#2e7d32;")     # green
+        elif kind == "static":
+            self.bga_indicator.setText("○ Static BGA only (single image)")
+            self.bga_indicator.setStyleSheet("color:#888;")
+        elif kind == "video":
+            self.bga_indicator.setText("○ Video BGA (not rendered as a sequence)")
+            self.bga_indicator.setStyleSheet("color:#888;")
+        else:
+            self.bga_indicator.setText("○ No BGA to render")
+            self.bga_indicator.setStyleSheet("color:#888;")
 
     def _show_readonly_tags(self, s):
         self._unbind_tags(self._default_tags(s))
@@ -2597,9 +2762,13 @@ class MainWindow(QMainWindow):
         self.pl_render_btn.setEnabled(False)
         self._pl_worker = RenderWorker(items, out_dir, fmt, threads,
                                        quality=quality, priority=priority)
+        prog = RenderProgressDialog(self, "Rendering Playlist", len(items))
         self._pl_worker.log.connect(self.log)
+        self._pl_worker.item_done.connect(lambda _row: prog.step())
+        self._pl_worker.done.connect(prog.finish)
         self._pl_worker.done.connect(lambda: self.pl_render_btn.setEnabled(True))
         self._pl_worker.start()
+        prog.exec_()
 
     def _pl_context_menu(self, pos):
         item = self.pltree.itemAt(pos)
@@ -2942,6 +3111,9 @@ class MainWindow(QMainWindow):
         pv.addLayout(nav)
         self.song_art_status = QLabel(""); self.song_art_status.setStyleSheet("color:#666;")
         pv.addWidget(self.song_art_status)
+        # indicates whether the selected chart has a renderable sequence BGA
+        self.bga_indicator = QLabel(""); self.bga_indicator.setWordWrap(True)
+        pv.addWidget(self.bga_indicator)
         self.ignore_bmp = QCheckBox("ignore .bmp"); self.ignore_bmp.setChecked(True)
         self.ignore_bmp.stateChanged.connect(lambda: self._load_song_art(self._song_art_path, force=True))
         pv.addWidget(self.ignore_bmp)
@@ -3090,10 +3262,14 @@ class MainWindow(QMainWindow):
         cover_cfg = ("__BLACK__" if self._art_black else (self._art_path or None))
         self._worker = RenderWorker(list(self.queue), out_dir, fmt, threads,
                                     cover_cfg, quality=quality, priority=priority)
+        prog = RenderProgressDialog(self, "Rendering Queue", len(self.queue))
         self._worker.log.connect(self.log)
+        self._worker.item_done.connect(lambda _row: prog.step())
         self._worker.item_done.connect(self._on_item_done)
+        self._worker.done.connect(prog.finish)
         self._worker.done.connect(lambda: self.q_render_btn.setEnabled(True))
         self._worker.start()
+        prog.exec_()
 
     def _queue_context_menu(self, pos):
         item = self.qtable.itemAt(pos)
@@ -3186,9 +3362,14 @@ class MainWindow(QMainWindow):
         self.q_bga_btn.setEnabled(False)
         self._bga_worker = BGAWorker(list(self.queue), out_dir, self.q_threads.value(),
                                      encode_opts=opts, priority=priority)
+        prog = RenderProgressDialog(self, "Rendering BGA Videos", len(self.queue))
         self._bga_worker.log.connect(self.log)
+        self._bga_worker.total_known.connect(prog.set_total)
+        self._bga_worker.item_done.connect(prog.set_value)
+        self._bga_worker.done.connect(prog.finish)
         self._bga_worker.done.connect(lambda: self.q_bga_btn.setEnabled(True))
         self._bga_worker.start()
+        prog.exec_()
 
 
 def main():

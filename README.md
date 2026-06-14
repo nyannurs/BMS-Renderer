@@ -63,14 +63,22 @@ First library scan is slow; after that it's cached and fast.
 
 BMS Renderer assumes your library is organized one folder per song, with that song's chart files, keysounds, and artwork all kept together inside it. Some features depend on this assumption, such as "Show all charts for this song" and the album art picking.
 
+## Media hotkeys ##
+
+If your keyboard has media keys, they should just work. These will only work if the program is focused.
+
+- CTRL + M: mute current playback
+- CTRL + left arrow/right arrow: play previous/next song respectively
+- CTRL + up arrow/down arrow: increase/decrease volume respectively
+- CTRL + spacebar: pause/unpause the currently playing song
+
+
 ## Linux users ##
 
 Audio playback needs the `PortAudio` system library, which pip can't install on Linux. Examples:
 
 - **Debian/Ubuntu/Mint**: `sudo apt install libportaudio2`
-
 - **Arch**: `sudo pacman -S portaudio`
-
 - **Fedora**: `sudo dnf install portaudio`
 
 Windows and macOS users can skip this — `pip install sounddevice` includes PortAudio there.
