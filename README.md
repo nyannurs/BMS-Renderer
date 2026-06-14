@@ -64,10 +64,13 @@ First library scan is slow; after that it's cached and fast.
 BMS Renderer assumes your library is organized one folder per song, with that song's chart files, keysounds, and artwork all kept together inside it. Some features depend on this assumption, such as "Show all charts for this song" and the album art picking.
 
 ## Linux users ##
+
 Audio playback needs the `PortAudio` system library, which pip can't install on Linux. Examples:
 
 **Debian/Ubuntu/Mint**: `sudo apt install libportaudio2`
+
 **Arch**: `sudo pacman -S portaudio`
+
 **Fedora**: `sudo dnf install portaudio`
 
 Windows and macOS users can skip this — `pip install sounddevice` includes PortAudio there.
