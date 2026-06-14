@@ -22,7 +22,7 @@ try:
         QSpinBox, QComboBox, QPlainTextEdit, QFileDialog, QHeaderView,
         QAbstractItemView, QMessageBox, QGroupBox, QFormLayout, QCheckBox,
         QScrollArea, QSizePolicy, QTreeWidget, QTreeWidgetItem,
-        QListWidget, QListWidgetItem,
+        QListWidget, QListWidgetItem, QDialog, QSlider, QDialogButtonBox,
     )
 except ImportError:
     sys.stderr.write("\nPyQt5 is not installed. Install it first:\n\n    pip install PyQt5\n\n")
@@ -54,9 +54,9 @@ ICON_SIZES_B64 = {
 }
 
 try:
-    from player import Player, SD_OK as _SD_OK
+    from player import Player, SD_OK as _SD_OK, SD_IMPORT_ERROR as _SD_ERR
 except Exception:
-    Player, _SD_OK = None, False
+    Player, _SD_OK, _SD_ERR = None, False, ""
 
 # Optional Discord Rich Presence. If discord_rpc.py isn't in the folder (or fails
 # to import for any reason), the app runs exactly as before — RPC is purely opt-in.
@@ -70,6 +70,34 @@ except Exception:
 # ----------------------------------------------------------------------------
 # Background render worker (Qt signals replace Tkinter's after() polling)
 # ----------------------------------------------------------------------------
+def _apply_process_priority(level):
+    """Set this process's scheduling priority (child render processes inherit it).
+    Cross-platform; silently no-ops if it can't. `level` is one of
+    High / Above Normal / Normal / Below Normal / Low."""
+    try:
+        import os as _os
+        if sys.platform.startswith("win"):
+            import ctypes
+            classes = {
+                "High": 0x00000080, "Above Normal": 0x00008000,
+                "Normal": 0x00000020, "Below Normal": 0x00004000,
+                "Low": 0x00000040,                       # IDLE_PRIORITY_CLASS
+            }
+            cls = classes.get(level, 0x00000020)
+            ctypes.windll.kernel32.SetPriorityClass(
+                ctypes.windll.kernel32.GetCurrentProcess(), cls)
+        else:
+            # POSIX niceness: lower nice = higher priority
+            nice = {"High": -10, "Above Normal": -5, "Normal": 0,
+                    "Below Normal": 5, "Low": 10}.get(level, 0)
+            try:
+                _os.nice(nice - _os.nice(0))     # set absolute-ish niceness
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 _APP_ICON = None
 _BLACK_COVER = None
 
@@ -351,6 +379,11 @@ class VolumeTriangle(QWidget):
     def level(self):
         return self._level
 
+    def set_level(self, lv):
+        """Set the level programmatically (media keys) and notify listeners."""
+        self._level = max(0.0, min(1.0, float(lv)))
+        self.update(); self.changed.emit(self._level)
+
     def _set_from_x(self, x):
         self._level = max(0.0, min(1.0, x / max(1, self.width())))
         self.update(); self.changed.emit(self._level)
@@ -381,10 +414,13 @@ class RenderWorker(QThread):
     item_done = pyqtSignal(int)
     done = pyqtSignal()
 
-    def __init__(self, items, out_dir, fmt, workers, cover_cfg=None):
+    def __init__(self, items, out_dir, fmt, workers, cover_cfg=None,
+                 quality=None, priority="Normal"):
         super().__init__()
         self.items, self.out_dir, self.fmt, self.workers = items, out_dir, fmt, workers
         self.cover_cfg = cover_cfg      # None | "__BLACK__" | path to whole-queue art
+        self.quality = quality          # None = current default encode settings
+        self.priority = priority
 
     def _resolve_cover(self, item):
         from bms_core import process_cover, _PIL_OK
@@ -410,6 +446,7 @@ class RenderWorker(QThread):
             self.setPriority(QThread.LowestPriority)
         except Exception:
             pass
+        _apply_process_priority(self.priority)
         ext = {"FLAC": ".flac", "WAV": ".wav", "OGG": ".ogg", "MP3": ".mp3"}.get(self.fmt, ".flac")
         ff = ffmpeg_path() if self.fmt in ("OGG", "MP3", "FLAC") else None
         jobs = {}
@@ -422,7 +459,7 @@ class RenderWorker(QThread):
         with ProcessPoolExecutor(max_workers=self.workers) as ex:
             futs = {ex.submit(render_one_job,
                               (p, o, self.fmt, it["tags"], self._resolve_cover(it), ff,
-                               bms_core._LIBRARY_ROOT)): (row, it)
+                               bms_core._LIBRARY_ROOT, self.quality)): (row, it)
                     for (p, o), (row, it) in jobs.items()}
             for fut in as_completed(futs):
                 row, it = futs[fut]; done += 1
@@ -448,15 +485,18 @@ class BGAWorker(QThread):
     log = pyqtSignal(str)
     done = pyqtSignal()
 
-    def __init__(self, items, out_dir, workers):
+    def __init__(self, items, out_dir, workers, encode_opts=None, priority="Normal"):
         super().__init__()
         self.items, self.out_dir, self.workers = items, out_dir, workers
+        self.encode_opts = encode_opts        # None = original default behavior
+        self.priority = priority
 
     def run(self):
         try:
             self.setPriority(QThread.LowestPriority)
         except Exception:
             pass
+        _apply_process_priority(self.priority)
         ff = ffmpeg_path()
         fps, size = 30, (720, 720)
         jobs = []; skipped = 0
@@ -466,7 +506,8 @@ class BGAWorker(QThread):
                 title = it["tags"].get("Title", "untitled")
                 safe = "".join("_" if c in '<>:"/\\|?*' else c for c in title).strip() or "untitled"
                 out_path = os.path.join(self.out_dir, safe + ".mp4")
-                jobs.append((it["path"], out_path, ff, bms_core._LIBRARY_ROOT, fps, size))
+                jobs.append((it["path"], out_path, ff, bms_core._LIBRARY_ROOT,
+                             fps, size, self.encode_opts))
             else:
                 skipped += 1
         if not jobs:
@@ -586,6 +627,326 @@ class TableFetchWorker(QThread):
             self.fetched.emit(self.url, None, str(e))
 
 
+class BGAExportDialog(QDialog):
+    """Settings dialog for 'Render All BGA in Queue': pick video + audio codecs,
+    bitrate/compression, process priority. 'Default' on both reproduces the original
+    H.264 4:2:0 + AAC in mp4; any other combination outputs to mkv."""
+
+    # (label, key). Order matters for the dropdowns.
+    VIDEO_CODECS = [
+        ("Default (H.264 4:2:0, mp4)", "default"),
+        ("H.264 (x264, software)", "x264"),
+        ("H.264 (NVENC, hardware)", "x264_nvenc"),
+        ("HEVC / H.265 (x265, software)", "hevc"),
+        ("HEVC / H.265 (NVENC, hardware)", "hevc_nvenc"),
+        ("AV1 (libaom, software)", "av1"),
+        ("VP9 (libvpx, software)", "vp9"),
+    ]
+    AUDIO_CODECS = [
+        ("Default (AAC 192k)", "default"),
+        ("FLAC (lossless)", "flac"),
+        ("WAV (uncompressed)", "wav"),
+        ("OGG Vorbis (VBR)", "ogg"),
+        ("MP3 (VBR)", "mp3"),
+        ("AAC (VBR)", "aac"),
+        # Opus intentionally omitted: it needs 48k and resampling is out of scope.
+    ]
+    PRIORITIES = ["High", "Above Normal", "Normal", "Below Normal", "Low"]
+
+    # (quality, size-efficiency, speed) on a 1-5 scale, for the little guide graphic.
+    # size-efficiency = smaller file for same quality (higher bar = smaller files).
+    CODEC_PERF = {
+        "default":    (3, 3, 5),
+        "x264":       (4, 3, 4),
+        "x264_nvenc": (3, 3, 5),
+        "hevc":       (5, 4, 2),
+        "hevc_nvenc": (4, 4, 4),
+        "av1":        (5, 5, 1),
+        "vp9":        (4, 4, 2),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Render All BGA — Export Settings")
+        self.setMinimumWidth(620)
+        root = QVBoxLayout(self)
+
+        cols = QHBoxLayout()
+        root.addLayout(cols)
+
+        # ---------------- video column ----------------
+        vbox = QGroupBox("Video"); vlay = QVBoxLayout(vbox)
+        self.v_combo = QComboBox()
+        for label, _key in self.VIDEO_CODECS:
+            self.v_combo.addItem(label)
+        vlay.addWidget(self.v_combo)
+
+        self.v_bitrate_lbl = QLabel("Bitrate:")
+        vlay.addWidget(self.v_bitrate_lbl)
+        vrow = QHBoxLayout()
+        self.v_bitrate = QSlider(Qt.Horizontal)
+        self.v_bitrate.setRange(1000, 20000); self.v_bitrate.setSingleStep(500)
+        self.v_bitrate.setValue(6000)
+        self.v_bitrate_spin = QSpinBox()
+        self.v_bitrate_spin.setRange(1000, 20000); self.v_bitrate_spin.setSingleStep(500)
+        self.v_bitrate_spin.setValue(6000); self.v_bitrate_spin.setSuffix(" kbps")
+        vrow.addWidget(self.v_bitrate, 1); vrow.addWidget(self.v_bitrate_spin)
+        vlay.addLayout(vrow)
+
+        # codec performance guide
+        self.perf = _CodecPerfGraphic()
+        vlay.addWidget(QLabel("Codec guide (quality · file size · speed):"))
+        vlay.addWidget(self.perf)
+        vlay.addStretch(1)
+        cols.addWidget(vbox, 1)
+
+        # ---------------- audio column ----------------
+        abox = QGroupBox("Audio"); alay = QVBoxLayout(abox)
+        self.a_combo = QComboBox()
+        for label, _key in self.AUDIO_CODECS:
+            self.a_combo.addItem(label)
+        alay.addWidget(self.a_combo)
+
+        self.a_slider_lbl = QLabel("Bitrate:")
+        alay.addWidget(self.a_slider_lbl)
+        arow = QHBoxLayout()
+        self.a_slider = QSlider(Qt.Horizontal)
+        self.a_slider.setRange(64, 320); self.a_slider.setSingleStep(8)
+        self.a_slider.setValue(192)
+        self.a_spin = QSpinBox()
+        self.a_spin.setRange(64, 320); self.a_spin.setSingleStep(8)
+        self.a_spin.setValue(192)
+        arow.addWidget(self.a_slider, 1); arow.addWidget(self.a_spin)
+        alay.addLayout(arow)
+        alay.addStretch(1)
+        cols.addWidget(abox, 1)
+
+        # ---------------- priority ----------------
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("Process priority:"))
+        self.prio = QComboBox(); self.prio.addItems(self.PRIORITIES)
+        self.prio.setCurrentText("Normal")
+        prow.addWidget(self.prio); prow.addStretch(1)
+        root.addLayout(prow)
+
+        # ---------------- buttons ----------------
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        root.addWidget(bb)
+
+        self.v_combo.currentIndexChanged.connect(self._sync_video)
+        self.a_combo.currentIndexChanged.connect(self._sync_audio)
+        # keep each slider and its manual spinbox in lock-step (both directions)
+        self.v_bitrate.valueChanged.connect(
+            lambda v: self._mirror(self.v_bitrate_spin, v))
+        self.v_bitrate_spin.valueChanged.connect(
+            lambda v: self._mirror(self.v_bitrate, v))
+        self.a_slider.valueChanged.connect(self._on_audio_slider)
+        self.a_spin.valueChanged.connect(lambda v: self._mirror(self.a_slider, v))
+        self._sync_video(); self._sync_audio()
+
+    @staticmethod
+    def _mirror(widget, value):
+        widget.blockSignals(True)
+        widget.setValue(value)
+        widget.blockSignals(False)
+
+    def _on_audio_slider(self, v):
+        self._mirror(self.a_spin, v)
+        self._update_audio_label(v)
+
+    # -- adaptive controls --------------------------------------------------
+    def _video_key(self):
+        return self.VIDEO_CODECS[self.v_combo.currentIndex()][1]
+
+    def _audio_key(self):
+        return self.AUDIO_CODECS[self.a_combo.currentIndex()][1]
+
+    def _sync_video(self):
+        key = self._video_key()
+        self.perf.set_codec(key)
+        # Default shows its baseline bitrate but LOCKED, as a quality indicator
+        if key == "default":
+            for wdg in (self.v_bitrate, self.v_bitrate_spin):
+                wdg.blockSignals(True); wdg.setValue(6000)
+                wdg.setEnabled(False); wdg.blockSignals(False)
+            self.v_bitrate_lbl.setText("Bitrate (default baseline):")
+        else:
+            self.v_bitrate.setEnabled(True); self.v_bitrate_spin.setEnabled(True)
+            self.v_bitrate_lbl.setText("Bitrate:")
+
+    def _sync_audio(self):
+        key = self._audio_key()
+        def _set(lo, hi, step, val, enabled, suffix):
+            for wdg in (self.a_slider, self.a_spin):
+                wdg.blockSignals(True)
+                wdg.setRange(lo, hi); wdg.setSingleStep(step)
+                wdg.setValue(val); wdg.setEnabled(enabled)
+                wdg.blockSignals(False)
+            self.a_spin.setSuffix(suffix)
+        if key == "wav":
+            _set(0, 1, 1, 0, False, "")
+            self.a_slider_lbl.setText("WAV is uncompressed — no bitrate")
+        elif key == "flac":
+            _set(0, 8, 1, 8, True, "")          # compression level, default 8
+            self.a_slider_lbl.setText("Compression level:")
+        elif key == "default":
+            _set(64, 320, 8, 192, False, " kbps")
+            self.a_slider_lbl.setText("Bitrate (default baseline):")
+        else:
+            cur = self.a_slider.value()
+            _set(64, 320, 8, cur if cur >= 64 else 192, True, " kbps")
+            self.a_slider_lbl.setText("Bitrate:")
+
+    def _update_audio_label(self, v):
+        # the spinbox shows the number now; the label only carries the caption,
+        # which _sync_audio already sets per-codec, so nothing to do here
+        pass
+
+    # -- result -------------------------------------------------------------
+    def options(self):
+        """Return the encode-options dict + the chosen priority string."""
+        a = self._audio_key()
+        opts = {
+            "video": self._video_key(),
+            "vbitrate": self.v_bitrate.value(),
+            "audio": a,
+            "abitrate": self.a_slider.value() if a not in ("flac", "wav") else 192,
+            "flac_level": self.a_slider.value() if a == "flac" else 8,
+        }
+        return opts, self.prio.currentText()
+
+
+class _CodecPerfGraphic(QWidget):
+    """A tiny three-bar graphic showing a codec's quality / file-size / speed profile,
+    so users get an at-a-glance feel for the trade-offs."""
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(64)
+        self._perf = BGAExportDialog.CODEC_PERF["default"]
+
+    def set_codec(self, key):
+        self._perf = BGAExportDialog.CODEC_PERF.get(key, (3, 3, 3))
+        self.update()
+
+    def paintEvent(self, _e):
+        from PyQt5.QtGui import QPainter, QColor
+        q, s, sp = self._perf
+        labels = ["Quality", "Size", "Speed"]
+        vals = [q, s, sp]
+        colors = ["#4caf50", "#2196f3", "#ff9800"]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w = self.width(); rowh = self.height() // 3
+        track = self.palette().color(self.palette().AlternateBase)
+        txtcol = self.palette().color(self.palette().WindowText)
+        bar_x = 60; bar_w = w - bar_x - 30
+        for i, (lab, val, col) in enumerate(zip(labels, vals, colors)):
+            y = i * rowh + 4; h = rowh - 8
+            p.setPen(txtcol); p.drawText(0, y, bar_x - 6, h,
+                                         Qt.AlignRight | Qt.AlignVCenter, lab)
+            p.fillRect(bar_x, y, bar_w, h, track)
+            p.fillRect(bar_x, y, int(bar_w * val / 5.0), h, QColor(col))
+        p.end()
+
+
+class AudioExportDialog(QDialog):
+    """Settings dialog for 'Render All in Queue': threads, output format, format-
+    specific quality, and process priority. Defaults reproduce the app's current
+    behavior exactly (FLAC compression 8, OGG q6, MP3 320k CBR)."""
+    PRIORITIES = ["High", "Above Normal", "Normal", "Below Normal", "Low"]
+
+    def __init__(self, parent, fmt, threads, max_threads):
+        super().__init__(parent)
+        self.setWindowTitle("Render All in Queue — Export Settings")
+        self.setMinimumWidth(460)
+        root = QVBoxLayout(self)
+
+        form = QFormLayout(); root.addLayout(form)
+
+        self.fmt = QComboBox()
+        self.fmt.addItems(["FLAC", "WAV"] + (["OGG", "MP3"] if ffmpeg_path() else []))
+        self.fmt.setCurrentText(fmt)
+        form.addRow("Format:", self.fmt)
+
+        self.threads = QSpinBox(); self.threads.setRange(1, max_threads)
+        self.threads.setValue(threads)
+        form.addRow("Threads:", self.threads)
+
+        # format-specific quality control (adapts to the format)
+        self.q_lbl = QLabel("Quality:")
+        self.q_slider = QSlider(Qt.Horizontal)
+        self.q_value = QLabel("")
+        qrow = QHBoxLayout(); qrow.addWidget(self.q_slider, 1); qrow.addWidget(self.q_value)
+        form.addRow(self.q_lbl, qrow)
+
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("Process priority:"))
+        self.prio = QComboBox(); self.prio.addItems(self.PRIORITIES)
+        self.prio.setCurrentText("Normal")
+        prow.addWidget(self.prio); prow.addStretch(1)
+        root.addLayout(prow)
+
+        self.hint = QLabel(""); self.hint.setStyleSheet("color:#888;"); self.hint.setWordWrap(True)
+        root.addWidget(self.hint)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        root.addWidget(bb)
+
+        self.fmt.currentTextChanged.connect(self._sync_format)
+        self.q_slider.valueChanged.connect(self._update_q_label)
+        self._sync_format(self.fmt.currentText())
+
+    def _sync_format(self, fmt):
+        s = self.q_slider
+        s.blockSignals(True)
+        if fmt == "FLAC":
+            self.q_lbl.setText("Compression:")
+            s.setEnabled(True); s.setRange(0, 12); s.setValue(8)
+            self.hint.setText("FLAC is lossless. Higher compression = smaller files, "
+                              "slower encode. Default is 8.")
+        elif fmt == "WAV":
+            self.q_lbl.setText("Quality:")
+            s.setEnabled(False); s.setRange(0, 1); s.setValue(0)
+            self.hint.setText("WAV is uncompressed PCM — no quality setting.")
+        elif fmt == "OGG":
+            self.q_lbl.setText("Quality (VBR):")
+            s.setEnabled(True); s.setRange(0, 10); s.setValue(6)
+            self.hint.setText("OGG Vorbis VBR quality (0–10). Default 6 ≈ 192 kbps.")
+        elif fmt == "MP3":
+            self.q_lbl.setText("Bitrate:")
+            # 0 is a sentinel meaning "default 320k CBR"; 1..9 = LAME VBR quality
+            s.setEnabled(True); s.setRange(0, 9); s.setValue(0)
+            self.hint.setText("MP3: default is 320 kbps CBR (slider at 0). Move right "
+                              "for VBR (1 = highest quality VBR … 9 = smallest).")
+        s.blockSignals(False)
+        self._update_q_label(s.value())
+
+    def _update_q_label(self, v):
+        fmt = self.fmt.currentText()
+        if fmt == "WAV":
+            self.q_value.setText("—")
+        elif fmt == "MP3":
+            self.q_value.setText("320k CBR" if v == 0 else f"VBR q{v}")
+        else:
+            self.q_value.setText(str(v))
+
+    def result_settings(self):
+        """Return (fmt, threads, quality_dict_or_None, priority). quality is None when
+        the chosen settings match the current defaults, so the render path is unchanged."""
+        fmt = self.fmt.currentText()
+        v = self.q_slider.value()
+        quality = None
+        if fmt == "FLAC" and v != 8:
+            quality = {"flac_level": v}
+        elif fmt == "OGG" and v != 6:
+            quality = {"ogg_q": v}
+        elif fmt == "MP3" and v != 0:
+            quality = {"mp3_vbr_q": v}
+        return fmt, self.threads.value(), quality, self.prio.currentText()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -663,7 +1024,16 @@ class MainWindow(QMainWindow):
         because a dependency is missing."""
         from bms_core import _PIL_OK
         if not _SD_OK:
-            self.log("WARNING: 'sounddevice' not available — in-app playback is disabled.")
+            self.log("WARNING: audio playback is unavailable — the 'sounddevice' "
+                     "module failed to load.")
+            if _SD_ERR:
+                self.log(f"  reason: {_SD_ERR}")
+            self.log("  This usually means PortAudio's library is missing, not that "
+                     "you have no audio device. PipeWire/PulseAudio still work through "
+                     "it. Fix: install PortAudio + the Python binding, e.g. Debian/"
+                     "Ubuntu: 'sudo apt install libportaudio2' then 'pip install "
+                     "sounddevice'; Arch: 'sudo pacman -S portaudio'; Fedora: "
+                     "'sudo dnf install portaudio'.")
         if not _PIL_OK:
             self.log("WARNING: Pillow (PIL) not available — cover art is disabled.")
         if ffmpeg_path() is None:
@@ -806,7 +1176,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.ltable, 1)
 
         add_bar = QHBoxLayout(); add_bar.addStretch(1)
-        add_btn = QPushButton("Add selected to Queue →")
+        add_btn = QPushButton("Add selected to Queue")
+        from PyQt5.QtWidgets import QStyle
+        add_btn.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        add_btn.setLayoutDirection(Qt.RightToLeft)   # icon sits at the trailing edge
         add_btn.clicked.connect(self._lib_add_selected)
         add_bar.addWidget(add_btn)
         lay.addLayout(add_bar)
@@ -927,7 +1300,8 @@ class MainWindow(QMainWindow):
 
     def _start_song(self, path, title, kind="library", index=-1):
         if self.player is None:
-            self.log("Playback unavailable (no audio device)."); return
+            self.log("Playback unavailable — PortAudio/sounddevice isn't loaded. "
+                     "See the startup warning for how to install it."); return
         self.player.stop()
         self._now_path = path
         self._play_gen = getattr(self, "_play_gen", 0) + 1   # invalidate older renders
@@ -1120,6 +1494,9 @@ class MainWindow(QMainWindow):
             self.wave.set_pos(frac)
 
     def _on_volume(self, level):
+        # a manual (or programmatic non-mute) volume change above 0 clears mute
+        if level > 0:
+            self._muted = False
         if self.player is not None:
             try:
                 self.player.set_volume(float(level))
@@ -1177,6 +1554,57 @@ class MainWindow(QMainWindow):
 
     def _prev_track(self):
         self._advance(-1)
+
+    def _install_media_keys(self):
+        """Bind multimedia keyboard keys (and convenient fallbacks) to the transport.
+        Qt delivers these when the app has focus; they work on Windows, macOS and
+        Linux without any extra dependency. (System-wide keys while minimized would
+        need per-OS global hooks, which we intentionally don't pull in.)"""
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui import QKeySequence
+
+        def bind(key, fn):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ApplicationShortcut)   # fire from anywhere in the app
+            sc.activated.connect(fn)
+            return sc
+
+        self._media_shortcuts = [
+            # dedicated multimedia keys
+            bind(Qt.Key_MediaPlay, self._toggle_play),
+            bind(Qt.Key_MediaPause, self._toggle_play),
+            bind(Qt.Key_MediaTogglePlayPause, self._toggle_play),
+            bind(Qt.Key_MediaStop, self._stop_play),
+            bind(Qt.Key_MediaNext, self._next_track),
+            bind(Qt.Key_MediaPrevious, self._prev_track),
+            bind(Qt.Key_VolumeUp, lambda: self._nudge_volume(+0.05)),
+            bind(Qt.Key_VolumeDown, lambda: self._nudge_volume(-0.05)),
+            bind(Qt.Key_VolumeMute, self._toggle_mute),
+            # friendly fallbacks for keyboards without media keys
+            bind("Ctrl+Right", self._next_track),
+            bind("Ctrl+Left", self._prev_track),
+            bind("Ctrl+Up", lambda: self._nudge_volume(+0.05)),
+            bind("Ctrl+Down", lambda: self._nudge_volume(-0.05)),
+            bind("Ctrl+M", self._toggle_mute),
+        ]
+
+    def _nudge_volume(self, delta):
+        if not hasattr(self, "vol"):
+            return
+        self._muted = False
+        self.vol.set_level(self.vol.level() + delta)
+
+    def _toggle_mute(self):
+        if not hasattr(self, "vol"):
+            return
+        if getattr(self, "_muted", False):
+            # restore the level we had before muting
+            self.vol.set_level(getattr(self, "_premute_level", 1.0))
+            self._muted = False
+        else:
+            self._premute_level = self.vol.level()
+            self.vol.set_level(0.0)
+            self._muted = True
 
     def _redetect_device(self):
         if self.player is None:
@@ -1974,16 +2402,17 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.pl_stack, 1)
 
         bbar = QHBoxLayout()
-        rm_btn = QPushButton("Remove from playlist"); rm_btn.clicked.connect(self._pl_remove)
+        rm_btn = QPushButton("Remove from Playlist"); rm_btn.clicked.connect(self._pl_remove)
         bbar.addWidget(rm_btn); bbar.addStretch(1)
-        bbar.addWidget(QLabel("Threads:"))
+        # Threads + Format now live in the render-settings dialog (opened by the render
+        # button). The widgets are kept (hidden) so the Queue<->Playlists sync wiring
+        # keeps working unchanged.
         self.pl_threads = QSpinBox(); self.pl_threads.setRange(1, (os.cpu_count() or 4) * 2)
-        bbar.addWidget(self.pl_threads)
-        bbar.addWidget(QLabel("Format:"))
+        self.pl_threads.hide()
         self.pl_fmt = QComboBox()
         self.pl_fmt.addItems(["FLAC", "WAV"] + (["OGG", "MP3"] if ffmpeg_path() else []))
-        bbar.addWidget(self.pl_fmt)
-        self.pl_render_btn = QPushButton("Render playlist")
+        self.pl_fmt.hide()
+        self.pl_render_btn = QPushButton("Render Playlist")
         self.pl_render_btn.clicked.connect(self._pl_render)
         bbar.addWidget(self.pl_render_btn)
         lay.addLayout(bbar)
@@ -2152,9 +2581,17 @@ class MainWindow(QMainWindow):
                           "art": e.get("art") if isinstance(e, dict) else None})
         if not items:
             self.log("No owned songs in this playlist to render."); return
+        dlg = AudioExportDialog(self, self.pl_fmt.currentText(),
+                                self.pl_threads.value(), self.pl_threads.maximum())
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        fmt, threads, quality, priority = dlg.result_settings()
+        # keep the (hidden) playlist controls in sync, which propagates to the Queue tab
+        self.pl_fmt.setCurrentText(fmt)
+        self.pl_threads.setValue(threads)
         self.pl_render_btn.setEnabled(False)
-        self._pl_worker = RenderWorker(items, out_dir, self.q_fmt.currentText(),
-                                       self.q_threads.value())
+        self._pl_worker = RenderWorker(items, out_dir, fmt, threads,
+                                       quality=quality, priority=priority)
         self._pl_worker.log.connect(self.log)
         self._pl_worker.done.connect(lambda: self.pl_render_btn.setEnabled(True))
         self._pl_worker.start()
@@ -2184,7 +2621,7 @@ class MainWindow(QMainWindow):
         else:
             send_new = None
         m.addSeparator()
-        act_rm = m.addAction("Remove from playlist")
+        act_rm = m.addAction("Remove from Playlist")
         chosen = m.exec_(self.pltree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
@@ -2245,7 +2682,9 @@ class MainWindow(QMainWindow):
 
         bbar = QHBoxLayout(); bbar.addStretch(1)
         allbtn = QPushButton("Add all owned to Queue"); allbtn.clicked.connect(self._table_add_all)
-        selbtn = QPushButton("Add selected to Queue →"); selbtn.clicked.connect(self._table_add_selected)
+        selbtn = QPushButton("Add selected to Queue"); selbtn.clicked.connect(self._table_add_selected)
+        selbtn.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        selbtn.setLayoutDirection(Qt.RightToLeft)    # icon sits at the trailing edge
         bbar.addWidget(allbtn); bbar.addWidget(selbtn)
         lay.addLayout(bbar)
 
@@ -2425,7 +2864,9 @@ class MainWindow(QMainWindow):
         clr_btn = QPushButton("Clear Queue"); clr_btn.clicked.connect(self.q_clear)
         for b in (rem_btn, clr_btn): ctrl.addWidget(b)
         ctrl.addStretch(1)
-        ctrl.addWidget(QLabel("Threads:"))
+        # Threads + Format now live in the render-settings dialog. We keep the widget
+        # objects (not shown here) as the live state holders so all the existing
+        # Queue<->Playlists sync and BGA-worker wiring keeps working unchanged.
         self.q_threads = QSpinBox(); self.q_threads.setRange(1, (os.cpu_count() or 4) * 2)
         saved_threads = 0
         try:
@@ -2436,11 +2877,10 @@ class MainWindow(QMainWindow):
                                 else max(1, (os.cpu_count() or 4) - 1))
         self.q_threads.valueChanged.connect(
             lambda v: self._update_cfg(render_threads=v))
-        ctrl.addWidget(self.q_threads)
-        ctrl.addWidget(QLabel("Format:"))
+        self.q_threads.hide()
         self.q_fmt = QComboBox()
         self.q_fmt.addItems(["FLAC", "WAV"] + (["OGG", "MP3"] if ffmpeg_path() else []))
-        ctrl.addWidget(self.q_fmt)
+        self.q_fmt.hide()
         self.q_render_btn = QPushButton("Render All in Queue")
         self.q_render_btn.clicked.connect(self.q_render_all)
         self.q_bga_btn = QPushButton("Render All BGA in Queue")
@@ -2558,6 +2998,7 @@ class MainWindow(QMainWindow):
         self.next_btn.clicked.connect(self._next_track)
         self.prev_btn.clicked.connect(self._prev_track)
         self.dev_btn.clicked.connect(self._redetect_device)
+        self._install_media_keys()
         # position/finish poll, like the Tk app's after()-driven _tick
         from PyQt5.QtCore import QTimer
         self._timer = QTimer(self); self._timer.timeout.connect(self._tick)
@@ -2631,12 +3072,19 @@ class MainWindow(QMainWindow):
         out_dir = self.out_edit.text() or load_config().get("output")
         if not out_dir or not os.path.isdir(out_dir):
             QMessageBox.information(self, "No output folder", "Choose an output folder first."); return
+        dlg = AudioExportDialog(self, self.q_fmt.currentText(),
+                                self.q_threads.value(), self.q_threads.maximum())
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        fmt, threads, quality, priority = dlg.result_settings()
+        # write chosen format/threads back to the live controls so the Queue and
+        # Custom Playlists tabs stay in sync (their bidirectional wiring still applies)
+        self.q_fmt.setCurrentText(fmt)
+        self.q_threads.setValue(threads)
         self.q_render_btn.setEnabled(False); self._removed = 0
-        # resolve the whole-queue cover once (path, black flag) and pass to the worker
         cover_cfg = ("__BLACK__" if self._art_black else (self._art_path or None))
-        self._worker = RenderWorker(list(self.queue), out_dir,
-                                    self.q_fmt.currentText(), self.q_threads.value(),
-                                    cover_cfg)
+        self._worker = RenderWorker(list(self.queue), out_dir, fmt, threads,
+                                    cover_cfg, quality=quality, priority=priority)
         self._worker.log.connect(self.log)
         self._worker.item_done.connect(self._on_item_done)
         self._worker.done.connect(lambda: self.q_render_btn.setEnabled(True))
@@ -2726,8 +3174,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No output folder", "Choose an output folder first."); return
         if not ffmpeg_path():
             QMessageBox.information(self, "ffmpeg required", "BGA video export needs ffmpeg on PATH."); return
+        dlg = BGAExportDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        opts, priority = dlg.options()
         self.q_bga_btn.setEnabled(False)
-        self._bga_worker = BGAWorker(list(self.queue), out_dir, self.q_threads.value())
+        self._bga_worker = BGAWorker(list(self.queue), out_dir, self.q_threads.value(),
+                                     encode_opts=opts, priority=priority)
         self._bga_worker.log.connect(self.log)
         self._bga_worker.done.connect(lambda: self.q_bga_btn.setEnabled(True))
         self._bga_worker.start()

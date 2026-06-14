@@ -31,9 +31,13 @@ except Exception:
 try:
     import sounddevice as sd
     SD_OK = True
-except Exception:
+    SD_IMPORT_ERROR = ""
+except Exception as _e:
     sd = None
     SD_OK = False
+    # keep the reason so the app can tell the user WHY playback is unavailable
+    # (commonly: PortAudio's shared library isn't installed)
+    SD_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 
 class Player:

@@ -464,11 +464,11 @@ def detect_bga(path):
          "frames": int,        # number of distinct base-layer (ch 04) image changes
          "images": int}        # count of #BMP defs that point to images
 
-    Only the base BGA layer (channel 04) is considered — overlay (07) and
-    poor/miss (0A) layers are intentionally ignored, since the goal is the main
-    animated visual. 'sequence' means the base layer switches images at 2+ points
-    in time (an animation); 'static' means a single image shown the whole song;
-    'video' means at least one referenced BGA file is a video format.
+    Both the base BGA layer (channel 04) and the overlay/layer channel (07) are
+    considered, since some charts drive the animation entirely on layer 07. The
+    poor/miss layer (06/0A) is still ignored. 'sequence' means the BGA switches
+    images at 2+ points in time (an animation); 'static' means a single image shown
+    the whole song; 'video' means at least one referenced BGA file is a video.
     """
     bmp_table = {}            # id(int) -> filename (from #BMPxx)
     for line in read_bms_text(path).splitlines():
@@ -484,15 +484,17 @@ def detect_bga(path):
     if not bmp_table:
         return {"type": "none", "frames": 0, "images": 0}
 
-    # collect base-layer (channel 04) events: each measure's payload is a run of
-    # 2-char base-36 objects; a non-"00" object is an image-change at that slot
+    # collect BGA events from the base layer (channel 04) AND the overlay/layer
+    # channel (07). Many charts keep a static/empty base and drive the actual
+    # animation on layer 07 (composited over the base with black = transparent),
+    # so ignoring 07 would wrongly report 'no BGA' for those charts.
     base_objs = []            # list of bmp ids actually placed on the timeline
     for line in read_bms_text(path).splitlines():
         line = line.strip()
-        mm = re.match(r"#(\d{3})04:(.*)", line)
+        mm = re.match(r"#(\d{3})(04|07):(.*)", line)
         if not mm:
             continue
-        payload = mm.group(2).strip()
+        payload = mm.group(3).strip()
         for i in range(0, len(payload) - 1, 2):
             obj = payload[i:i+2]
             if obj != "00":
@@ -501,19 +503,26 @@ def detect_bga(path):
                 except ValueError:
                     pass
 
-    # which referenced BMP files are videos vs images?
-    used_ids = set(base_objs) or set(bmp_table)
-    has_video = any(os.path.splitext(bmp_table.get(i, ""))[1].lower() in VIDEO_EXTS
-                    for i in used_ids)
+    # Split the placed events into image vs video by their referenced file. A chart
+    # can define BOTH a video BGA and a full PNG fallback sequence (the video for
+    # players that decode it, the images for those that don't). Since this renderer
+    # renders image sequences, we look at which dominates the TIMELINE rather than
+    # bailing the moment a single video object appears.
+    img_events = sum(1 for i in base_objs
+                     if os.path.splitext(bmp_table.get(i, ""))[1].lower() in IMAGE_EXTS)
+    vid_events = sum(1 for i in base_objs
+                     if os.path.splitext(bmp_table.get(i, ""))[1].lower() in VIDEO_EXTS)
     image_count = sum(1 for fn in bmp_table.values()
                       if os.path.splitext(fn)[1].lower() in IMAGE_EXTS)
 
-    if has_video:
-        return {"type": "video", "frames": len(base_objs), "images": image_count}
-    if not base_objs:
+    # a usable image sequence/static wins; only call it 'video' when there's no
+    # renderable image timeline (the BGA is genuinely video-only)
+    if img_events == 0 and vid_events > 0:
+        return {"type": "video", "frames": vid_events, "images": image_count}
+    if img_events == 0:
         return {"type": "none", "frames": 0, "images": image_count}
-    if len(base_objs) >= 2:
-        return {"type": "sequence", "frames": len(base_objs), "images": image_count}
+    if img_events >= 2:
+        return {"type": "sequence", "frames": img_events, "images": image_count}
     return {"type": "static", "frames": 1, "images": image_count}
 
 
@@ -1259,12 +1268,16 @@ def write_tags_to_file(path, fmt, tags, cover):
             f.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover))
         f.save(path)
 
-def _encode_ogg_ffmpeg(ff, audio, out_path):
+def _encode_ogg_ffmpeg(ff, audio, out_path, quality=None):
     import subprocess
+    # default preserves the original -q:a 6; a quality dict can raise/lower it (VBR)
+    q = "6"
+    if quality and quality.get("ogg_q") is not None:
+        q = str(quality["ogg_q"])
     tmp_wav = out_path + ".tmp.wav"
     try:
         sf.write(tmp_wav, audio, SR, format="WAV")
-        proc = subprocess.run([ff, "-y", "-i", tmp_wav, "-c:a", "libvorbis", "-q:a", "6",
+        proc = subprocess.run([ff, "-y", "-i", tmp_wav, "-c:a", "libvorbis", "-q:a", q,
                                out_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               **_no_window_kwargs())
         if proc.returncode != 0:
@@ -1274,13 +1287,16 @@ def _encode_ogg_ffmpeg(ff, audio, out_path):
             try: os.remove(tmp_wav)
             except OSError: pass
 
-def _encode_flac_ffmpeg(ff, audio, out_path):
+def _encode_flac_ffmpeg(ff, audio, out_path, quality=None):
     import subprocess
+    lvl = "8"                                    # default unchanged
+    if quality and quality.get("flac_level") is not None:
+        lvl = str(max(0, min(12, int(quality["flac_level"]))))
     tmp_wav = out_path + ".tmp.wav"
     try:
         sf.write(tmp_wav, audio, SR, format="WAV")
         proc = subprocess.run([ff, "-y", "-i", tmp_wav, "-c:a", "flac",
-                               "-compression_level", "8", out_path],
+                               "-compression_level", lvl, out_path],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               **_no_window_kwargs())
         if proc.returncode != 0:
@@ -1290,13 +1306,16 @@ def _encode_flac_ffmpeg(ff, audio, out_path):
             try: os.remove(tmp_wav)
             except OSError: pass
 
-def _encode_mp3_ffmpeg(ff, audio, out_path):
+def _encode_mp3_ffmpeg(ff, audio, out_path, quality=None):
     import subprocess
     tmp_wav = out_path + ".tmp.wav"
+    # default preserves 320k CBR; a quality dict switches to VBR at a target bitrate
+    enc = ["-c:a", "libmp3lame", "-b:a", "320k"]
+    if quality and quality.get("mp3_vbr_q") is not None:
+        enc = ["-c:a", "libmp3lame", "-q:a", str(quality["mp3_vbr_q"])]
     try:
         sf.write(tmp_wav, audio, SR, format="WAV")
-        proc = subprocess.run([ff, "-y", "-i", tmp_wav, "-c:a", "libmp3lame",
-                               "-b:a", "320k", out_path],
+        proc = subprocess.run([ff, "-y", "-i", tmp_wav] + enc + [out_path],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               **_no_window_kwargs())
         if proc.returncode != 0:
@@ -1307,12 +1326,15 @@ def _encode_mp3_ffmpeg(ff, audio, out_path):
             except OSError: pass
 
 def bga_timeline(path):
-    """Extract the base-layer (channel 04) BGA as a list of (seconds, image_path)
-    events, using the SAME tempo/measure-length/STOP accumulator as render_bms so
-    the visuals line up with the audio. Returns (events, total_seconds, missing):
-      events  : [(t_seconds, abs_image_path_or_None), ...] in time order
-      total_seconds : length of the chart in seconds (for the final frame hold)
-      missing : count of referenced BGA images not found on disk
+    """Extract the BGA as time-ordered (seconds, image_path) events, using the SAME
+    tempo/measure-length/STOP accumulator as render_bms so visuals line up with audio.
+    Returns (events, total_seconds, missing, layer_events):
+      events       : base layer (channel 04) [(t_seconds, abs_path_or_None), ...]
+      total_seconds: length of the chart in seconds (for the final-frame hold)
+      missing      : count of referenced base-layer images not found on disk
+      layer_events : overlay layer (channel 07), same shape; composited over the base
+                     with black treated as transparent. Empty when the chart has no
+                     layer BGA.
     Only images are resolved; video-format BGA files resolve to None (skipped)."""
     d = parse_bms(path)
     header, bars = d["header"], d["bars"]
@@ -1335,10 +1357,11 @@ def bga_timeline(path):
     except (ValueError, TypeError):
         base_bpm = 120.0
     if not bars:
-        return [], 0.0, 0
+        return [], 0.0, 0, []
 
     max_measure = max(bars.keys())
-    events = []           # (sample_pos, bmp_id)
+    events = []           # (sample_pos, bmp_id)  base layer (ch 04)
+    layer_events = []     # (sample_pos, bmp_id)  overlay layer (ch 07)
     bpm = base_bpm
     sample_pos = 0.0
 
@@ -1357,7 +1380,7 @@ def bga_timeline(path):
         for chan, payloads in bar.items():
             if chan == "02":
                 continue
-            if chan not in ("03", "08", "09", "04"):
+            if chan not in ("03", "08", "09", "04", "07"):
                 continue
             for payload in payloads:
                 pairs = [payload[i:i+2] for i in range(0, len(payload) - len(payload) % 2, 2)]
@@ -1390,6 +1413,8 @@ def bga_timeline(path):
                         stop_here = stop_table.get(val, 0.0)
                     elif chan == "04":                    # BGA base layer
                         events.append((sample_pos, val))
+                    elif chan == "07":                    # BGA overlay/layer
+                        layer_events.append((sample_pos, val))
             if bpm <= 0:
                 bpm = base_bpm
             sample_pos += (SR * 60.0 / bpm) / (resolution / 4.0) * ratio
@@ -1397,19 +1422,120 @@ def bga_timeline(path):
                 sample_pos += (SR * 60.0 / bpm) * (stop_here / 192.0 * 4.0)
 
     total_seconds = sample_pos / SR
+
     # resolve bmp ids to image paths (videos → None/skip)
-    out, missing = [], 0
-    for sp, bid in events:
-        fn = bmp_table.get(bid)
-        img = None
-        if fn:
-            ext = os.path.splitext(fn)[1].lower()
-            if ext in IMAGE_EXTS:
-                img = find_image(folder, fn)
-                if img is None:
-                    missing += 1
-        out.append((sp / SR, img))
-    return out, total_seconds, missing
+    def _resolve(evlist):
+        res, miss = [], 0
+        for sp, bid in evlist:
+            fn = bmp_table.get(bid)
+            img = None
+            if fn:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext in IMAGE_EXTS:
+                    img = find_image(folder, fn)
+                    if img is None:
+                        miss += 1
+            res.append((sp / SR, img))
+        return res, miss
+
+    out, missing = _resolve(events)
+    layer_out, layer_missing = _resolve(layer_events)
+    return out, total_seconds, missing, layer_out
+
+
+def _bga_encode_args(opts, out_path):
+    """Translate a GUI encode-options dict into ffmpeg output args + the real output
+    path (the container/extension may change). `opts` keys:
+        video: 'default'|'x264'|'x264_nvenc'|'hevc'|'hevc_nvenc'|'av1'|'vp9'
+        vbitrate: int kbps
+        audio: 'default'|'flac'|'wav'|'ogg'|'mp3'|'aac'|'opus'
+        abitrate: int kbps   (lossy)
+        flac_level: int 0-8  (flac only)
+    Returns (args_list, final_out_path). When opts is None the EXACT original behavior
+    is used (H.264 4:2:0 + AAC 192k in mp4)."""
+    # ---- default: preserve original behavior exactly ----
+    if not opts or (opts.get("video", "default") == "default"
+                    and opts.get("audio", "default") == "default"):
+        return (["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+                 "-c:a", "aac", "-b:a", "192k", "-shortest"], out_path)
+
+    base, _ext = os.path.splitext(out_path)
+    # any non-default combination uses MKV for maximum codec compatibility
+    final_out = base + ".mkv"
+
+    v = opts.get("video", "default")
+    a = opts.get("audio", "default")
+    vbr = int(opts.get("vbitrate", 6000))
+    abr = int(opts.get("abitrate", 192))
+
+    args = []
+
+    # ---- video ----
+    if v == "default":
+        args += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast"]
+    elif v == "x264":
+        args += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "medium",
+                 "-b:v", f"{vbr}k"]
+    elif v == "x264_nvenc":
+        args += ["-c:v", "h264_nvenc", "-pix_fmt", "yuv420p", "-preset", "p5",
+                 "-b:v", f"{vbr}k"]
+    elif v == "hevc":
+        args += ["-c:v", "libx265", "-pix_fmt", "yuv420p", "-preset", "medium",
+                 "-b:v", f"{vbr}k"]
+    elif v == "hevc_nvenc":
+        args += ["-c:v", "hevc_nvenc", "-pix_fmt", "yuv420p", "-preset", "p5",
+                 "-b:v", f"{vbr}k"]
+    elif v == "av1":
+        args += ["-c:v", "libaom-av1", "-pix_fmt", "yuv420p", "-b:v", f"{vbr}k",
+                 "-cpu-used", "6"]
+    elif v == "vp9":
+        args += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-b:v", f"{vbr}k"]
+    else:
+        args += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast"]
+
+    # ---- audio ----
+    if a == "default":
+        args += ["-c:a", "aac", "-b:a", "192k"]
+    elif a == "wav":
+        args += ["-c:a", "pcm_s16le"]                       # uncompressed; no bitrate
+    elif a == "flac":
+        lvl = int(opts.get("flac_level", 8))
+        args += ["-c:a", "flac", "-compression_level", str(max(0, min(12, lvl)))]
+    elif a == "ogg":
+        args += ["-c:a", "libvorbis", "-q:a", str(_vorbis_q(abr))]   # VBR
+    elif a == "mp3":
+        args += ["-c:a", "libmp3lame", "-q:a", str(_lame_q(abr))]    # VBR
+    elif a == "aac":
+        args += ["-c:a", "aac", "-b:a", f"{abr}k"]
+    elif a == "opus":
+        # opus needs 48k; resampling is out of scope, so callers should not offer it
+        # at 44.1k — but if it arrives, fall back to aac so we never silently fail
+        args += ["-c:a", "aac", "-b:a", f"{abr}k"]
+    else:
+        args += ["-c:a", "aac", "-b:a", "192k"]
+
+    args += ["-shortest"]
+    return (args, final_out)
+
+
+def _vorbis_q(kbps):
+    """Map a target kbps to a libvorbis VBR quality (-q:a, roughly 0..10)."""
+    table = [(64, 0), (96, 2), (128, 4), (160, 5), (192, 6), (224, 7),
+             (256, 8), (320, 9)]
+    for lim, q in table:
+        if kbps <= lim:
+            return q
+    return 10
+
+
+def _lame_q(kbps):
+    """Map a target kbps to a libmp3lame VBR quality (-q:a, 0=best..9). Higher kbps
+    -> lower q number -> better quality."""
+    table = [(128, 5), (160, 4), (192, 2), (224, 1), (256, 0)]
+    for lim, q in table:
+        if kbps <= lim:
+            return q
+    return 0
 
 
 def render_bga_video_job(job):
@@ -1418,7 +1544,12 @@ def render_bga_video_job(job):
     Returns (out_path, title, None) on success or (out_path, title, error_str).
     Strategy: render audio with render_bms; build the channel-04 BGA timeline; feed
     raw RGB frames to ffmpeg at a fixed fps while muxing the audio in one pass."""
-    in_path, out_path, ff, lib_root, fps, size = job
+    # job may carry an optional 8th element: the encode-options dict (None = default)
+    if len(job) >= 7:
+        in_path, out_path, ff, lib_root, fps, size, _opts = job[:7]
+    else:
+        in_path, out_path, ff, lib_root, fps, size = job
+        _opts = None
     title = os.path.basename(in_path)
     try:
         import subprocess
@@ -1435,7 +1566,7 @@ def render_bga_video_job(job):
         audio_seconds = len(audio) / SR
 
         # 2) BGA timeline (image events in seconds)
-        events, bga_seconds, _missing = bga_timeline(in_path)
+        events, bga_seconds, _missing, layer_events = bga_timeline(in_path)
         duration = max(audio_seconds, bga_seconds)
 
         # 3) choose output dimensions from the BGA's OWN aspect ratio so the image
@@ -1447,7 +1578,7 @@ def render_bga_video_job(job):
         from collections import Counter
         dim_time = Counter()           # (w,h) -> number of events using it
         dim_seen = {}                  # path -> (w,h), measured once
-        for _t, p in events:
+        for _t, p in list(events) + list(layer_events):
             if not p:
                 continue
             if p not in dim_seen:
@@ -1469,48 +1600,67 @@ def render_bga_video_job(job):
             H = target; W = max(2, round(target * iw / ih))
         W -= W % 2; H -= H % 2                  # H.264 needs even width/height
         black = Image.new("RGB", (W, H), (0, 0, 0))
-        cache = {}
-        def frame_for(img_path):
+        cache = {}                      # img_path -> scaled RGB Image (base use)
+        def _scaled(img_path):
+            """Load an image scaled to fit the frame, centered on black. Cached."""
             if img_path in cache:
                 return cache[img_path]
-            if img_path is None:
-                raw = black.tobytes()
-                cache[img_path] = raw
-                return raw
             canvas = black.copy()
-            try:
-                im = Image.open(img_path).convert("RGB")
-                # scale to fill the frame, preserving aspect, NEVER cropping. We must
-                # scale UP as well as down (thumbnail() only shrinks), so small source
-                # BGAs (e.g. 256x256) fill the 720px frame instead of sitting tiny in
-                # a sea of black. Fit = min ratio so the whole image stays visible.
-                iw, ih = im.size
-                if iw > 0 and ih > 0:
-                    scale = min(W / iw, H / ih)
-                    nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
-                    im = im.resize((nw, nh), Image.LANCZOS)
-                canvas.paste(im, ((W - im.width) // 2, (H - im.height) // 2))
-            except Exception:
-                pass
-            raw = canvas.tobytes()
-            cache[img_path] = raw
+            if img_path is not None:
+                try:
+                    im = Image.open(img_path).convert("RGB")
+                    iw, ih = im.size
+                    if iw > 0 and ih > 0:
+                        scale = min(W / iw, H / ih)
+                        nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
+                        im = im.resize((nw, nh), Image.LANCZOS)
+                    canvas.paste(im, ((W - im.width) // 2, (H - im.height) // 2))
+                except Exception:
+                    pass
+            cache[img_path] = canvas
+            return canvas
+
+        frame_cache = {}                # (base_path, layer_path) -> raw RGB bytes
+        def frame_for(base_path, layer_path):
+            key = (base_path, layer_path)
+            if key in frame_cache:
+                return frame_cache[key]
+            base_img = _scaled(base_path)
+            if layer_path is None:
+                raw = base_img.tobytes()
+            else:
+                # composite the overlay (channel 07) over the base, treating pure
+                # black as transparent — the standard BMS layer-BGA behavior
+                layer_img = _scaled(layer_path)
+                import numpy as _np
+                b = _np.asarray(base_img)
+                l = _np.asarray(layer_img)
+                mask = (l.sum(axis=2) > 0)[:, :, None]   # non-black layer pixels
+                comp = _np.where(mask, l, b).astype("uint8")
+                raw = comp.tobytes()
+            frame_cache[key] = raw
             return raw
 
-        # 4) per-output-frame lookup: show the last BGA event whose time <= t.
-        #    Prepend a blank (None) at t=0 so nothing shows BEFORE the first real
-        #    BGA event instead of freezing on frame 1.
-        ev = sorted(((t, p) for t, p in events), key=lambda x: x[0])
-        if not ev or ev[0][0] > 0.0:
-            ev = [(0.0, None)] + ev
+        # 4) per-output-frame lookup for BOTH layers: show the last event whose time
+        #    <= t. Prepend a blank (None) at t=0 so nothing shows before the first
+        #    real event instead of freezing on frame 1.
+        def _prep(evlist):
+            e = sorted(((t, p) for t, p in evlist), key=lambda x: x[0])
+            if not e or e[0][0] > 0.0:
+                e = [(0.0, None)] + e
+            return e
+        ev = _prep(events)
+        lev = _prep(layer_events)
         total_frames = max(1, int(duration * fps))
 
-        # 5) pipe raw frames to ffmpeg, muxing the wav; ffmpeg encodes H.264 + AAC
+        # 5) pipe raw frames to ffmpeg, muxing the wav. Codec/container come from the
+        #    encode options (None -> original H.264 4:2:0 + AAC in mp4).
+        enc_args, real_out = _bga_encode_args(_opts, out_path)
         cmd = [ff, "-y", "-loglevel", "error",
                "-f", "rawvideo", "-pixel_format", "rgb24",
                "-video_size", f"{W}x{H}", "-framerate", str(fps), "-i", "pipe:0",
-               "-i", tmp_wav,
-               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
-               "-c:a", "aac", "-b:a", "192k", "-shortest", out_path]
+               "-i", tmp_wav] + enc_args + [real_out]
+        out_path = real_out          # report the actual file we wrote
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 **_no_window_kwargs())
@@ -1527,14 +1677,16 @@ def render_bga_video_job(job):
         t_err = _th.Thread(target=_drain, args=(proc.stderr, "err"), daemon=True)
         t_out = _th.Thread(target=_drain, args=(proc.stdout, "out"), daemon=True)
         t_err.start(); t_out.start()
-        ei = 0
+        ei = 0; li = 0
         try:
             try:
                 for fno in range(total_frames):
                     t = fno / fps
                     while ei + 1 < len(ev) and ev[ei + 1][0] <= t:
                         ei += 1
-                    proc.stdin.write(frame_for(ev[ei][1]))
+                    while li + 1 < len(lev) and lev[li + 1][0] <= t:
+                        li += 1
+                    proc.stdin.write(frame_for(ev[ei][1], lev[li][1]))
             except BrokenPipeError:
                 pass                       # ffmpeg exited early; error captured below
             try:
@@ -1557,9 +1709,13 @@ def render_bga_video_job(job):
 
 def render_one_job(job):
     """Render ONE song to its final tagged file. Runs in a worker process.
-    `job` = (in_path, out_path, fmt, tags, cover_bytes, ffmpeg, library_root).
+    `job` = (in_path, out_path, fmt, tags, cover_bytes, ffmpeg, library_root[, quality]).
     Returns (out_path, title, None) on success or (out_path, title, error_str)."""
-    in_path, out_path, fmt, tags, cover, ff, lib_root = job
+    if len(job) >= 8:
+        in_path, out_path, fmt, tags, cover, ff, lib_root, quality = job[:8]
+    else:
+        in_path, out_path, fmt, tags, cover, ff, lib_root = job
+        quality = None
     title = tags.get("Title", os.path.basename(in_path))
     try:
         set_library_root(lib_root)              # restore guard in this subprocess
@@ -1567,11 +1723,11 @@ def render_one_job(job):
         audio, _ = render_bms(in_path)
         assert_safe_output(out_path)
         if fmt == "OGG":
-            _encode_ogg_ffmpeg(ff, audio, out_path)
+            _encode_ogg_ffmpeg(ff, audio, out_path, quality)
         elif fmt == "MP3":
-            _encode_mp3_ffmpeg(ff, audio, out_path)
+            _encode_mp3_ffmpeg(ff, audio, out_path, quality)
         elif fmt == "FLAC" and ff:
-            _encode_flac_ffmpeg(ff, audio, out_path)
+            _encode_flac_ffmpeg(ff, audio, out_path, quality)
         else:
             sf.write(out_path, audio, SR, format=("WAV" if fmt == "WAV" else "FLAC"))
         write_tags_to_file(out_path, fmt, tags, cover)
