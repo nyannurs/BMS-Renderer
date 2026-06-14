@@ -216,7 +216,8 @@ class MarqueeLabel(QLabel):
         super().__init__()
         self._full = text
         self._offset = 0
-        self.setStyleSheet("color:#444;")
+        # no hardcoded colour — inherit the palette text colour so it's dark on a
+        # light theme and white on a dark theme
         from PyQt5.QtCore import QTimer
         self._timer = QTimer(self); self._timer.timeout.connect(self._scroll)
 
@@ -719,7 +720,7 @@ class BGAExportDialog(QDialog):
         # codec performance guide
         self.perf = _CodecPerfGraphic()
         guide_lbl = QLabel("Codec guide — longer bar is better:")
-        guide_lbl.setStyleSheet("color:#888;")
+        guide_lbl.setObjectName("mutedLabel")
         vlay.addWidget(guide_lbl)
         vlay.addWidget(self.perf)
         vlay.addStretch(1)
@@ -966,7 +967,7 @@ class AudioExportDialog(QDialog):
         prow.addWidget(self.prio); prow.addStretch(1)
         root.addLayout(prow)
 
-        self.hint = QLabel(""); self.hint.setStyleSheet("color:#888;"); self.hint.setWordWrap(True)
+        self.hint = QLabel(""); self.hint.setObjectName("mutedLabel"); self.hint.setWordWrap(True)
         root.addWidget(self.hint)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1074,9 +1075,12 @@ class MainWindow(QMainWindow):
                 pass
         self._build()
         self._sync_render_settings()
-        # remember the app's default palette, then apply the saved theme choice
+        # remember the app's default style + palette, then apply the saved theme
         from PyQt5.QtWidgets import QApplication
-        self._default_palette = QApplication.instance().palette()
+        from PyQt5.QtGui import QPalette
+        _app = QApplication.instance()
+        self._default_palette = QPalette(_app.palette())          # copy, not a ref
+        self._default_style = _app.style().objectName()           # e.g. "windowsvista"
         if bool(load_config().get("dark_mode", False)):
             self._apply_theme(True)
 
@@ -1090,6 +1094,11 @@ class MainWindow(QMainWindow):
         # main split: tabs (left) | right panel
         mid = QHBoxLayout()
         self.tabs = QTabWidget()
+        # native dark-mode toggle (persisted), top-right of the tab bar
+        self.dark_toggle = QCheckBox("Dark mode")
+        self.dark_toggle.setChecked(bool(load_config().get("dark_mode", False)))
+        self.dark_toggle.toggled.connect(self._on_dark_toggled)
+        self.tabs.setCornerWidget(self.dark_toggle, Qt.TopRightCorner)
         self._build_tabs()
         mid.addWidget(self.tabs, 1)
         mid.addWidget(self._build_right_panel())
@@ -1184,12 +1193,7 @@ class MainWindow(QMainWindow):
             from PyQt5.QtCore import QUrl
             QDesktopServices.openUrl(QUrl("https://github.com/nyannurs/BMS-Renderer"))
         logo.mousePressEvent = _open_repo
-        # native dark-mode toggle (persisted); placed left of the logo
-        self.dark_toggle = QCheckBox("Dark mode")
-        self.dark_toggle.setChecked(bool(load_config().get("dark_mode", False)))
-        self.dark_toggle.toggled.connect(self._on_dark_toggled)
-        grid.addWidget(self.dark_toggle, 0, 2, 2, 1, Qt.AlignRight | Qt.AlignTop)
-        grid.addWidget(logo, 0, 3, 2, 1)
+        grid.addWidget(logo, 0, 2, 2, 1)
         grid.setColumnStretch(1, 1)
         return grid
 
@@ -1198,13 +1202,13 @@ class MainWindow(QMainWindow):
         self._apply_theme(on)
 
     def _apply_theme(self, dark):
-        """Apply or remove a native dark palette (Fusion + dark colors) and re-invert
-        the logo to match."""
+        """Swap the application palette between the dark theme and the captured light
+        default. The style stays Fusion app-wide (set at startup), so only the palette
+        changes — that makes the light<->dark switch fully reversible in one click."""
         from PyQt5.QtWidgets import QApplication
         from PyQt5.QtGui import QPalette, QColor
         app = QApplication.instance()
         if dark:
-            app.setStyle("Fusion")
             pal = QPalette()
             pal.setColor(QPalette.Window, QColor(45, 45, 48))
             pal.setColor(QPalette.WindowText, QColor(230, 230, 230))
@@ -1215,14 +1219,36 @@ class MainWindow(QMainWindow):
             pal.setColor(QPalette.Text, QColor(230, 230, 230))
             pal.setColor(QPalette.Button, QColor(55, 55, 58))
             pal.setColor(QPalette.ButtonText, QColor(230, 230, 230))
+            pal.setColor(QPalette.BrightText, QColor(255, 80, 80))
+            pal.setColor(QPalette.Link, QColor(90, 160, 255))
             pal.setColor(QPalette.Highlight, QColor(45, 125, 255))
             pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
             pal.setColor(QPalette.Disabled, QPalette.Text, QColor(120, 120, 120))
             pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(120, 120, 120))
+            pal.setColor(QPalette.Disabled, QPalette.WindowText, QColor(120, 120, 120))
             app.setPalette(pal)
         else:
-            app.setPalette(self._default_palette)
+            app.setPalette(QPalette(self._default_palette))
+        self._repolish_all(app)
         self._refresh_logo_for_theme()
+
+    def _repolish_all(self, app):
+        # Re-polish every widget so it picks up the NEW app palette. Critically we do
+        # NOT call wdg.setPalette() here: assigning an explicit palette to a widget
+        # makes it stop following the application palette forever, which is exactly
+        # what left widgets stuck on the old theme after a switch. unpolish/polish +
+        # a style refresh makes them re-read the (inherited) app palette cleanly.
+        style = app.style()
+        for wdg in app.allWidgets():
+            style.unpolish(wdg)
+            style.polish(wdg)
+            wdg.update()
+        # the read-only tag fields carry a palette-derived stylesheet set at bind time;
+        # clear it so it can't keep stale (wrong-theme) colors. It re-applies with the
+        # correct palette on the next selection.
+        for e in getattr(self, "tag_fields", {}).values():
+            if e.isReadOnly():
+                e.setStyleSheet("")
 
     def _refresh_logo_for_theme(self):
         if getattr(self, "_logo_raw", None) is None or self._logo_raw.isNull():
@@ -1810,7 +1836,7 @@ class MainWindow(QMainWindow):
         w = QWidget(); lay = QVBoxLayout(w)
         bar = QHBoxLayout()
         self.disc_status = QLabel("scan a library first — then come back to explore it")
-        self.disc_status.setStyleSheet("color:#666;")
+        self.disc_status.setObjectName("mutedLabel")
         bar.addWidget(self.disc_status); bar.addStretch(1)
         shuffle_btn = QPushButton("Shuffle"); shuffle_btn.clicked.connect(self._discovery_reset)
         bar.addWidget(shuffle_btn)
@@ -2316,7 +2342,7 @@ class MainWindow(QMainWindow):
         if not path:
             self.bga_indicator.setText(""); return
         self.bga_indicator.setText("Checking for BGA…")
-        self.bga_indicator.setStyleSheet("color:#888;")
+        self.bga_indicator.setStyleSheet("color:#999;")
         # cancel a prior check and start a fresh one
         prev = getattr(self, "_bga_probe", None)
         if prev is not None and prev.isRunning():
@@ -2333,16 +2359,16 @@ class MainWindow(QMainWindow):
             return
         if kind == "sequence":
             self.bga_indicator.setText("● Sequence BGA — can be rendered to video")
-            self.bga_indicator.setStyleSheet("color:#2e7d32;")     # green
+            self.bga_indicator.setStyleSheet("color:#3fae50;")     # green (both themes)
         elif kind == "static":
             self.bga_indicator.setText("○ Static BGA only (single image)")
-            self.bga_indicator.setStyleSheet("color:#888;")
+            self.bga_indicator.setStyleSheet("color:#999;")
         elif kind == "video":
             self.bga_indicator.setText("○ Video BGA (not rendered as a sequence)")
-            self.bga_indicator.setStyleSheet("color:#888;")
+            self.bga_indicator.setStyleSheet("color:#999;")
         else:
             self.bga_indicator.setText("○ No BGA to render")
-            self.bga_indicator.setStyleSheet("color:#888;")
+            self.bga_indicator.setStyleSheet("color:#999;")
 
     def _show_readonly_tags(self, s):
         self._unbind_tags(self._default_tags(s))
@@ -2549,7 +2575,7 @@ class MainWindow(QMainWindow):
         ren_btn = QPushButton("Rename…"); ren_btn.clicked.connect(self._pl_rename)
         del_btn = QPushButton("Delete"); del_btn.clicked.connect(self._pl_delete)
         bar.addWidget(new_btn); bar.addWidget(ren_btn); bar.addWidget(del_btn)
-        self.pl_count = QLabel(""); self.pl_count.setStyleSheet("color:#666;")
+        self.pl_count = QLabel(""); self.pl_count.setObjectName("mutedLabel")
         bar.addWidget(self.pl_count)
         bar.addStretch(1)
         lay.addLayout(bar)
@@ -2832,7 +2858,7 @@ class MainWindow(QMainWindow):
         self.t_expand_btn = QPushButton("Expand all"); self.t_expand_btn.clicked.connect(self._table_expand_all)
         bar.addWidget(self.t_collapse_btn); bar.addWidget(self.t_expand_btn)
         bar.addSpacing(16)
-        self.table_status = QLabel(""); self.table_status.setStyleSheet("color:#666;")
+        self.table_status = QLabel(""); self.table_status.setObjectName("mutedLabel")
         bar.addWidget(self.table_status)
         bar.addStretch(1)
         lay.addLayout(bar)
@@ -3083,7 +3109,7 @@ class MainWindow(QMainWindow):
             e.installEventFilter(self)
         self._tag_field_order = ["Title", "Artist", "Album", "Alb.Artist", "Genre", "BPM"]
         self.tag_hint = QLabel("Select a queued song to edit its tags.")
-        self.tag_hint.setStyleSheet("color:#888;"); self.tag_hint.setWordWrap(True)
+        self.tag_hint.setObjectName("mutedLabel"); self.tag_hint.setWordWrap(True)
         form.addRow(self.tag_hint)
         col.addWidget(tags)
 
@@ -3109,7 +3135,7 @@ class MainWindow(QMainWindow):
         self.song_art_next.setFixedWidth(30); self.song_art_next.clicked.connect(lambda: self._song_art_step(1))
         nav.addWidget(self.song_art_prev); nav.addWidget(self.song_art_slider, 1); nav.addWidget(self.song_art_next)
         pv.addLayout(nav)
-        self.song_art_status = QLabel(""); self.song_art_status.setStyleSheet("color:#666;")
+        self.song_art_status = QLabel(""); self.song_art_status.setObjectName("mutedLabel")
         pv.addWidget(self.song_art_status)
         # indicates whether the selected chart has a renderable sequence BGA
         self.bga_indicator = QLabel(""); self.bga_indicator.setWordWrap(True)
@@ -3136,7 +3162,7 @@ class MainWindow(QMainWindow):
         row.addWidget(choose); row.addWidget(wclear); row.addStretch(1)
         av.addLayout(row)
         self.art_lbl = QLabel("(none — render will have no cover)")
-        self.art_lbl.setStyleSheet("color:#666;"); self.art_lbl.setWordWrap(True)
+        self.art_lbl.setObjectName("mutedLabel"); self.art_lbl.setWordWrap(True)
         av.addWidget(self.art_lbl)
         col.addWidget(art)
         col.addStretch(1)
@@ -3391,6 +3417,9 @@ def main():
                 pass
     try:
         app = QApplication(sys.argv)
+        # Use the Fusion style app-wide so light<->dark theming only needs a palette
+        # swap (switching styles at runtime is fragile and left widgets half-themed).
+        app.setStyle("Fusion")
         # tell Windows this is its own app (not python.exe) so the taskbar shows our icon
         if sys.platform == "win32":
             try:
@@ -3405,7 +3434,8 @@ def main():
         # "iconBtn") keep their tight fixed width
         app.setStyleSheet(
             "QPushButton { padding: 4px 10px; }"
-            "QPushButton#iconBtn { padding: 4px 0px; }")
+            "QPushButton#iconBtn { padding: 4px 0px; }"
+            "QLabel#mutedLabel { color: #999; }")    # readable on light AND dark
         w = MainWindow(); w.show()
         sys.exit(app.exec_())
     except SystemExit:
