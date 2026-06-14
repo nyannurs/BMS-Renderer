@@ -67,10 +67,10 @@ BMS Renderer assumes your library is organized one folder per song, with that so
 
 Audio playback needs the `PortAudio` system library, which pip can't install on Linux. Examples:
 
-**Debian/Ubuntu/Mint**: `sudo apt install libportaudio2`
+- **Debian/Ubuntu/Mint**: `sudo apt install libportaudio2`
 
-**Arch**: `sudo pacman -S portaudio`
+- **Arch**: `sudo pacman -S portaudio`
 
-**Fedora**: `sudo dnf install portaudio`
+- **Fedora**: `sudo dnf install portaudio`
 
 Windows and macOS users can skip this — `pip install sounddevice` includes PortAudio there.
