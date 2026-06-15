@@ -1968,9 +1968,24 @@ class MainWindow(QMainWindow):
         return g
 
     def _grid_context(self, grid, pos):
-        sel = [getattr(self, "_path_index", {}).get(i.data(Qt.UserRole))
-               for i in grid.selectedItems()]
-        sel = [s for s in sel if s]
+        # In a multi-section collapsible view (e.g. Tables by level), each level is a
+        # separate QListWidget. Gather the selection across EVERY sibling grid so a
+        # shift/ctrl selection that spans levels is fully included — not just the grid
+        # that was right-clicked.
+        grids = [grid]
+        view = getattr(grid, "_owner_view", None)
+        if view is not None:
+            grids = [g for g, _n in getattr(view, "_sections", [])] or [grid]
+        seen = set(); sel = []
+        for g in grids:
+            for i in g.selectedItems():
+                p = i.data(Qt.UserRole)
+                if p in seen:
+                    continue
+                seen.add(p)
+                s = getattr(self, "_path_index", {}).get(p)
+                if s:
+                    sel.append(s)
         if not sel:
             it = grid.itemAt(pos)
             s = getattr(self, "_path_index", {}).get(it.data(Qt.UserRole)) if it else None
@@ -2028,6 +2043,8 @@ class MainWindow(QMainWindow):
         view._sections = []                  # [(grid, song_count)] for resize recompute
         for label, songs in sections:
             grid = self._make_album_grid(self._on_tgrid_double)
+            grid._owner_view = view          # back-ref so context menu can gather
+                                             # selections across ALL sibling grids
             grid.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             grid.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             self._fill_one_grid(grid, songs)
@@ -2039,17 +2056,20 @@ class MainWindow(QMainWindow):
         self._resize_collapsible(view)
 
     def _cell_w(self):
-        return self.TILE + self.PAD * 2 + 6
+        # must match the grid's setGridSize column pitch (TILE + PAD*2)
+        return self.TILE + self.PAD * 2
 
     def _cell_h(self):
-        return self.TILE + 60
+        # must match the grid's setGridSize row pitch (TILE + 56) so the computed
+        # section height doesn't overshoot and leave a band of empty padding
+        return self.TILE + 56
 
     def _resize_collapsible(self, view):
         avail = view.viewport().width() - 4
         per_row = max(1, avail // self._cell_w())
         for grid, n in getattr(view, "_sections", []):
             rows = max(1, (n + per_row - 1) // per_row)
-            grid.setFixedHeight(rows * self._cell_h() + 8)
+            grid.setFixedHeight(rows * self._cell_h() + 4)
 
     def _fill_one_grid(self, grid, songs):
         grid.clear()
@@ -2991,10 +3011,26 @@ class MainWindow(QMainWindow):
 
     def _table_selected_songs(self):
         out = []
+        # Album view: selections live in the per-level tile grids, not the tree.
+        # Gather from every section grid (shift/ctrl-click spans levels).
+        if getattr(self, "t_album", None) is not None and self.t_album.isChecked():
+            seen = set()
+            for grid, _n in getattr(self.t_grid, "_sections", []):
+                for it in grid.selectedItems():
+                    p = it.data(Qt.UserRole)
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    s = getattr(self, "_path_index", {}).get(p)
+                    if s:
+                        out.append(s)
+            return out
+        # List view: read the tree selection.
         for it in self.ttree.selectedItems():
             p = it.data(0, Qt.UserRole)
             s = getattr(self, "_path_index", {}).get(p)
-            if s: out.append(s)
+            if s:
+                out.append(s)
         return out
 
     def _on_table_select(self):
