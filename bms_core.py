@@ -936,8 +936,45 @@ def scan_library(root, conn, log=lambda s: None, progress=lambda d, t: None):
         "SELECT path,size,mtime,title,artist,genre,bpm,mode,notes,random,md5 FROM charts")]
     return songs, {"reused": reused, "parsed": parsed, "removed": removed, "total": total}
 
+def _dir_index(folder):
+    """Cache a folder's real filenames keyed by lowercase name, so we can resolve a
+    referenced filename case-INSENSITIVELY. BMS charts are authored on Windows (a
+    case-insensitive filesystem) and routinely reference 'BD_000.wav' when the file
+    on disk is 'bd_000.ogg'; on a case-sensitive Linux filesystem an exact-case
+    os.path.exists() check misses, so every such keysound goes silent and the render
+    comes out empty. This index lets us match regardless of case.
+
+    Cached by folder path for the lifetime of the process. A song folder is static
+    during a render, and find_audio/find_image only consult this index as a fallback
+    (after exact + extension-swap miss), so re-listing every miss would be wasteful.
+    Call clear_dir_index_cache() if folder contents may have changed."""
+    index = _dir_index._cache.get(folder)
+    if index is None:
+        try:
+            index = {n.lower(): n for n in os.listdir(folder)}
+        except OSError:
+            index = {}
+        _dir_index._cache[folder] = index
+    return index
+_dir_index._cache = {}
+
+
+def clear_dir_index_cache():
+    """Drop the cached directory listings (call if a song folder changed on disk)."""
+    _dir_index._cache.clear()
+
+
+def _resolve_ci(folder, name):
+    """Return the real on-disk path for `name` in `folder`, matched case-insensitively;
+    None if absent."""
+    real = _dir_index(folder).get(name.lower())
+    return os.path.join(folder, real) if real else None
+
+
 def find_audio(folder, name):
-    """BMS often names a .wav but ships .ogg. Try exact, then swap extensions."""
+    """BMS often names a .wav but ships .ogg, and is authored case-insensitively.
+    Try exact, then swap extensions, each first case-sensitively (fast path) then
+    case-insensitively (Linux/macOS correctness)."""
     exact = os.path.join(folder, name)
     if os.path.exists(exact):
         return exact
@@ -946,11 +983,19 @@ def find_audio(folder, name):
         cand = os.path.join(folder, stem + ext)
         if os.path.exists(cand):
             return cand
+    # case-insensitive fallback: exact name, then each candidate extension
+    hit = _resolve_ci(folder, name)
+    if hit:
+        return hit
+    for ext in AUDIO_EXTS:
+        hit = _resolve_ci(folder, stem + ext)
+        if hit:
+            return hit
     return None
 
 def find_image(folder, name):
-    """BGA often names a .bmp but ships .png (or vice versa). Try exact, then swap
-    among known image extensions."""
+    """BGA often names a .bmp but ships .png (or vice versa), and is authored
+    case-insensitively. Exact, then extension swap, then case-insensitive fallback."""
     exact = os.path.join(folder, name)
     if os.path.exists(exact):
         return exact
@@ -959,6 +1004,13 @@ def find_image(folder, name):
         cand = os.path.join(folder, stem + ext)
         if os.path.exists(cand):
             return cand
+    hit = _resolve_ci(folder, name)
+    if hit:
+        return hit
+    for ext in IMAGE_EXTS:
+        hit = _resolve_ci(folder, stem + ext)
+        if hit:
+            return hit
     return None
 
 def process_cover(path, max_px=1000, max_bytes=500_000):
