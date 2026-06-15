@@ -209,6 +209,20 @@ class CollapsibleAlbumView(QScrollArea):
         self._vbox.addStretch(1)
 
 
+class _NumericTreeItem(QTreeWidgetItem):
+    """A QTreeWidgetItem that sorts numeric columns by VALUE, not by text. The default
+    item compares column display strings lexicographically, so "1000" sorts before
+    "200" — wrong for the BPM and Notes columns. When both cells parse as numbers we
+    compare numerically; otherwise we fall back to a case-insensitive text compare."""
+    def __lt__(self, other):
+        col = self.treeWidget().sortColumn() if self.treeWidget() else 0
+        a = self.text(col); b = other.text(col)
+        try:
+            return float(a.replace(",", "")) < float(b.replace(",", ""))
+        except (ValueError, AttributeError):
+            return a.casefold() < b.casefold()
+
+
 class MarqueeLabel(QLabel):
     """A single-line label that horizontally scrolls its text when it's too wide,
     used for the now-playing title in the transport bar."""
@@ -422,6 +436,10 @@ class RenderWorker(QThread):
         self.cover_cfg = cover_cfg      # None | "__BLACK__" | path to whole-queue art
         self.quality = quality          # None = current default encode settings
         self.priority = priority
+        self._abort = False             # set by abort() to stop after the current item
+
+    def abort(self):
+        self._abort = True
 
     def _resolve_cover(self, item):
         from bms_core import process_cover, _PIL_OK
@@ -457,12 +475,20 @@ class RenderWorker(QThread):
             jobs[(it["path"], os.path.join(self.out_dir, safe + ext))] = (row, it)
         total = len(jobs); done = 0
         self.log.emit(f"Rendering {total} song(s) with {self.workers} worker process(es)…")
-        with ProcessPoolExecutor(max_workers=self.workers) as ex:
+        # Use a 'spawn' context for the pool. On Linux the default 'fork' duplicates
+        # the whole Qt/X11 application state into each worker, which causes segfaults
+        # when workers or the app tear down — fresh 'spawn' interpreters avoid that.
+        import multiprocessing as _mp
+        ctx = _mp.get_context("spawn")
+        ex = ProcessPoolExecutor(max_workers=self.workers, mp_context=ctx)
+        try:
             futs = {ex.submit(render_one_job,
                               (p, o, self.fmt, it["tags"], self._resolve_cover(it), ff,
                                bms_core._LIBRARY_ROOT, self.quality)): (row, it)
                     for (p, o), (row, it) in jobs.items()}
             for fut in as_completed(futs):
+                if self._abort:
+                    break
                 row, it = futs[fut]; done += 1
                 try:
                     out_path, title, err = fut.result()
@@ -473,8 +499,43 @@ class RenderWorker(QThread):
                 else:
                     self.log.emit(f"  [{done}/{total}] done -> {out_path}")
                     self.item_done.emit(row)
-        self.log.emit("Queue render complete.")
+        finally:
+            if self._abort:
+                # Hard-stop: cancel not-yet-started futures AND terminate the worker
+                # PROCESSES that are mid-render — shutdown(wait=False) alone leaves
+                # in-flight renders running to completion in the background.
+                for f in futs:
+                    f.cancel()
+                self._kill_pool(ex)
+                self.log.emit("Render aborted.")
+            else:
+                ex.shutdown(wait=True)
+                self.log.emit("Queue render complete.")
         self.done.emit()
+
+    @staticmethod
+    def _kill_pool(ex):
+        """Terminate a ProcessPoolExecutor's worker processes immediately, so an
+        aborted render doesn't keep rendering in the background."""
+        procs = list(getattr(ex, "_processes", {}).values())
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        # don't wait on the children (we just killed them); tear down the executor's
+        # bookkeeping without blocking
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            ex.shutdown(wait=False)        # older Python without cancel_futures
+        for p in procs:
+            try:
+                p.join(timeout=2)
+                if p.is_alive():
+                    p.kill()               # SIGKILL anything still standing
+            except Exception:
+                pass
 
 
 # ----------------------------------------------------------------------------
@@ -511,6 +572,10 @@ class BGAWorker(QThread):
         self.items, self.out_dir, self.workers = items, out_dir, workers
         self.encode_opts = encode_opts        # None = original default behavior
         self.priority = priority
+        self._abort = False
+
+    def abort(self):
+        self._abort = True
 
     def run(self):
         try:
@@ -537,9 +602,14 @@ class BGAWorker(QThread):
         self.total_known.emit(total)
         self.log.emit(f"Rendering {total} BGA video(s) with {self.workers} worker(s)… "
                       f"({skipped} skipped — video/no BGA)")
-        with ProcessPoolExecutor(max_workers=self.workers) as ex:
+        import multiprocessing as _mp
+        ctx = _mp.get_context("spawn")
+        ex = ProcessPoolExecutor(max_workers=self.workers, mp_context=ctx)
+        try:
             futs = {ex.submit(render_bga_video_job, j): j for j in jobs}
             for fut in as_completed(futs):
+                if self._abort:
+                    break
                 done += 1
                 try:
                     out_path, title, err = fut.result()
@@ -548,7 +618,15 @@ class BGAWorker(QThread):
                     self.item_done.emit(done); continue
                 self.log.emit(f"  [{done}/{total}] {'FAILED: '+title if err else 'done -> '+out_path}")
                 self.item_done.emit(done)
-        self.log.emit("BGA render complete.")
+        finally:
+            if self._abort:
+                for f in futs:
+                    f.cancel()
+                RenderWorker._kill_pool(ex)
+                self.log.emit("BGA render aborted.")
+            else:
+                ex.shutdown(wait=True)
+                self.log.emit("BGA render complete.")
         self.done.emit()
 
 
@@ -879,9 +957,116 @@ class _CodecPerfGraphic(QWidget):
         p.end()
 
 
+class ArtViewerDialog(QDialog):
+    """A resizable window that shows a single artwork scaled to the window, with a
+    scaling-mode selector in the top-left whose choice auto-saves to config. Purely
+    cosmetic — for enjoying the art alongside the music."""
+
+    # (label, key, Qt transformation mode | None for 1:1). 1:1 shows the image at its
+    # true pixel size (scrollable if larger than the window).
+    MODES = [
+        ("Smooth (best)", "smooth"),
+        ("Fast (nearest)", "nearest"),
+        ("1:1 actual size", "actual"),
+    ]
+
+    def __init__(self, parent, image_path, title=""):
+        super().__init__(parent)
+        self.setWindowTitle(title or os.path.basename(image_path))
+        self.setMinimumSize(200, 200)
+        # restore the saved window size/position if we have one, else a sensible default
+        geo_b64 = load_config().get("art_viewer_geometry")
+        if geo_b64:
+            try:
+                from PyQt5.QtCore import QByteArray
+                self.restoreGeometry(QByteArray.fromBase64(geo_b64.encode("ascii")))
+            except Exception:
+                self.resize(720, 720)
+        else:
+            self.resize(720, 720)
+        self._path = image_path
+        self._src = QPixmap(image_path)
+
+        lay = QVBoxLayout(self); lay.setContentsMargins(8, 8, 8, 8); lay.setSpacing(6)
+
+        # top-left scaling controls
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Scaling:"))
+        self.mode = QComboBox()
+        for label, _key in self.MODES:
+            self.mode.addItem(label)
+        saved = load_config().get("art_viewer_scaling", "smooth")
+        idx = next((i for i, (_l, k) in enumerate(self.MODES) if k == saved), 0)
+        self.mode.setCurrentIndex(idx)
+        self.mode.currentIndexChanged.connect(self._on_mode_changed)
+        top.addWidget(self.mode)
+        top.addStretch(1)
+        lay.addLayout(top)
+
+        # image area. A scroll area hosts the label so 1:1 can exceed the window.
+        from PyQt5.QtWidgets import QScrollArea
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setAlignment(Qt.AlignCenter)
+        self._scroll.setStyleSheet("background:#111;")
+        self._img = QLabel(); self._img.setAlignment(Qt.AlignCenter)
+        self._img.setStyleSheet("background:#111;")
+        self._scroll.setWidget(self._img)
+        lay.addWidget(self._scroll, 1)
+
+        self._rescale()
+
+    def _mode_key(self):
+        return self.MODES[self.mode.currentIndex()][1]
+
+    def _on_mode_changed(self):
+        # auto-save the choice so it persists across art windows and sessions
+        try:
+            self.parent()._update_cfg(art_viewer_scaling=self._mode_key())
+        except Exception:
+            cfg = load_config(); cfg["art_viewer_scaling"] = self._mode_key(); save_config(cfg)
+        self._rescale()
+
+    def _rescale(self):
+        if self._src.isNull():
+            self._img.setText("(image could not be loaded)")
+            self._img.setStyleSheet("background:#111;color:#777;")
+            return
+        key = self._mode_key()
+        if key == "actual":
+            # 1:1 — show at true pixel size; the scroll area provides panning if large
+            self._scroll.setWidgetResizable(False)
+            self._img.setPixmap(self._src)
+            self._img.resize(self._src.size())
+            return
+        self._scroll.setWidgetResizable(True)
+        area = self._scroll.viewport().size()
+        mode = Qt.SmoothTransformation if key == "smooth" else Qt.FastTransformation
+        scaled = self._src.scaled(area, Qt.KeepAspectRatio, mode)
+        self._img.setPixmap(scaled)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        # re-fit on window resize (no-op for 1:1)
+        if self._mode_key() != "actual":
+            self._rescale()
+
+    def closeEvent(self, e):
+        # remember this window's size + position for next time
+        try:
+            geo = bytes(self.saveGeometry().toBase64()).decode("ascii")
+            cfg = load_config(); cfg["art_viewer_geometry"] = geo; save_config(cfg)
+        except Exception:
+            pass
+        super().closeEvent(e)
+
+
 class RenderProgressDialog(QDialog):
     """A small modal dialog with a green progress bar shown during a render job.
-    The owner calls step() as each item finishes and finish() when the job ends."""
+    The owner calls step() as each item finishes and finish() when the job ends.
+    An Abort button emits `aborted` so the owner can stop the worker."""
+    aborted = pyqtSignal()
+
     def __init__(self, parent, title, total):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -897,7 +1082,21 @@ class RenderProgressDialog(QDialog):
             " height:20px; }"
             "QProgressBar::chunk { background-color:#4caf50; }")   # green
         lay.addWidget(self.bar)
+        from PyQt5.QtWidgets import QPushButton
+        btnrow = QHBoxLayout(); btnrow.addStretch(1)
+        self.abort_btn = QPushButton("Abort render")
+        self.abort_btn.clicked.connect(self._on_abort)
+        btnrow.addWidget(self.abort_btn)
+        lay.addLayout(btnrow)
         self._closable = False
+        self._aborted = False
+
+    def _on_abort(self):
+        self._aborted = True
+        self.abort_btn.setEnabled(False)
+        self.abort_btn.setText("Aborting…")
+        self.label.setText("Aborting — finishing the current item…")
+        self.aborted.emit()
 
     def set_total(self, total):
         self._total = max(1, total); self._done = min(self._done, self._total)
@@ -916,10 +1115,13 @@ class RenderProgressDialog(QDialog):
         self.label.setText(f"Rendering {self._done} of {self._total}…")
 
     def finish(self):
-        self._done = self._total
-        self.bar.setValue(self._total)
-        self.label.setText(f"Done — {self._total} rendered.")
         self._closable = True
+        if self._aborted:
+            self.label.setText(f"Aborted — {self._done} of {self._total} rendered.")
+        else:
+            self._done = self._total
+            self.bar.setValue(self._total)
+            self.label.setText(f"Done — {self._total} rendered.")
         self.accept()
 
     def closeEvent(self, e):
@@ -1405,7 +1607,7 @@ class MainWindow(QMainWindow):
                 charts_sorted = sorted(charts, key=lambda s: _numkey(s.get("notes")))
                 rep = pick_playable_chart(charts_sorted)
                 vals = self._row_vals(rep)[:-1] + [str(len(charts_sorted))]
-                parent = QTreeWidgetItem(vals)
+                parent = _NumericTreeItem(vals)
                 parent.setData(0, Qt.UserRole, rep["path"])
                 parent.addChildren([self._child_item(c) for c in charts_sorted])
                 parents.append(parent)
@@ -1413,7 +1615,7 @@ class MainWindow(QMainWindow):
         else:
             items = []
             for s in rows:
-                item = QTreeWidgetItem(self._row_vals(s))
+                item = _NumericTreeItem(self._row_vals(s))
                 item.setData(0, Qt.UserRole, s["path"])
                 items.append(item)
             self.ltable.addTopLevelItems(items)
@@ -1421,7 +1623,7 @@ class MainWindow(QMainWindow):
         self.ltable.setSortingEnabled(True)
 
     def _child_item(self, c):
-        it = QTreeWidgetItem(self._row_vals(c))
+        it = _NumericTreeItem(self._row_vals(c))
         it.setData(0, Qt.UserRole, c["path"])
         return it
 
@@ -1794,8 +1996,25 @@ class MainWindow(QMainWindow):
             save_config(cfg)
         except Exception:
             pass
-        # stop any running workers so the process exits cleanly
-        for attr in ("_thumb_worker", "_play_worker", "_scan", "_worker", "_bga_worker"):
+        # stop the player first so its feeder thread isn't running during teardown
+        try:
+            if getattr(self, "player", None) is not None:
+                self.player.stop()
+        except Exception:
+            pass
+        # abort + wait for render/BGA workers so their process pools shut down cleanly
+        # before the app exits (a half-torn-down pool can segfault on exit, especially
+        # on Linux). Pl/queue/bga workers support abort(); give them time to unwind.
+        for attr in ("_worker", "_pl_worker", "_bga_worker"):
+            wkr = getattr(self, attr, None)
+            if wkr is not None and wkr.isRunning():
+                try:
+                    if hasattr(wkr, "abort"): wkr.abort()
+                    wkr.wait(5000)
+                except Exception:
+                    pass
+        # stop any running lightweight workers
+        for attr in ("_thumb_worker", "_play_worker", "_scan", "_bga_probe"):
             wkr = getattr(self, attr, None)
             if wkr is not None:
                 try:
@@ -2447,6 +2666,27 @@ class MainWindow(QMainWindow):
         # save this pick onto the current queue item / playlist entry
         self._save_song_art_pick(path)
 
+    def _open_art_viewer(self):
+        # open the currently-shown song-folder art in a resizable viewer window
+        files = getattr(self, "_song_art_files", [])
+        idx = getattr(self, "_song_art_idx", 0)
+        if not files or not (0 <= idx < len(files)):
+            return
+        path = files[idx]
+        if not os.path.isfile(path):
+            return
+        dlg = ArtViewerDialog(self, path, title=os.path.basename(path))
+        # keep a reference so the modeless dialog isn't garbage-collected; drop it
+        # when the dialog finishes. We do NOT use WA_DeleteOnClose — deleting the C++
+        # object while a Python reference lingers makes any later access (e.g. pruning
+        # the list) raise "wrapped C/C++ object has been deleted".
+        if not hasattr(self, "_art_viewers"):
+            self._art_viewers = []
+        self._art_viewers.append(dlg)
+        dlg.finished.connect(lambda _r, d=dlg: self._art_viewers.remove(d)
+                             if d in self._art_viewers else None)
+        dlg.show()       # modeless so music keeps playing and the app stays usable
+
     def _song_art_step(self, delta):
         if not self._song_art_files:
             return
@@ -2662,7 +2902,7 @@ class MainWindow(QMainWindow):
             s = self._pl_resolve(entry)
             if s:
                 vals = self._row_vals(s)[:1] + self._row_vals(s)[1:]
-                item = QTreeWidgetItem([s.get("title",""), s.get("artist",""),
+                item = _NumericTreeItem([s.get("title",""), s.get("artist",""),
                                         s.get("mode",""), str(s.get("notes",""))])
                 item.setData(0, Qt.UserRole, s["path"])
                 owned += 1
@@ -2812,6 +3052,7 @@ class MainWindow(QMainWindow):
         self._pl_worker.log.connect(self.log)
         self._pl_worker.item_done.connect(lambda _row: prog.step())
         self._pl_worker.done.connect(prog.finish)
+        prog.aborted.connect(self._pl_worker.abort)
         self._pl_worker.done.connect(lambda: self.pl_render_btn.setEnabled(True))
         self._pl_worker.start()
         prog.exec_()
@@ -2997,7 +3238,7 @@ class MainWindow(QMainWindow):
                 s = idx.get(e.get("md5"))           # only owned charts have a match
                 if not s:
                     continue
-                child = QTreeWidgetItem(self._row_vals(s))
+                child = _NumericTreeItem(self._row_vals(s))
                 child.setData(0, Qt.UserRole, s["path"])
                 parent.addChild(child); owned_total += 1
                 self._tbl_play_order.append(s)
@@ -3161,6 +3402,9 @@ class MainWindow(QMainWindow):
         self.song_art_preview = QLabel("(no images)"); self.song_art_preview.setAlignment(Qt.AlignCenter)
         self.song_art_preview.setFixedSize(290, 200)
         self.song_art_preview.setStyleSheet("background:#111;color:#777;")
+        self.song_art_preview.setCursor(Qt.PointingHandCursor)
+        self.song_art_preview.setToolTip("Click to view full size")
+        self.song_art_preview.mousePressEvent = lambda e: self._open_art_viewer()
         pv.addWidget(self.song_art_preview, 0, Qt.AlignHCenter)
         nav = QHBoxLayout()
         self.song_art_prev = QPushButton("◀"); self.song_art_prev.setObjectName("iconBtn")
@@ -3330,6 +3574,7 @@ class MainWindow(QMainWindow):
         self._worker.item_done.connect(self._on_item_done)
         self._worker.done.connect(prog.finish)
         self._worker.done.connect(lambda: self.q_render_btn.setEnabled(True))
+        prog.aborted.connect(self._worker.abort)
         self._worker.start()
         prog.exec_()
 
@@ -3429,6 +3674,7 @@ class MainWindow(QMainWindow):
         self._bga_worker.total_known.connect(prog.set_total)
         self._bga_worker.item_done.connect(prog.set_value)
         self._bga_worker.done.connect(prog.finish)
+        prog.aborted.connect(self._bga_worker.abort)
         self._bga_worker.done.connect(lambda: self.q_bga_btn.setEnabled(True))
         self._bga_worker.start()
         prog.exec_()
@@ -3466,11 +3712,20 @@ def main():
         ic = _app_icon()
         if ic is not None:
             app.setWindowIcon(ic)
-        # pad text buttons left/right; the playhead icon buttons (objectName
-        # "iconBtn") keep their tight fixed width
+        # Consistent button shape across the app. Every standard button (text-only
+        # OR text+icon) shares the same padding, min-height and icon spacing, so an
+        # icon button lines up with a plain one. The tight transport/art icon buttons
+        # (objectName "iconBtn") opt out and keep their fixed square shape.
         app.setStyleSheet(
-            "QPushButton { padding: 4px 10px; }"
-            "QPushButton#iconBtn { padding: 4px 0px; }"
+            "QPushButton {"
+            "  padding: 4px 12px;"
+            "  min-height: 18px;"
+            "  icon-size: 16px;"
+            "}"
+            "QPushButton#iconBtn {"
+            "  padding: 4px 0px;"
+            "  min-height: 18px;"
+            "}"
             "QLabel#mutedLabel { color: #999; }")    # readable on light AND dark
         w = MainWindow(); w.show()
         sys.exit(app.exec_())
