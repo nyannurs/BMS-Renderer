@@ -213,9 +213,23 @@ class _NumericTreeItem(QTreeWidgetItem):
     """A QTreeWidgetItem that sorts numeric columns by VALUE, not by text. The default
     item compares column display strings lexicographically, so "1000" sorts before
     "200" — wrong for the BPM and Notes columns. When both cells parse as numbers we
-    compare numerically; otherwise we fall back to a case-insensitive text compare."""
+    compare numerically; otherwise we fall back to a case-insensitive text compare.
+
+    A column may also carry an explicit numeric SORT KEY in Qt.UserRole+2 (used by the
+    playlist "Added" column, whose cell shows a human date like 2026-06-16 but must
+    sort chronologically by the underlying timestamp). When both items provide that
+    key for the active column, it wins over the text-based comparison."""
+    SORTKEY_ROLE = Qt.UserRole + 2
+
     def __lt__(self, other):
         col = self.treeWidget().sortColumn() if self.treeWidget() else 0
+        ka = self.data(col, self.SORTKEY_ROLE)
+        kb = other.data(col, self.SORTKEY_ROLE)
+        if ka is not None and kb is not None:
+            try:
+                return float(ka) < float(kb)
+            except (ValueError, TypeError):
+                pass
         a = self.text(col); b = other.text(col)
         try:
             return float(a.replace(",", "")) < float(b.replace(",", ""))
@@ -1306,7 +1320,28 @@ class MainWindow(QMainWindow):
         self.dark_toggle = QCheckBox("Dark mode")
         self.dark_toggle.setChecked(bool(load_config().get("dark_mode", False)))
         self.dark_toggle.toggled.connect(self._on_dark_toggled)
-        self.tabs.setCornerWidget(self.dark_toggle, Qt.TopRightCorner)
+        # ---- EXPERIMENTAL: entry font-size slider (remove this whole block + the
+        # _apply_entry_font_scale method + its two call sites to revert) -------------
+        corner = QWidget()
+        _ch = QHBoxLayout(corner); _ch.setContentsMargins(0, 0, 0, 0); _ch.setSpacing(8)
+        # Discrete font-size slider: a handful of notches rather than a continuous drag.
+        self.FONT_STEPS = [10, 13, 16, 19, 22, 25, 28]   # px per notch
+        self.font_slider = QSlider(Qt.Horizontal)
+        self.font_slider.setFixedWidth(160)
+        self.font_slider.setRange(0, len(self.FONT_STEPS) - 1)
+        self.font_slider.setSingleStep(1); self.font_slider.setPageStep(1)
+        self.font_slider.setTickPosition(QSlider.TicksBelow)
+        self.font_slider.setTickInterval(1)
+        saved = int(load_config().get("entry_font_px", 0)) or 10
+        nearest = min(range(len(self.FONT_STEPS)),
+                      key=lambda i: abs(self.FONT_STEPS[i] - saved))
+        self.font_slider.setValue(nearest)
+        self.font_slider.setToolTip("Song entry text size")
+        self.font_slider.valueChanged.connect(self._on_entry_font_changed)
+        _ch.addWidget(self.font_slider)
+        _ch.addWidget(self.dark_toggle)
+        self.tabs.setCornerWidget(corner, Qt.TopRightCorner)
+        # ---- END EXPERIMENTAL ----------------------------------------------------
         self._build_tabs()
         mid.addWidget(self.tabs, 1)
         mid.addWidget(self._build_right_panel())
@@ -1320,6 +1355,7 @@ class MainWindow(QMainWindow):
 
         self.log(f"BMS Renderer v{APP_VERSION} (Qt) ready.")
         self._warn_missing_deps()
+        self._apply_entry_font_scale()   # EXPERIMENTAL: apply saved entry font size
         # reopen the last library automatically, like the Tk app
         saved = load_config().get("library")
         if saved and os.path.isdir(saved):
@@ -1408,6 +1444,54 @@ class MainWindow(QMainWindow):
     def _on_dark_toggled(self, on):
         self._update_cfg(dark_mode=bool(on))
         self._apply_theme(on)
+
+    # ---- EXPERIMENTAL: entry font-size slider (remove this method + the corner-widget
+    # block in _build + the _apply_entry_font_scale() call in _build to revert) --------
+    def _on_entry_font_changed(self, idx):
+        px = self.FONT_STEPS[int(idx)]
+        self._update_cfg(entry_font_px=int(px))
+        self._apply_entry_font_scale(int(px))
+
+    def _apply_entry_font_scale(self, px=None):
+        """Scale ONLY the song-entry rows in the list/tree views — not headers,
+        buttons, labels, or any other chrome. We set a real QFont on each view (which
+        scales both the row text AND the row height, unlike a stylesheet font-size),
+        then restore the default app font on the tree HEADERS so column titles stay
+        put. Theme-independent: changing the font never touches colours, so it
+        survives light<->dark switches untouched."""
+        from PyQt5.QtGui import QFont, QFontInfo
+        if px is None:
+            px = self.FONT_STEPS[self.font_slider.value()] if hasattr(self, "font_slider") else 0
+        if not px:
+            return
+        f = QFont(QApplication.font())
+        f.setPixelSize(int(px))
+        # Leading scales with the font: ~2px at a 10px default, growing proportionally.
+        pad = max(1, round(px / 5))
+        item_css = (f"QTreeView::item, QListView::item "
+                    f"{{ padding-top: {pad}px; padding-bottom: {pad}px; }}")
+        # Lock each header to an EXPLICIT fixed pixel size captured once. A header with a
+        # non-explicit font re-inherits from its view, so after we scale the view font
+        # the header would follow unless we pin it with a concrete size of its own.
+        if not hasattr(self, "_orig_header_fonts"):
+            self._orig_header_fonts = {}
+            for name in ("ltable", "pltree", "ttree", "qtable"):
+                w = getattr(self, name, None)
+                if w is not None:
+                    hf = QFont(w.header().font())
+                    hf.setPixelSize(QFontInfo(w.header().font()).pixelSize())  # pin it
+                    self._orig_header_fonts[name] = hf
+        for name in ("ltable", "pltree", "ttree", "qtable"):
+            w = getattr(self, name, None)
+            if w is not None:
+                w.setFont(f)
+                w.setStyleSheet(item_css)
+                w.header().setFont(self._orig_header_fonts[name])  # rows scale; titles don't
+        # icon-grid views (Discovery + album grids) are all MarqueeList instances
+        for gr in self.findChildren(MarqueeList):
+            gr.setFont(f)
+            gr.setStyleSheet(item_css)
+    # ---- END EXPERIMENTAL ------------------------------------------------------------
 
     def _apply_theme(self, dark):
         """Swap the application palette between the dark theme and the captured light
@@ -1740,12 +1824,29 @@ class MainWindow(QMainWindow):
                 self._start_song(q["path"], q["tags"].get("Title", ""), "queue", nxt)
                 return True
         elif kind == "playlist":
-            entries = self._playlists.get(self.pl_pick.currentText(), [])
-            playable = lambda i: self._pl_resolve(entries[i]) is not None
-            nxt = self._step_index(index, len(entries), direction, playable)
+            # Advance by VISUAL row order, not entries-list order. The playlist tree is
+            # sortable, so the row displayed below the current one is what the user
+            # expects to play next — stepping through the unsorted entries list instead
+            # picked a seemingly random song once any column was sorted. `index` here is
+            # the visual row of the currently-playing song; a row is playable when it
+            # resolves to an owned song (greyed "not owned" rows are skipped).
+            tree = self.pltree
+            count = tree.topLevelItemCount()
+            row_song = lambda r: self._path_index.get(
+                tree.topLevelItem(r).data(0, Qt.UserRole)) if tree.topLevelItem(r) else None
+            playable = lambda r: row_song(r) is not None
+            # Re-locate the current row by the now-playing path: if the user re-sorted
+            # the list mid-playback, the stored `index` is stale but the path isn't.
+            cur = index
+            now = getattr(self, "_now_path", None)
+            located = next((r for r in range(count)
+                            if tree.topLevelItem(r).data(0, Qt.UserRole) == now), None)
+            if located is not None:
+                cur = located
+            nxt = self._step_index(cur, count, direction, playable)
             if nxt is not None:
-                s = self._pl_resolve(entries[nxt])
-                self.pltree.setCurrentItem(self.pltree.topLevelItem(nxt))
+                s = row_song(nxt)
+                tree.setCurrentItem(tree.topLevelItem(nxt))
                 self._start_song(s["path"], s.get("title", ""), "playlist", nxt)
                 return True
         elif kind == "table":
@@ -2473,7 +2574,8 @@ class MainWindow(QMainWindow):
             md5 = s.get("md5", "")
             if not md5 or md5 in have:
                 continue
-            entry = {"md5": md5, "title": s.get("title", ""), "artist": s.get("artist", "")}
+            entry = {"md5": md5, "title": s.get("title", ""), "artist": s.get("artist", ""),
+                     "added": time.time()}
             # carry edited tags but NOT Album / Album Artist (those are per-destination)
             if isinstance(s.get("tags"), dict):
                 t = {k: v for k, v in s["tags"].items()
@@ -2830,7 +2932,8 @@ class MainWindow(QMainWindow):
         self._enqueue_songs(self._selected_lib_songs())
 
     # ---- Custom Playlists tab ----
-    PCOLS = ["Title", "Artist", "Mode", "Notes"]
+    # "Added" is playlist-only — it sorts by when each song was added to THIS playlist.
+    PCOLS = ["Title", "Artist", "Mode", "Notes", "Added"]
 
     def _build_playlists_tab(self):
         w = QWidget(); lay = QVBoxLayout(w)
@@ -2882,7 +2985,11 @@ class MainWindow(QMainWindow):
         self.pl_fmt.hide()
         self.pl_render_btn = QPushButton("Render Playlist")
         self.pl_render_btn.clicked.connect(self._pl_render)
-        bbar.addWidget(self.pl_render_btn)
+        self.pl_bga_btn = QPushButton("Render All BGA in Playlist")
+        self.pl_bga_btn.clicked.connect(self._pl_render_bga)
+        self.pl_bga_btn.setEnabled(bool(ffmpeg_path()))   # BGA video needs ffmpeg
+        bbar.addWidget(self.pl_bga_btn)                    # left of the audio render button
+        bbar.addWidget(self.pl_render_btn)                # rightmost
         lay.addLayout(bbar)
 
         self._playlists = {}
@@ -2911,23 +3018,41 @@ class MainWindow(QMainWindow):
         entries = self._playlists.get(name, [])
         owned = 0
         for ei, entry in enumerate(entries):
+            # "Added" cell: show a human date, sort by the raw timestamp. Entries saved
+            # before this column existed have no "added" field — fall back to their
+            # position in the list (insertion order == the order they were added), so
+            # old playlists still sort oldest→newest sensibly.
+            ts = entry.get("added") if isinstance(entry, dict) else None
+            sort_ts = ts if ts is not None else ei
+            added_txt = self._fmt_added(ts)
             s = self._pl_resolve(entry)
             if s:
-                vals = self._row_vals(s)[:1] + self._row_vals(s)[1:]
                 item = _NumericTreeItem([s.get("title",""), s.get("artist",""),
-                                        s.get("mode",""), str(s.get("notes",""))])
+                                        s.get("mode",""), str(s.get("notes","")), added_txt])
                 item.setData(0, Qt.UserRole, s["path"])
+                item.setData(4, _NumericTreeItem.SORTKEY_ROLE, float(sort_ts))
                 owned += 1
             else:
                 # entry not owned on this machine — show greyed with saved title
                 item = QTreeWidgetItem([entry.get("title","?"), entry.get("artist",""),
-                                        "—", "(not owned)"])
+                                        "—", "(not owned)", added_txt])
                 item.setForeground(0, Qt.gray)
             # remember which playlist entry this row IS, so selection stays correct
             # after the user sorts a column (tree row order != entries order).
             item.setData(0, Qt.UserRole + 1, ei)
             self.pltree.addTopLevelItem(item)
         self.pl_count.setText(f"{len(entries)} songs ({owned} owned)")
+
+    @staticmethod
+    def _fmt_added(ts):
+        """Render an added-timestamp as a short local date, or '—' when unknown."""
+        if ts is None:
+            return "—"
+        try:
+            import datetime
+            return datetime.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d")
+        except (ValueError, TypeError, OSError):
+            return "—"
 
     def _pl_new(self):
         from PyQt5.QtWidgets import QInputDialog
@@ -3013,10 +3138,13 @@ class MainWindow(QMainWindow):
     def _on_pl_double(self, item, _col):
         if self._rmb_down():
             return
-        i = item.data(0, Qt.UserRole + 1)           # entry index (sort-safe)
+        # Start playback from this row's VISUAL position so auto-advance walks the
+        # list top-to-bottom as displayed. (Selection/tags still use the entry index
+        # via _on_pl_select; only the play cursor is row-based.)
+        row = self.pltree.indexOfTopLevelItem(item)
         s = getattr(self, "_path_index", {}).get(item.data(0, Qt.UserRole))
         if s:
-            self._start_song(s["path"], s.get("title", "?"), "playlist", i)
+            self._start_song(s["path"], s.get("title", "?"), "playlist", row)
 
     def _pl_remove(self):
         name = self.pl_pick.currentText()
@@ -3040,20 +3168,7 @@ class MainWindow(QMainWindow):
         if not out_dir or not os.path.isdir(out_dir):
             QMessageBox.information(self, "No output folder", "Choose an output folder first."); return
         entries = self._playlists[name]
-        items = []
-        for e in entries:
-            s = self._pl_resolve(e)
-            if not s:
-                continue
-            # start from the song's own info, then apply the entry's EDITED tags
-            tags = {"Title": s.get("title", ""), "Artist": s.get("artist", ""),
-                    "Album": "", "AlbumArtist": "",
-                    "Genre": s.get("genre", ""), "BPM": str(s.get("bpm", ""))}
-            if isinstance(e, dict) and isinstance(e.get("tags"), dict):
-                for k, v in e["tags"].items():
-                    tags[k] = v               # edited Title/Artist/Album/etc. win
-            items.append({"path": s["path"], "tags": tags,
-                          "art": e.get("art") if isinstance(e, dict) else None})
+        items = self._pl_collect_items()
         if not items:
             self.log("No owned songs in this playlist to render."); return
         dlg = AudioExportDialog(self, self.pl_fmt.currentText(),
@@ -3074,6 +3189,54 @@ class MainWindow(QMainWindow):
         prog.aborted.connect(self._pl_worker.abort)
         self._pl_worker.done.connect(lambda: self.pl_render_btn.setEnabled(True))
         self._pl_worker.start()
+        prog.exec_()
+
+    def _pl_collect_items(self):
+        """Owned songs of the current playlist as render items (path + merged tags),
+        in the playlist's saved order. Shared by audio and BGA render."""
+        name = self.pl_pick.currentText()
+        items = []
+        for e in self._playlists.get(name, []):
+            s = self._pl_resolve(e)
+            if not s:
+                continue
+            tags = {"Title": s.get("title", ""), "Artist": s.get("artist", ""),
+                    "Album": "", "AlbumArtist": "",
+                    "Genre": s.get("genre", ""), "BPM": str(s.get("bpm", ""))}
+            if isinstance(e, dict) and isinstance(e.get("tags"), dict):
+                for k, v in e["tags"].items():
+                    tags[k] = v
+            items.append({"path": s["path"], "tags": tags,
+                          "art": e.get("art") if isinstance(e, dict) else None})
+        return items
+
+    def _pl_render_bga(self):
+        name = self.pl_pick.currentText()
+        if not name or not self._playlists.get(name):
+            QMessageBox.information(self, "Empty", "This playlist has no songs."); return
+        out_dir = self.out_edit.text() or load_config().get("output")
+        if not out_dir or not os.path.isdir(out_dir):
+            QMessageBox.information(self, "No output folder", "Choose an output folder first."); return
+        if not ffmpeg_path():
+            QMessageBox.information(self, "ffmpeg required", "BGA video export needs ffmpeg on PATH."); return
+        items = self._pl_collect_items()
+        if not items:
+            self.log("No owned songs in this playlist to render."); return
+        dlg = BGAExportDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        opts, priority = dlg.options()
+        self.pl_bga_btn.setEnabled(False)
+        self._pl_bga_worker = BGAWorker(items, out_dir, self.pl_threads.value(),
+                                        encode_opts=opts, priority=priority)
+        prog = RenderProgressDialog(self, "Rendering BGA Videos", len(items))
+        self._pl_bga_worker.log.connect(self.log)
+        self._pl_bga_worker.total_known.connect(prog.set_total)
+        self._pl_bga_worker.item_done.connect(prog.set_value)
+        self._pl_bga_worker.done.connect(prog.finish)
+        prog.aborted.connect(self._pl_bga_worker.abort)
+        self._pl_bga_worker.done.connect(lambda: self.pl_bga_btn.setEnabled(True))
+        self._pl_bga_worker.start()
         prog.exec_()
 
     def _pl_context_menu(self, pos):

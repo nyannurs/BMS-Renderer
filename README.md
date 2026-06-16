@@ -82,4 +82,4 @@ Windows and macOS users can skip this — `pip install sounddevice` includes Por
 
 ## Documentation ##
 
-Just like everything in this project, the included "docs" folder is generated entirely by Claude.
+Just like everything in this project, the included "docs" folder is generated entirely by Claude. Also it could be missing small details.

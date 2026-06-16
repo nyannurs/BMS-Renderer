@@ -34,7 +34,7 @@ import time
 # ---------------------------------------------------------------------------
 # CONFIG — edit these three values.
 # ---------------------------------------------------------------------------
-CLIENT_ID = "PUT_YOUR_APPLICATION_ID_HERE"   # <-- paste your Discord Application ID
+CLIENT_ID = "1515472010329850027"   # <-- paste your Discord Application ID
 LARGE_IMAGE_KEY = "bms_logo"                  # Art Asset key, or "" for no image
 LARGE_IMAGE_TEXT = "BMS Renderer"             # tooltip when hovering the large image
 # ---------------------------------------------------------------------------
