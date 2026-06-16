@@ -897,6 +897,12 @@ class BGAExportDialog(QDialog):
         elif key == "default":
             _set(64, 320, 8, 192, False, " kbps")
             self.a_slider_lbl.setText("Bitrate (default baseline):")
+        elif key == "ogg":
+            # OGG Vorbis encodes well beyond the MP3/AAC ceiling — roughly 45 to
+            # ~500 kbps — so give it its own wider range rather than capping at 320.
+            cur = self.a_slider.value()
+            _set(45, 500, 5, cur if 45 <= cur <= 500 else 192, True, " kbps")
+            self.a_slider_lbl.setText("Bitrate:")
         else:
             cur = self.a_slider.value()
             _set(64, 320, 8, cur if cur >= 64 else 192, True, " kbps")
@@ -1197,8 +1203,8 @@ class AudioExportDialog(QDialog):
         elif fmt == "OGG":
             self.q_lbl.setText("Quality (VBR):")
             s.setEnabled(True); s.setRange(0, 10); s.setValue(6)
-            self.hint.setText("OGG Vorbis VBR quality (left = smallest file … "
-                              "right = best). Default 6 ≈ 192 kbps.")
+            self.hint.setText("OGG Vorbis VBR quality 0–10 (left = smallest file … "
+                              "right = best). Default 6 ≈ 192 kbps; 10 ≈ 500 kbps.")
         elif fmt == "MP3":
             self.q_lbl.setText("Quality:")
             # left → right = smallest file → best quality, matching OGG. The slider
@@ -1515,6 +1521,7 @@ class MainWindow(QMainWindow):
         self.ltable.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.ltable.setRootIsDecorated(True)            # show expand arrows in songs-only
         self.ltable.setSortingEnabled(True)
+        self._wire_sort_persistence(self.ltable, "lib_sort")
         hdr = self.ltable.header()
         # match the Tk app: fixed-ish, user-draggable column widths; resizing a
         # column pushes the layout rightward (the last column absorbs slack) rather
@@ -1580,6 +1587,22 @@ class MainWindow(QMainWindow):
             rows.append(s)
         self._filtered = rows
         self._fill_lib_tree(rows)              # no cap — Qt batch-insert handles the full set
+
+    def _wire_sort_persistence(self, tree, cfg_key):
+        """Persist a tree's sort column+order across boots. Restores the saved sort
+        now, then saves whenever the user clicks a header to re-sort."""
+        saved = load_config().get(cfg_key)
+        if isinstance(saved, (list, tuple)) and len(saved) == 2:
+            col, order = saved
+            try:
+                tree.sortByColumn(int(col), Qt.SortOrder(int(order)))
+            except Exception:
+                pass
+        # remember the key on the header so the slot knows where to save
+        hdr = tree.header()
+        hdr.setSortIndicatorShown(True)
+        hdr.sortIndicatorChanged.connect(
+            lambda col, order, k=cfg_key: self._update_cfg(**{k: [int(col), int(order)]}))
 
     def _save_lib_col_widths(self, *args):
         widths = [self.ltable.columnWidth(i) for i in range(len(self.LCOLS))]
@@ -1764,19 +1787,16 @@ class MainWindow(QMainWindow):
         self._marked_items = []
 
         if now_path is None:
-            self._refresh_queue_titles()
             return
 
-        # 2) Queue: note prefix + colour on the matching row(s)
+        # 2) Queue: blue bold on the matching row(s) — no text prefix, so it's
+        #    consistent with how other tabs mark the now-playing row.
         if hasattr(self, "qtable"):
             for i in range(self.qtable.topLevelItemCount()):
                 if i >= len(self.queue):
                     break
                 item = self.qtable.topLevelItem(i)
-                base = self.queue[i]["tags"].get("Title", "")
-                playing = self.queue[i]["path"] == now_path
-                item.setText(0, ("\u266a  " + base) if playing else base)
-                if playing:
+                if self.queue[i]["path"] == now_path:
                     f = item.font(0); f.setBold(True); item.setFont(0, f)
                     for c in range(self.qtable.columnCount()):
                         item.setForeground(c, blue)
@@ -1794,16 +1814,6 @@ class MainWindow(QMainWindow):
                     for c in range(tree.columnCount()):
                         item.setForeground(c, blue)
                     self._marked_items.append((item, tree.columnCount()))
-
-    def _refresh_queue_titles(self):
-        """Reset queue row titles to their plain (un-prefixed) form."""
-        if not hasattr(self, "qtable"):
-            return
-        for i in range(self.qtable.topLevelItemCount()):
-            if i < len(self.queue):
-                item = self.qtable.topLevelItem(i)
-                if item:
-                    item.setText(0, self.queue[i]["tags"].get("Title", ""))
 
     def _on_play_ready(self, audio, path, gen=None):
         # ignore renders that a newer play request has superseded (rapid double-clicks)
@@ -2848,6 +2858,8 @@ class MainWindow(QMainWindow):
         self.pltree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.pltree.setExpandsOnDoubleClick(False)
         self.pltree.header().setStretchLastSection(True)
+        self.pltree.setSortingEnabled(True)
+        self._wire_sort_persistence(self.pltree, "playlist_sort")
         self.pltree.setColumnWidth(0, 300); self.pltree.setColumnWidth(1, 190)
         self.pltree.itemSelectionChanged.connect(self._on_pl_select)
         self.pltree.itemDoubleClicked.connect(self._on_pl_double)
@@ -2898,7 +2910,7 @@ class MainWindow(QMainWindow):
         self.pltree.clear()
         entries = self._playlists.get(name, [])
         owned = 0
-        for entry in entries:
+        for ei, entry in enumerate(entries):
             s = self._pl_resolve(entry)
             if s:
                 vals = self._row_vals(s)[:1] + self._row_vals(s)[1:]
@@ -2911,6 +2923,9 @@ class MainWindow(QMainWindow):
                 item = QTreeWidgetItem([entry.get("title","?"), entry.get("artist",""),
                                         "—", "(not owned)"])
                 item.setForeground(0, Qt.gray)
+            # remember which playlist entry this row IS, so selection stays correct
+            # after the user sorts a column (tree row order != entries order).
+            item.setData(0, Qt.UserRole + 1, ei)
             self.pltree.addTopLevelItem(item)
         self.pl_count.setText(f"{len(entries)} songs ({owned} owned)")
 
@@ -2960,12 +2975,12 @@ class MainWindow(QMainWindow):
         entries = self._playlists.get(name, [])
         out = []
         for it in self.pltree.selectedItems():
-            i = self.pltree.indexOfTopLevelItem(it)
+            i = it.data(0, Qt.UserRole + 1)         # entry index (sort-safe)
             base = getattr(self, "_path_index", {}).get(it.data(0, Qt.UserRole))
             if not base:
                 continue
             s = dict(base)
-            if 0 <= i < len(entries) and isinstance(entries[i], dict) \
+            if i is not None and 0 <= i < len(entries) and isinstance(entries[i], dict) \
                     and isinstance(entries[i].get("tags"), dict):
                 s["tags"] = entries[i]["tags"]      # carry edited tags (incl. Album)
             out.append(s)
@@ -2975,10 +2990,13 @@ class MainWindow(QMainWindow):
         items = self.pltree.selectedItems()
         if not items:
             return
-        i = self.pltree.indexOfTopLevelItem(items[0])
+        # Map the selected row back to its playlist entry by the index we stored on the
+        # item, NOT its position in the tree — the tree is sortable, so row order no
+        # longer matches the entries list after the user clicks a column header.
+        i = items[0].data(0, Qt.UserRole + 1)
         name = self.pl_pick.currentText()
         entries = self._playlists.get(name, [])
-        if not (0 <= i < len(entries)):
+        if i is None or not (0 <= i < len(entries)):
             return
         entry = entries[i]
         s = self._pl_resolve(entry)
@@ -2995,7 +3013,7 @@ class MainWindow(QMainWindow):
     def _on_pl_double(self, item, _col):
         if self._rmb_down():
             return
-        i = self.pltree.indexOfTopLevelItem(item)
+        i = item.data(0, Qt.UserRole + 1)           # entry index (sort-safe)
         s = getattr(self, "_path_index", {}).get(item.data(0, Qt.UserRole))
         if s:
             self._start_song(s["path"], s.get("title", "?"), "playlist", i)
@@ -3004,8 +3022,9 @@ class MainWindow(QMainWindow):
         name = self.pl_pick.currentText()
         if not name:
             return
-        rows = sorted({self.pltree.indexOfTopLevelItem(it)
-                       for it in self.pltree.selectedItems()}, reverse=True)
+        rows = sorted({it.data(0, Qt.UserRole + 1)
+                       for it in self.pltree.selectedItems()
+                       if it.data(0, Qt.UserRole + 1) is not None}, reverse=True)
         entries = self._playlists.get(name, [])
         for r in rows:
             if 0 <= r < len(entries):
@@ -3132,6 +3151,8 @@ class MainWindow(QMainWindow):
         self.ttree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.ttree.setExpandsOnDoubleClick(False)
         self.ttree.header().setStretchLastSection(True)
+        self.ttree.setSortingEnabled(True)
+        self._wire_sort_persistence(self.ttree, "table_sort")
         self.ttree.setColumnWidth(0, 300); self.ttree.setColumnWidth(1, 190)
         self.ttree.itemSelectionChanged.connect(self._on_table_select)
         self.ttree.itemDoubleClicked.connect(self._on_table_double)
@@ -3698,6 +3719,12 @@ def main():
             except Exception:
                 pass
     try:
+        # Remove the useless '?' context-help button from dialog title bars (Windows).
+        # Must be set before the QApplication is constructed to take effect.
+        try:
+            QApplication.setAttribute(Qt.AA_DisableWindowContextHelpButton, True)
+        except Exception:
+            pass
         app = QApplication(sys.argv)
         # Use the Fusion style app-wide so light<->dark theming only needs a palette
         # swap (switching styles at runtime is fragile and left widgets half-themed).

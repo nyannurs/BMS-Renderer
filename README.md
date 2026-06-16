@@ -2,7 +2,7 @@
 
 ![Screenshot](https://i.imgur.com/dvwTJp9.png)
 
-This program is vibe coded, JSYK.
+This program is built by exclusively iterating with Claude. It's fully vibe coded.
 
 BMS Renderer turns a BMS library into a tagged music collection. It scans your
 charts, lets you browse and play them like a music player, and renders them to
@@ -79,3 +79,7 @@ Audio playback needs the `PortAudio` system library, which pip can't install on 
 - **Fedora**: `sudo dnf install portaudio`
 
 Windows and macOS users can skip this — `pip install sounddevice` includes PortAudio there.
+
+## Documentation ##
+
+Just like everything in this project, the included "docs" folder is generated entirely by Claude.

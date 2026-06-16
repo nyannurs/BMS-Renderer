@@ -1658,44 +1658,121 @@ def render_bga_video_job(job):
             H = target; W = max(2, round(target * iw / ih))
         W -= W % 2; H -= H % 2                  # H.264 needs even width/height
         black = Image.new("RGB", (W, H), (0, 0, 0))
+
+        def _resample(up):
+            # bicubic when scaling UP (smooth); box/area when scaling DOWN (clean
+            # averaging, no aliasing). We key the overlay's transparency from the
+            # source pixels, so bicubic edge ringing can't create a black halo.
+            return Image.BICUBIC if up else Image.BOX
+
         cache = {}                      # img_path -> scaled RGB Image (base use)
         def _scaled(img_path):
-            """Load an image scaled to fit the frame, centered on black. Cached."""
+            """Load an image scaled to fit the frame, centered on black. Cached.
+            Used for the BASE layer. If the image has an alpha channel it is composited
+            ONTO BLACK using that alpha — a transparent base image (e.g. white title
+            text on a transparent background) must show as its content over black, not
+            have its hidden RGB flattened to fill the whole frame (which turned such
+            frames solid white)."""
             if img_path in cache:
                 return cache[img_path]
             canvas = black.copy()
             if img_path is not None:
                 try:
-                    im = Image.open(img_path).convert("RGB")
+                    src = Image.open(img_path)
+                    has_alpha = (src.mode in ("RGBA", "LA", "PA")) or (
+                        "transparency" in getattr(src, "info", {}))
+                    im = src.convert("RGBA") if has_alpha else src.convert("RGB")
                     iw, ih = im.size
                     if iw > 0 and ih > 0:
                         scale = min(W / iw, H / ih)
                         nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
-                        im = im.resize((nw, nh), Image.LANCZOS)
-                    canvas.paste(im, ((W - im.width) // 2, (H - im.height) // 2))
+                        im = im.resize((nw, nh), _resample(scale > 1.0))
+                    pos = ((W - im.width) // 2, (H - im.height) // 2)
+                    if has_alpha:
+                        canvas.paste(im, pos, im)         # use alpha as the mask
+                    else:
+                        canvas.paste(im, pos)
                 except Exception:
                     pass
             cache[img_path] = canvas
             return canvas
+
+        lcache = {}                     # img_path -> scaled RGBA Image (overlay use)
+        def _scaled_rgba(img_path):
+            """Load the OVERLAY (channel 07) image as RGBA for compositing over the
+            base, matching how beatoraja renders a layer BMP:
+
+            * If the image carries a real ALPHA channel, use it verbatim. Some layers
+              define their shape purely in alpha (and may store inverted RGB), so
+              deriving alpha from RGB would invert them — that was the ring/'?' bug.
+            * Otherwise (RGB/BMP, no alpha) use a BINARY black key: black is the
+              transparent colour, every non-black pixel is FULLY opaque. There is NO
+              brightness ramp — a layer's own translucency is baked into its pixels and
+              must not be re-derived from luminance, or bright opaque overlays (e.g.
+              the GOTTA CHAOS circles) wash out to faint ghosts. A small tolerance
+              (<=16) treats near-black as transparent to absorb JPEG/BMP noise without
+              keying out real dark content.
+
+            The mask is built at SOURCE resolution then scaled together with the RGB,
+            so edges anti-alias cleanly (no dark halo) without dimming interior pixels.
+            """
+            if img_path in lcache:
+                return lcache[img_path]
+            canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            if img_path is not None:
+                try:
+                    import numpy as _np
+                    src = Image.open(img_path)
+                    has_alpha = (src.mode in ("RGBA", "LA", "PA")) or (
+                        "transparency" in getattr(src, "info", {}))
+                    if has_alpha:
+                        im = src.convert("RGBA")          # trust the embedded alpha
+                    else:
+                        rgb = _np.asarray(src.convert("RGB"))
+                        lum = rgb.max(axis=2)             # 0..255
+                        # binary black-key: BMS layers use pure black as the transparent
+                        # colour. Use a TIGHT threshold so only true/near-pure black keys
+                        # out — dark-but-coloured content (e.g. dark-brown hair at max~10)
+                        # must stay opaque. A loose threshold (e.g. 16) wrongly keyed such
+                        # content transparent. Measured assets: transparent regions are
+                        # exactly (0,0,0); the darkest real content sits at max-channel ~10.
+                        BLACK_TOL = 4
+                        alpha = (_np.where(lum > BLACK_TOL, 255, 0)).astype("uint8")
+                        rgba = _np.dstack([rgb, alpha]).astype("uint8")
+                        im = Image.fromarray(rgba, "RGBA")
+                    iw, ih = im.size
+                    if iw > 0 and ih > 0:
+                        scale = min(W / iw, H / ih)
+                        nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
+                        im = im.resize((nw, nh), _resample(scale > 1.0))
+                    canvas.paste(im, ((W - im.width) // 2, (H - im.height) // 2), im)
+                except Exception:
+                    pass
+            lcache[img_path] = canvas
+            return canvas
+
+        rgba_base_cache = {}            # base_path -> base as an RGBA PIL image
+        def _base_rgba_img(base_path):
+            if base_path not in rgba_base_cache:
+                rgba_base_cache[base_path] = _scaled(base_path).convert("RGBA")
+            return rgba_base_cache[base_path]
 
         frame_cache = {}                # (base_path, layer_path) -> raw RGB bytes
         def frame_for(base_path, layer_path):
             key = (base_path, layer_path)
             if key in frame_cache:
                 return frame_cache[key]
-            base_img = _scaled(base_path)
             if layer_path is None:
-                raw = base_img.tobytes()
+                raw = _scaled(base_path).tobytes()
             else:
-                # composite the overlay (channel 07) over the base, treating pure
-                # black as transparent — the standard BMS layer-BGA behavior
-                layer_img = _scaled(layer_path)
-                import numpy as _np
-                b = _np.asarray(base_img)
-                l = _np.asarray(layer_img)
-                mask = (l.sum(axis=2) > 0)[:, :, None]   # non-black layer pixels
-                comp = _np.where(mask, l, b).astype("uint8")
-                raw = comp.tobytes()
+                # Alpha-composite the overlay (channel 07) over the base. PIL's
+                # alpha_composite is C-optimised (faster than a numpy float blend).
+                # The base RGBA image is cached per base so it isn't re-converted for
+                # every overlay paired with it. Overlay alpha is proportional to
+                # brightness (see _scaled_rgba) so edges blend instead of haloing.
+                comp = _base_rgba_img(base_path).copy()
+                comp.alpha_composite(_scaled_rgba(layer_path))
+                raw = comp.convert("RGB").tobytes()
             frame_cache[key] = raw
             return raw
 
