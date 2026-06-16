@@ -1652,11 +1652,33 @@ def render_bga_video_job(job):
             iw, ih = dim_time.most_common(1)[0][0]    # the dominant frame size
         else:
             iw, ih = target, target
+
+        # The REQUESTED output size keeps the BGA's aspect ratio inside `target`.
         if iw >= ih:
-            W = target; H = max(2, round(target * ih / iw))
+            req_W = target; req_H = max(2, round(target * ih / iw))
         else:
-            H = target; W = max(2, round(target * iw / ih))
-        W -= W % 2; H -= H % 2                  # H.264 needs even width/height
+            req_H = target; req_W = max(2, round(target * iw / ih))
+        req_W -= req_W % 2; req_H -= req_H % 2          # H.264 needs even dims
+
+        # --- change A: never UPSCALE inside PIL --------------------------------
+        # Per-image BICUBIC upscaling is the dominant cost of the whole pipeline,
+        # and it scales with OUTPUT pixels: a 512px BGA exported at 1080p paid ~8x
+        # the per-image time for blur it can't add real detail to. So we composite
+        # at a WORKING size capped to the dominant source resolution, then let
+        # ffmpeg upscale the finished stream to the requested size exactly ONCE
+        # (one GPU/CPU-cheap pass over the encoded video) instead of upscaling
+        # every distinct frame in Python. When the request is already <= source
+        # (downscale or equal), the working size IS the requested size and nothing
+        # changes — downscaling stays in PIL where BOX gives clean averaging.
+        cap = max(2, max(iw, ih))               # longest dominant source edge
+        work_target = min(target, cap)
+        if iw >= ih:
+            W = work_target; H = max(2, round(work_target * ih / iw))
+        else:
+            H = work_target; W = max(2, round(work_target * iw / ih))
+        W -= W % 2; H -= H % 2
+        # only ask ffmpeg to rescale if the working size differs from requested
+        upscale_to = (req_W, req_H) if (req_W, req_H) != (W, H) else None
         black = Image.new("RGB", (W, H), (0, 0, 0))
 
         def _resample(up):
@@ -1702,9 +1724,18 @@ def render_bga_video_job(job):
             """Load the OVERLAY (channel 07) image as RGBA for compositing over the
             base, matching how beatoraja renders a layer BMP:
 
-            * If the image carries a real ALPHA channel, use it verbatim. Some layers
-              define their shape purely in alpha (and may store inverted RGB), so
-              deriving alpha from RGB would invert them — that was the ring/'?' bug.
+            * If the image carries a MEANINGFUL ALPHA channel (one that actually
+              contains some transparency), use it verbatim. Some layers define their
+              shape purely in alpha (and may store inverted RGB), so deriving alpha
+              from RGB would invert them — that was the ring/'?' bug.
+            * If the image is nominally RGBA but its alpha is DEGENERATE — every
+              pixel fully opaque (min == 255) — the alpha carries no shape and must
+              NOT be trusted. This happens when a chart's original RGB/BMP layers were
+              batch-converted to PNG and the converter stapled on a blanket opaque
+              alpha. Trusting it verbatim leaves the layer's black background opaque,
+              so it paints over the base and the whole frame goes black except the
+              non-black overlay pixels (the 庫の女・庫の目 'base disappeared, only
+              lyrics survive' bug). Such layers fall through to the black key below.
             * Otherwise (RGB/BMP, no alpha) use a BINARY black key: black is the
               transparent colour, every non-black pixel is FULLY opaque. There is NO
               brightness ramp — a layer's own translucency is baked into its pixels and
@@ -1727,7 +1758,15 @@ def render_bga_video_job(job):
                         "transparency" in getattr(src, "info", {}))
                     if has_alpha:
                         im = src.convert("RGBA")          # trust the embedded alpha
-                    else:
+                        # ...but only if that alpha is MEANINGFUL. A nominally-RGBA
+                        # layer whose alpha is uniformly opaque (min == 255) carries no
+                        # transparency — typically a batch BMP->PNG conversion that
+                        # stapled on a blanket opaque channel. Trusting it would keep
+                        # the layer's black background opaque and paint over the base.
+                        # Fall through to the black key in that case.
+                        if _np.asarray(im)[:, :, 3].min() == 255:
+                            has_alpha = False
+                    if not has_alpha:
                         rgb = _np.asarray(src.convert("RGB"))
                         lum = rgb.max(axis=2)             # 0..255
                         # binary black-key: BMS layers use pure black as the transparent
@@ -1791,10 +1830,18 @@ def render_bga_video_job(job):
         # 5) pipe raw frames to ffmpeg, muxing the wav. Codec/container come from the
         #    encode options (None -> original H.264 4:2:0 + AAC in mp4).
         enc_args, real_out = _bga_encode_args(_opts, out_path)
+        # change A: if we composited at a capped working size, upscale the finished
+        # stream to the requested size in ONE ffmpeg pass (lanczos ~ matches the
+        # BICUBIC look we'd have done per-frame) instead of upscaling every frame in
+        # PIL. No-op when upscale_to is None (request was <= source, nothing to do).
+        scale_args = []
+        if upscale_to is not None:
+            sw, sh = upscale_to
+            scale_args = ["-vf", f"scale={sw}:{sh}:flags=lanczos"]
         cmd = [ff, "-y", "-loglevel", "error",
                "-f", "rawvideo", "-pixel_format", "rgb24",
                "-video_size", f"{W}x{H}", "-framerate", str(fps), "-i", "pipe:0",
-               "-i", tmp_wav] + enc_args + [real_out]
+               "-i", tmp_wav] + scale_args + enc_args + [real_out]
         out_path = real_out          # report the actual file we wrote
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
