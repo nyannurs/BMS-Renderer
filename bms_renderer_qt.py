@@ -11,6 +11,7 @@ Run:  python bms_renderer_qt.py     (requires PyQt5)
 """
 import os
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
@@ -239,7 +240,10 @@ class _NumericTreeItem(QTreeWidgetItem):
 
 class MarqueeLabel(QLabel):
     """A single-line label that horizontally scrolls its text when it's too wide,
-    used for the now-playing title in the transport bar."""
+    used for the now-playing title in the transport bar. Emits `clicked` when pressed
+    so the now-playing title can act like a list selection."""
+    clicked = pyqtSignal()
+
     def __init__(self, text=""):
         super().__init__()
         self._full = text
@@ -249,10 +253,34 @@ class MarqueeLabel(QLabel):
         from PyQt5.QtCore import QTimer
         self._timer = QTimer(self); self._timer.timeout.connect(self._scroll)
 
+    def mousePressEvent(self, e):
+        if self._full:
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+    def enterEvent(self, e):
+        # On hover, echo the now-playing entry highlight (blue + bold) so it reads as
+        # clickable — but only when there's actually a song to click through to.
+        if self._full:
+            self.setStyleSheet("color: #2d7dff; font-weight: bold;")
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        # restore the inherited palette colour / normal weight
+        self.setStyleSheet("")
+        super().leaveEvent(e)
+
     def setSong(self, text):
         self._full = text or ""
         self._offset = 0
         self.setText(self._full)
+        # only present as clickable (hand cursor) when there's actually a title to
+        # click through to; an empty now-playing field should feel inert.
+        from PyQt5.QtCore import Qt as _Qt
+        self.setCursor(_Qt.PointingHandCursor if self._full else _Qt.ArrowCursor)
+        self.setToolTip("Show info for the playing song" if self._full else "")
+        if not self._full:
+            self.setStyleSheet("")          # drop any lingering hover style
         if self._full and self.fontMetrics().horizontalAdvance(self._full) > self.width():
             self._timer.start(200)
         else:
@@ -1179,6 +1207,12 @@ class AudioExportDialog(QDialog):
         self.q_lbl = QLabel("Quality:")
         self.q_slider = QSlider(Qt.Horizontal)
         self.q_value = QLabel("")
+        # Reserve a fixed width for the value label sized to its widest possible text
+        # ("320k CBR"); otherwise the label grows/shrinks as the text changes and the
+        # slider resizes to fill the leftover space, which looks jittery as you drag.
+        self.q_value.setFixedWidth(
+            self.q_value.fontMetrics().horizontalAdvance("320k CBR") + 8)
+        self.q_value.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         qrow = QHBoxLayout(); qrow.addWidget(self.q_slider, 1); qrow.addWidget(self.q_value)
         form.addRow(self.q_lbl, qrow)
 
@@ -1320,28 +1354,7 @@ class MainWindow(QMainWindow):
         self.dark_toggle = QCheckBox("Dark mode")
         self.dark_toggle.setChecked(bool(load_config().get("dark_mode", False)))
         self.dark_toggle.toggled.connect(self._on_dark_toggled)
-        # ---- EXPERIMENTAL: entry font-size slider (remove this whole block + the
-        # _apply_entry_font_scale method + its two call sites to revert) -------------
-        corner = QWidget()
-        _ch = QHBoxLayout(corner); _ch.setContentsMargins(0, 0, 0, 0); _ch.setSpacing(8)
-        # Discrete font-size slider: a handful of notches rather than a continuous drag.
-        self.FONT_STEPS = [10, 13, 16, 19, 22, 25, 28]   # px per notch
-        self.font_slider = QSlider(Qt.Horizontal)
-        self.font_slider.setFixedWidth(160)
-        self.font_slider.setRange(0, len(self.FONT_STEPS) - 1)
-        self.font_slider.setSingleStep(1); self.font_slider.setPageStep(1)
-        self.font_slider.setTickPosition(QSlider.TicksBelow)
-        self.font_slider.setTickInterval(1)
-        saved = int(load_config().get("entry_font_px", 0)) or 10
-        nearest = min(range(len(self.FONT_STEPS)),
-                      key=lambda i: abs(self.FONT_STEPS[i] - saved))
-        self.font_slider.setValue(nearest)
-        self.font_slider.setToolTip("Song entry text size")
-        self.font_slider.valueChanged.connect(self._on_entry_font_changed)
-        _ch.addWidget(self.font_slider)
-        _ch.addWidget(self.dark_toggle)
-        self.tabs.setCornerWidget(corner, Qt.TopRightCorner)
-        # ---- END EXPERIMENTAL ----------------------------------------------------
+        self.tabs.setCornerWidget(self.dark_toggle, Qt.TopRightCorner)
         self._build_tabs()
         mid.addWidget(self.tabs, 1)
         mid.addWidget(self._build_right_panel())
@@ -1355,7 +1368,6 @@ class MainWindow(QMainWindow):
 
         self.log(f"BMS Renderer v{APP_VERSION} (Qt) ready.")
         self._warn_missing_deps()
-        self._apply_entry_font_scale()   # EXPERIMENTAL: apply saved entry font size
         # reopen the last library automatically, like the Tk app
         saved = load_config().get("library")
         if saved and os.path.isdir(saved):
@@ -1444,54 +1456,6 @@ class MainWindow(QMainWindow):
     def _on_dark_toggled(self, on):
         self._update_cfg(dark_mode=bool(on))
         self._apply_theme(on)
-
-    # ---- EXPERIMENTAL: entry font-size slider (remove this method + the corner-widget
-    # block in _build + the _apply_entry_font_scale() call in _build to revert) --------
-    def _on_entry_font_changed(self, idx):
-        px = self.FONT_STEPS[int(idx)]
-        self._update_cfg(entry_font_px=int(px))
-        self._apply_entry_font_scale(int(px))
-
-    def _apply_entry_font_scale(self, px=None):
-        """Scale ONLY the song-entry rows in the list/tree views — not headers,
-        buttons, labels, or any other chrome. We set a real QFont on each view (which
-        scales both the row text AND the row height, unlike a stylesheet font-size),
-        then restore the default app font on the tree HEADERS so column titles stay
-        put. Theme-independent: changing the font never touches colours, so it
-        survives light<->dark switches untouched."""
-        from PyQt5.QtGui import QFont, QFontInfo
-        if px is None:
-            px = self.FONT_STEPS[self.font_slider.value()] if hasattr(self, "font_slider") else 0
-        if not px:
-            return
-        f = QFont(QApplication.font())
-        f.setPixelSize(int(px))
-        # Leading scales with the font: ~2px at a 10px default, growing proportionally.
-        pad = max(1, round(px / 5))
-        item_css = (f"QTreeView::item, QListView::item "
-                    f"{{ padding-top: {pad}px; padding-bottom: {pad}px; }}")
-        # Lock each header to an EXPLICIT fixed pixel size captured once. A header with a
-        # non-explicit font re-inherits from its view, so after we scale the view font
-        # the header would follow unless we pin it with a concrete size of its own.
-        if not hasattr(self, "_orig_header_fonts"):
-            self._orig_header_fonts = {}
-            for name in ("ltable", "pltree", "ttree", "qtable"):
-                w = getattr(self, name, None)
-                if w is not None:
-                    hf = QFont(w.header().font())
-                    hf.setPixelSize(QFontInfo(w.header().font()).pixelSize())  # pin it
-                    self._orig_header_fonts[name] = hf
-        for name in ("ltable", "pltree", "ttree", "qtable"):
-            w = getattr(self, name, None)
-            if w is not None:
-                w.setFont(f)
-                w.setStyleSheet(item_css)
-                w.header().setFont(self._orig_header_fonts[name])  # rows scale; titles don't
-        # icon-grid views (Discovery + album grids) are all MarqueeList instances
-        for gr in self.findChildren(MarqueeList):
-            gr.setFont(f)
-            gr.setStyleSheet(item_css)
-    # ---- END EXPERIMENTAL ------------------------------------------------------------
 
     def _apply_theme(self, dark):
         """Swap the application palette between the dark theme and the captured light
@@ -1672,10 +1636,13 @@ class MainWindow(QMainWindow):
         self._filtered = rows
         self._fill_lib_tree(rows)              # no cap — Qt batch-insert handles the full set
 
-    def _wire_sort_persistence(self, tree, cfg_key):
+    def _wire_sort_persistence(self, tree, cfg_key, default=None):
         """Persist a tree's sort column+order across boots. Restores the saved sort
-        now, then saves whenever the user clicks a header to re-sort."""
+        now (or `default` as (col, order) when nothing is saved), then saves whenever
+        the user clicks a header to re-sort."""
         saved = load_config().get(cfg_key)
+        if not (isinstance(saved, (list, tuple)) and len(saved) == 2):
+            saved = default
         if isinstance(saved, (list, tuple)) and len(saved) == 2:
             col, order = saved
             try:
@@ -2611,6 +2578,7 @@ class MainWindow(QMainWindow):
             e = self.tag_fields[label]
             e.blockSignals(True)
             e.setText(tags.get(key, "") or "")
+            e.setToolTip(tags.get(key, "") or "")   # full value on hover when truncated
             e.setReadOnly(not editable)
             # dim read-only fields using the THEME's disabled-text/base colours so it
             # works on light and dark (Night) themes alike — no hardcoded light grey
@@ -2681,6 +2649,10 @@ class MainWindow(QMainWindow):
         self.info_fields["Play type"].setText(s.get("mode", "—") or "—")
         self.info_fields["File"].setText(s.get("path", "—"))
         self.info_fields["MD5"].setText(s.get("md5", "—") or "—")
+        # full value on hover (Windows-style) so truncated fields are still readable
+        for w in self.info_fields.values():
+            t = w.text()
+            w.setToolTip(t if t and t != "—" else "")
         # also load the song's folder art into the picker
         self._load_song_art(s.get("path"))
         # update the sequence-BGA indicator (off the GUI thread — detect_bga parses
@@ -2856,6 +2828,23 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, event):
         from PyQt5.QtCore import QEvent
+        # Right-positioned tooltips for the info/tag fields: show the full value just
+        # to the RIGHT of the field (more intuitive than the default below-cursor box).
+        if event.type() == QEvent.ToolTip:
+            tip = obj.toolTip() if hasattr(obj, "toolTip") else ""
+            in_panel = (obj in getattr(self, "info_fields", {}).values()
+                        or obj in getattr(self, "tag_fields", {}).values())
+            if in_panel:
+                from PyQt5.QtWidgets import QToolTip
+                if tip:
+                    # anchor at the field's right edge, vertically centred
+                    pt = obj.mapToGlobal(obj.rect().topRight())
+                    pt.setX(pt.x() + 8)
+                    pt.setY(pt.y() + obj.height() // 2 - 10)
+                    QToolTip.showText(pt, tip, obj)
+                else:
+                    QToolTip.hideText()
+                return True
         if event.type() == QEvent.KeyPress and obj in self.tag_fields.values():
             key = event.key()
             # find which field
@@ -2919,6 +2908,20 @@ class MainWindow(QMainWindow):
             existing.add(s["path"]); added += 1
         if added:
             self._refresh_queue(); self.log(f"Added {added} song(s) to the queue.")
+
+    def _on_now_label_clicked(self):
+        # Load the currently-playing song into the right info panel, the same way a
+        # single list selection does. Resolve the song from its path; if it isn't in
+        # the library index (e.g. played from a file outside the scan), do nothing.
+        path = getattr(self, "_now_path", None)
+        if not path:
+            return
+        s = getattr(self, "_path_index", {}).get(path)
+        if not s:
+            return
+        self._sel_kind, self._sel_index = None, None   # read-only context
+        self._show_info(s)
+        self._show_readonly_tags(s)
 
     def _on_lib_select(self):
         sel = self._selected_lib_songs()
@@ -3167,7 +3170,6 @@ class MainWindow(QMainWindow):
         out_dir = self.out_edit.text() or load_config().get("output")
         if not out_dir or not os.path.isdir(out_dir):
             QMessageBox.information(self, "No output folder", "Choose an output folder first."); return
-        entries = self._playlists[name]
         items = self._pl_collect_items()
         if not items:
             self.log("No owned songs in this playlist to render."); return
@@ -3315,7 +3317,8 @@ class MainWindow(QMainWindow):
         self.ttree.setExpandsOnDoubleClick(False)
         self.ttree.header().setStretchLastSection(True)
         self.ttree.setSortingEnabled(True)
-        self._wire_sort_persistence(self.ttree, "table_sort")
+        self._wire_sort_persistence(self.ttree, "table_sort",
+                                    default=[0, int(Qt.AscendingOrder)])
         self.ttree.setColumnWidth(0, 300); self.ttree.setColumnWidth(1, 190)
         self.ttree.itemSelectionChanged.connect(self._on_table_select)
         self.ttree.itemDoubleClicked.connect(self._on_table_double)
@@ -3416,8 +3419,16 @@ class MainWindow(QMainWindow):
         sym = tbl.get("symbol", "")
         owned_total = 0
         self._tbl_play_order = []        # flat owned-song order for next/prev
-        for lv in sorted(by_level.keys(), key=level_key):
-            parent = QTreeWidgetItem([f"{sym}{lv}", "", "", "", ""])
+        for order_i, lv in enumerate(sorted(by_level.keys(), key=level_key)):
+            # The level parent sorts by DIFFICULTY, not by the "★10" text (which would
+            # put ★10 before ★2). We store a numeric sort key on column 0: numeric
+            # levels by value, non-numeric ones (e.g. "???") after all numbers. Using a
+            # _NumericTreeItem + SORTKEY_ROLE means column-0 sorting respects difficulty
+            # even though the cell shows "★10".
+            kind, val = level_key(lv)
+            sort_val = float(val) if kind == 0 else 1e9 + order_i
+            parent = _NumericTreeItem([f"{sym}{lv}", "", "", "", ""])
+            parent.setData(0, _NumericTreeItem.SORTKEY_ROLE, sort_val)
             for e in by_level[lv]:
                 s = idx.get(e.get("md5"))           # only owned charts have a match
                 if not s:
@@ -3567,6 +3578,8 @@ class MainWindow(QMainWindow):
         for k in ("Title", "Artist", "Album", "Alb.Artist", "Genre", "BPM"):
             e = QLineEdit(); self.tag_fields[k] = e; form.addRow(k + ":", e)
             e.textEdited.connect(self._on_tag_edit)
+            # keep the hover tooltip showing the current full value as the user types
+            e.textChanged.connect(lambda t, w=e: w.setToolTip(t))
             e.installEventFilter(self)
         self._tag_field_order = ["Title", "Artist", "Album", "Alb.Artist", "Genre", "BPM"]
         self.tag_hint = QLabel("Select a queued song to edit its tags.")
@@ -3579,6 +3592,7 @@ class MainWindow(QMainWindow):
         for k in ("Title", "Artist", "Genre", "BPM", "Notes", "Play type", "File", "MD5"):
             lbl = QLabel("—"); lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
             self.info_fields[k] = lbl; iform.addRow(k + ":", lbl)
+            lbl.installEventFilter(self)        # right-positioned full-value tooltip
         col.addWidget(info)
 
         # song-folder art picker (per-song cover, with prev/next + slider)
@@ -3649,8 +3663,11 @@ class MainWindow(QMainWindow):
         self.dev_btn = QPushButton("Audio device")
         self.dev_btn.setIcon(st.standardIcon(QStyle.SP_BrowserReload))
         bar.addWidget(self.dev_btn)
-        # now-playing marquee (between the device button and the time)
+        # now-playing marquee (between the device button and the time). Clicking it
+        # loads the playing song into the right info panel, like selecting it in a list.
+        # The hand cursor only appears once a song is playing (managed in setSong).
         self.now_lbl = MarqueeLabel(); self.now_lbl.setFixedWidth(180)
+        self.now_lbl.clicked.connect(self._on_now_label_clicked)
         bar.addWidget(self.now_lbl)
         self.time_lbl = QLabel("0:00 / 0:00"); bar.addWidget(self.time_lbl)
         self.wave = WaveformBar(); self.wave.seek.connect(self._on_wave_seek)
@@ -3916,9 +3933,66 @@ def main():
             "  padding: 4px 0px;"
             "  min-height: 18px;"
             "}"
-            "QLabel#mutedLabel { color: #999; }")    # readable on light AND dark
+            "QLabel#mutedLabel { color: #999; }"
+            # modern tooltip look (replaces the default raised Win95-style box):
+            # dark slate bubble with light text, soft border, a little padding and
+            # rounded corners. Reads cleanly over both light and dark themes.
+            "QToolTip {"
+            "  background-color: #2b2b30;"
+            "  color: #f0f0f0;"
+            "  border: 1px solid #4a4a52;"
+            "  border-radius: 4px;"
+            "  padding: 4px 7px;"
+            "}")
         w = MainWindow(); w.show()
-        sys.exit(app.exec_())
+
+        # --- graceful shutdown -------------------------------------------------
+        # On Linux, closing the window returned from app.exec_() but the process
+        # then hung: a ProcessPoolExecutor (spawn) keeps internal non-daemon helper
+        # threads alive, and the interpreter blocks joining them at exit. SIGINT
+        # didn't help because the main thread was already past the Qt loop, inside
+        # interpreter shutdown where Python signal handlers don't run. Killing the
+        # terminal worked only because that signalled the whole process group.
+        #
+        # Fix: one handler that tears down anything still running, then hard-exits
+        # with os._exit() to bypass the interpreter's thread-join wait entirely.
+        def _graceful_shutdown(*_a):
+            try:
+                w.close()              # runs MainWindow.closeEvent (stops player+workers)
+            except Exception:
+                pass
+            # belt-and-suspenders: terminate any lingering child processes (render/BGA
+            # pools) so none survive to keep us alive.
+            try:
+                import multiprocessing
+                for child in multiprocessing.active_children():
+                    try:
+                        child.terminate()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            os._exit(0)                # skip interpreter teardown / thread joins
+
+        app.aboutToQuit.connect(lambda: None)   # ensure Qt cleanup path is registered
+        try:
+            import signal
+            # let Ctrl+C in the terminal actually quit instead of being swallowed
+            signal.signal(signal.SIGINT, _graceful_shutdown)
+            signal.signal(signal.SIGTERM, _graceful_shutdown)
+            # Qt's event loop otherwise starves Python's signal handlers; a cheap idle
+            # timer hands control back to the interpreter periodically so a SIGINT
+            # delivered mid-run is actually seen.
+            from PyQt5.QtCore import QTimer
+            _sig_timer = QTimer()
+            _sig_timer.start(200)
+            _sig_timer.timeout.connect(lambda: None)
+        except Exception:
+            pass
+        # ----------------------------------------------------------------------
+
+        app.exec_()
+        _graceful_shutdown()           # normal window-close path also hard-exits cleanly
     except SystemExit:
         raise
     except Exception:
