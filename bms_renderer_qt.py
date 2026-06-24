@@ -1951,7 +1951,10 @@ class MainWindow(QMainWindow):
             try:
                 state = getattr(self.player, "state", None)
                 if state == "paused":
-                    self._rpc.set_paused()
+                    s = getattr(self, "_path_index", {}).get(
+                        getattr(self, "_now_path", None), {})
+                    self._rpc.set_paused(self._now_title(),
+                                         s.get("artist", "") if s else "")
                 elif state == "playing":
                     self._rpc_now_playing(getattr(self, "_now_path", None),
                                           self._now_title())
@@ -1982,8 +1985,9 @@ class MainWindow(QMainWindow):
             s = getattr(self, "_path_index", {}).get(path, {})
             artist = s.get("artist", "") if s else ""
             dur = self.player.duration_seconds() if self.player else 0
+            pos = self.player.position_seconds() if self.player else 0
             self._rpc.set_playing(title or (s.get("title", "") if s else ""),
-                                  artist, duration=dur)
+                                  artist, duration=dur, position=pos)
         except Exception:
             pass
 

@@ -96,8 +96,16 @@ class RichPresence:
         self.connected = False
 
     # -- presence updates ---------------------------------------------------
-    def set_playing(self, title, artist="", duration=0):
-        """Show '<title>' / 'by <artist>' with an elapsed (or remaining) timer."""
+    def set_playing(self, title, artist="", duration=0, position=0):
+        """Show '<title>' / 'by <artist>' with a live timer.
+
+        The timer is anchored to the ACTUAL playhead: we backdate `start` by the
+        current `position` so Discord's clock reads the real elapsed time of the song
+        (counting up from where playback actually is), not from the moment this call
+        was made. With a known `duration` we also send `end`, so Discord shows a
+        countdown that finishes exactly when the song does — and because `end` is also
+        anchored to the true position, a resume after pause picks up where it left off
+        instead of restarting the full duration."""
         if not self.connected or self._rpc is None:
             return
         # Discord requires the 'details'/'state' strings to be 2..128 chars; clamp.
@@ -110,28 +118,35 @@ class RichPresence:
             "large_text": LARGE_IMAGE_TEXT or None,
         }
         now = time.time()
+        pos = max(0.0, float(position or 0))
+        # backdate the start by the elapsed position so the clock reflects the playhead
+        start = now - pos
+        kwargs["start"] = int(start)
         if duration and duration > 0:
-            # show a countdown that ends when the song ends
-            kwargs["start"] = int(now)
-            kwargs["end"] = int(now + duration)
-        else:
-            kwargs["start"] = int(now)
-        self._start_ts = now
+            kwargs["end"] = int(start + duration)   # countdown ends when the song ends
+        self._start_ts = start
         try:
             self._rpc.update(**kwargs)
             self.last_error = ""
         except Exception as e:
             self.last_error = f"update failed: {type(e).__name__}: {e}"
 
-    def set_paused(self):
+    def set_paused(self, title="", artist=""):
+        """Freeze the presence while paused. Crucially this sends NO start/end, which
+        REMOVES the timer from the presence so Discord stops ticking — leaving the
+        timestamps in place would let the clock keep running even though playback is
+        paused. Keeps the song title/artist visible so the card still reads sensibly."""
         if not self.connected or self._rpc is None:
             return
+        details = self._fit(title or "Paused")
+        state = self._fit(("by " + artist) if artist else "Paused")
         try:
             self._rpc.update(
-                details="Paused",
-                state=" ",                     # a single space keeps Discord happy
+                details=details,
+                state=state,
                 large_image=LARGE_IMAGE_KEY or None,
                 large_text=LARGE_IMAGE_TEXT or None,
+                # no 'start'/'end' → Discord shows no timer (frozen), not a running one
             )
         except Exception:
             pass
