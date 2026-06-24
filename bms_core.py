@@ -526,14 +526,6 @@ def detect_bga(path):
     return {"type": "static", "frames": 1, "images": image_count}
 
 
-def _num(v):
-    """Coerce a possibly-blank, possibly-string value to a float for sorting.
-    Blanks sort as -1 so empty BPM/notes group at the bottom ascending."""
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return -1.0
-
 _C_BGM       = _ch("01")
 _C_BPM       = _ch("03")   # inline hex BPM
 _C_BPM_EXT   = _ch("08")   # extended BPM (references #BPMxx)

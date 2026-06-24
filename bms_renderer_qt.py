@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QEvent
     from PyQt5.QtGui import QPixmap, QIcon
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -2121,7 +2121,12 @@ class MainWindow(QMainWindow):
             return
         dur = p.duration_seconds(); pos = p.position_seconds()
         if dur > 0:
-            self.time_lbl.setText(f"{self._fmt_time(pos)} / {self._fmt_time(dur)}")
+            # the label is mm:ss, so it only changes ~once/sec; skip the other ~7
+            # ticks/sec where the text is identical (avoids needless relayout).
+            txt = f"{self._fmt_time(pos)} / {self._fmt_time(dur)}"
+            if txt != getattr(self, "_last_time_txt", None):
+                self.time_lbl.setText(txt)
+                self._last_time_txt = txt
             if hasattr(self, "wave"):
                 self.wave.set_pos(pos / dur)
 
@@ -2827,7 +2832,6 @@ class MainWindow(QMainWindow):
         self._render_song_art()
 
     def eventFilter(self, obj, event):
-        from PyQt5.QtCore import QEvent
         # Right-positioned tooltips for the info/tag fields: show the full value just
         # to the RIGHT of the field (more intuitive than the default below-cursor box).
         if event.type() == QEvent.ToolTip:
