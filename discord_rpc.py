@@ -29,6 +29,7 @@ Nothing here ever touches your BMS files; it only sends "now playing" text to yo
 local Discord client.
 """
 
+import os
 import time
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,6 @@ class RichPresence:
         self.client_id = client_id or CLIENT_ID
         self._rpc = None
         self.connected = False
-        self._start_ts = None
         self.last_error = ""        # surfaced to the host app so failures are visible
 
     # -- lifecycle ----------------------------------------------------------
@@ -97,59 +97,74 @@ class RichPresence:
 
     # -- presence updates ---------------------------------------------------
     def set_playing(self, title, artist="", duration=0, position=0):
-        """Show '<title>' / 'by <artist>' with a live timer.
-
-        The timer is anchored to the ACTUAL playhead: we backdate `start` by the
-        current `position` so Discord's clock reads the real elapsed time of the song
-        (counting up from where playback actually is), not from the moment this call
-        was made. With a known `duration` we also send `end`, so Discord shows a
-        countdown that finishes exactly when the song does — and because `end` is also
-        anchored to the true position, a resume after pause picks up where it left off
-        instead of restarting the full duration."""
+        """Show '<title>' / 'by <artist>'. No timer — just the song info. (`duration`
+        and `position` are accepted but unused, so existing callers don't break.)"""
         if not self.connected or self._rpc is None:
             return
         # Discord requires the 'details'/'state' strings to be 2..128 chars; clamp.
         details = self._fit(title or "Unknown title")
         state = self._fit(("by " + artist) if artist else "Playing a chart")
-        kwargs = {
-            "details": details,
-            "state": state,
-            "large_image": LARGE_IMAGE_KEY or None,
-            "large_text": LARGE_IMAGE_TEXT or None,
-        }
-        now = time.time()
-        pos = max(0.0, float(position or 0))
-        # backdate the start by the elapsed position so the clock reflects the playhead
-        start = now - pos
-        kwargs["start"] = int(start)
-        if duration and duration > 0:
-            kwargs["end"] = int(start + duration)   # countdown ends when the song ends
-        self._start_ts = start
-        try:
-            self._rpc.update(**kwargs)
-            self.last_error = ""
-        except Exception as e:
-            self.last_error = f"update failed: {type(e).__name__}: {e}"
+        self._push(details, state)
 
     def set_paused(self, title="", artist=""):
-        """Freeze the presence while paused. Crucially this sends NO start/end, which
-        REMOVES the timer from the presence so Discord stops ticking — leaving the
-        timestamps in place would let the clock keep running even though playback is
-        paused. Keeps the song title/artist visible so the card still reads sensibly."""
+        """Paused state — same song info, no timer."""
         if not self.connected or self._rpc is None:
             return
         details = self._fit(title or "Paused")
         state = self._fit(("by " + artist) if artist else "Paused")
+        self._push(details, state)
+
+    def _push(self, details, state):
+        """Send a presence with NO `timestamps` field at all.
+
+        Discord renders its default elapsed counter ("0:41") whenever the activity's
+        `timestamps` object is present — even `{start: None}` or a zero span shows a
+        (frozen) clock. pypresence always includes that object via its normal
+        `update()`, so the only way to suppress the timer is to bypass the builder and
+        send a hand-built activity dict with the key omitted. Newer pypresence exposes
+        `payload_override` for exactly this; if it's missing we fall back to the normal
+        call (which will show the timer, but never crashes)."""
+        activity = {
+            "type": 2,                # Listening — "Listening to BMS Renderer"; renders
+                                      # differently from a Playing card and is the right
+                                      # semantic type for a music app. (May also drop the
+                                      # default elapsed timer that Playing cards show.)
+            "state": state,
+            "details": details,
+            "assets": {
+                "large_image": LARGE_IMAGE_KEY or None,
+                "large_text": LARGE_IMAGE_TEXT or None,
+            },
+            # deliberately NO "timestamps" key -> Discord shows no elapsed timer
+        }
+        override = {
+            "cmd": "SET_ACTIVITY",
+            "args": {"pid": os.getpid(), "activity": activity},
+            "nonce": "{:.20f}".format(time.time()),
+        }
         try:
-            self._rpc.update(
-                details=details,
-                state=state,
-                large_image=LARGE_IMAGE_KEY or None,
-                large_text=LARGE_IMAGE_TEXT or None,
-                # no 'start'/'end' → Discord shows no timer (frozen), not a running one
-            )
-        except Exception:
-            pass
+            try:
+                self._rpc.update(payload_override=override)   # newer pypresence
+            except TypeError:
+                # older pypresence: no override support. Try passing the Listening type
+                # through the normal call; if that arg is also unsupported, fall back to
+                # a plain update (Playing card with the default timer).
+                try:
+                    self._rpc.update(
+                        activity_type=2,
+                        details=details, state=state,
+                        large_image=LARGE_IMAGE_KEY or None,
+                        large_text=LARGE_IMAGE_TEXT or None,
+                    )
+                except TypeError:
+                    self._rpc.update(
+                        details=details, state=state,
+                        large_image=LARGE_IMAGE_KEY or None,
+                        large_text=LARGE_IMAGE_TEXT or None,
+                    )
+            self.last_error = ""
+        except Exception as e:
+            self.last_error = f"update failed: {type(e).__name__}: {e}"
 
     def clear(self):
         if not self.connected or self._rpc is None:
