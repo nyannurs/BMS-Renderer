@@ -1,6 +1,6 @@
 # BMS Renderer
 
-![Screenshot](https://i.imgur.com/dvwTJp9.png)
+![Screenshot](https://i.imgur.com/DiekJzp.png)
 
 This program is built by exclusively iterating with Claude. It's fully vibe coded.
 
