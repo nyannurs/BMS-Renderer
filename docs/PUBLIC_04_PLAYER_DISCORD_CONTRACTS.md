@@ -38,4 +38,4 @@ Exact shapes that cross module and process boundaries.
 
 **Process priority** is one of High / Above Normal / Normal / Below Normal / Low.
 
-**Config keys:** `library`, `output`, `render_threads`, `lib_col_widths`, `window_geometry_qt`, `dark_mode`, `art_viewer_scaling`, `art_viewer_geometry`, `table_sort`.
+**Config keys:** `library`, `output`, `render_threads`, `lib_col_widths`, `window_geometry_qt`, `dark_mode`, `art_viewer_scaling`, `art_viewer_geometry`, `table_sort`, `nowplaying_txt`.

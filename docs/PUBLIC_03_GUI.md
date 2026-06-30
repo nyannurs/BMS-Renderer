@@ -43,6 +43,8 @@ The app uses the Fusion style application-wide, set once at startup; **the style
 ### Playback and media keys
 The transport methods start, stop, advance, and seek playback, honour shuffle/loop, and poll for auto-advance. Media keys are bound through application-scoped shortcuts (they fire when the app has focus, not system-wide): play/pause, stop, next/previous, volume up/down, and mute, with Ctrl-based fallbacks including Ctrl+Space for play/pause. The now-playing marker tracks only the marked rows rather than scanning the whole list, which matters at large library sizes.
 
+When the config key `nowplaying_txt` is enabled (off by default), the app writes the playing song's title and artist to `nowplaying.txt` in the program directory, updated on each song change and emptied when playback stops. This is intended as a local text source for OBS or similar streaming software.
+
 ### Tabs
 The Library tab is a flat sortable table; the numeric columns (BPM, Notes) sort by value rather than as text. Discovery is an art grid. Tables shows difficulty tables as a level/song tree; the level rows sort by difficulty (so ★2 precedes ★10, and a non-numeric level like "???" sorts last) and the view defaults to difficulty order. In album view each level is a separate grid, and both the "Add selected" button and the right-click menu gather the selection across **all** level grids so multi-selection spans levels. Custom Playlists has a "Date added" column (sorted chronologically) and both a "Render Playlist" and a "Render All BGA in Playlist" button; Queue manages the render queue. Render buttons open the appropriate export dialog and show the progress dialog. Thread-count and format selection live in the export dialogs.
 

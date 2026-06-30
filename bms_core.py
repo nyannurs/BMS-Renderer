@@ -698,10 +698,23 @@ def _migrate_old_cache():
         pass
 
 def load_config():
+    """Read the JSON config. Returns {} if the file simply doesn't exist yet.
+
+    If the file EXISTS but won't parse (e.g. a hand-edit introduced invalid JSON like
+    a trailing comma), we must NOT silently return {} — the very next save_config would
+    then write that empty dict back and wipe every setting. Instead we move the corrupt
+    file aside to `bms_config.json.bad` (so its contents aren't lost and the user can
+    see something went wrong) and start fresh from there."""
+    if not os.path.exists(CONFIG_PATH):
+        return {}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
+        try:
+            os.replace(CONFIG_PATH, CONFIG_PATH + ".bad")
+        except Exception:
+            pass
         return {}
 
 def save_config(cfg):

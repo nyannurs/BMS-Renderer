@@ -34,7 +34,8 @@ from bms_core import (
     APP_VERSION, ffmpeg_path, render_one_job, load_config, save_config,
     set_library_root, parse_bms, render_bga_video_job, detect_bga, pick_playable_chart,
     render_bms, SR, fetch_table, load_tables_file, save_tables_file, TABLES_PATH,
-    load_playlists, save_one_playlist, delete_playlist_file,
+    load_playlists, save_one_playlist, delete_playlist_file, program_dir,
+    pick_discovery_art,
 )
 # ---------------------------------------------------------------------------
 # Embedded assets (logo wordmark + window icon), base64 PNG. Kept in-source so
@@ -1368,6 +1369,7 @@ class MainWindow(QMainWindow):
 
         self.log(f"BMS Renderer v{APP_VERSION} (Qt) ready.")
         self._warn_missing_deps()
+        self._ensure_nowplaying_config()
         # reopen the last library automatically, like the Tk app
         saved = load_config().get("library")
         if saved and os.path.isdir(saved):
@@ -1745,6 +1747,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "now_lbl"):
             self.now_lbl.setSong(title)
         self._rpc_now_playing(path, title)
+        s = getattr(self, "_path_index", {}).get(path, {})
+        self._write_nowplaying(title or (s.get("title", "") if s else ""),
+                               s.get("artist", "") if s else "", path)
         cached = self._play_cache.get(path)
         if cached is not None:
             self._begin_playback(cached); return
@@ -1967,6 +1972,7 @@ class MainWindow(QMainWindow):
         self.player.stop()
         self.time_lbl.setText("0:00 / 0:00")
         self._update_play_icon()
+        self._write_nowplaying("", "", "")       # clear the OBS now-playing file
         if self._rpc is not None:
             try:
                 self._rpc.clear()
@@ -1976,6 +1982,136 @@ class MainWindow(QMainWindow):
     def _now_title(self):
         s = getattr(self, "_path_index", {}).get(getattr(self, "_now_path", None), {})
         return s.get("title", "") if s else ""
+
+    def _ensure_nowplaying_config(self):
+        """Auto-propagate the now-playing config keys into the user's config the first
+        time this build runs, so a power user who updates sees them appear (with safe
+        defaults) ready to edit — no GUI toggle, no manual key creation. Only writes if
+        a key is actually missing, so it never clobbers an existing choice."""
+        try:
+            cfg = load_config()
+            changed = False
+            if "nowplaying_output" not in cfg:
+                cfg["nowplaying_output"] = False        # off by default
+                changed = True
+            if "nowplaying_format" not in cfg:
+                cfg["nowplaying_format"] = "txt"     # "txt" or "html"
+                changed = True
+            if changed:
+                save_config(cfg)
+        except Exception:
+            pass
+
+    def _write_nowplaying(self, title="", artist="", path=""):
+        """Write the current song to a now-playing file in the program directory, for
+        use as an OBS local source. Off unless config `nowplaying_output` is true. The
+        format follows config `nowplaying_format`: "txt" (default) writes plain
+        "title\\nartist" to nowplaying.txt; "html" writes nowplaying.html — a 1:1 art
+        square (resolved with the same logic as the album grid) above the title (large)
+        and artist (small). Empty title+artist clears/blanks the file (e.g. on stop).
+        Fail-safe: any error is swallowed so playback is never affected."""
+        try:
+            cfg = load_config()
+            if not cfg.get("nowplaying_output", False):
+                return
+            fmt = (cfg.get("nowplaying_format", "txt") or "txt").lower()
+            if fmt == "html":
+                self._write_nowplaying_html(title, artist, path)
+            else:
+                self._write_nowplaying_output(title, artist)
+        except Exception:
+            pass
+
+    def _write_nowplaying_output(self, title, artist):
+        if title or artist:
+            line = title or "Unknown title"
+            if artist:
+                line += f"\n{artist}"
+        else:
+            line = ""
+        with open(os.path.join(program_dir(), "nowplaying.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write(line)
+
+    def _write_nowplaying_html(self, title, artist, path):
+        """HTML mode uses TWO files in the program dir:
+          - nowplaying.html : a static page written ONCE, containing the styling and a
+            tiny JS poller. Point the OBS Browser source at THIS file.
+          - nowplaying.json : the live data (title/artist/art), rewritten on each song
+            change. The page fetches it on a timer with a cache-buster and swaps the DOM
+            in place — no page reload, so no flash and no OBS file-cache staleness.
+        Resolution: the card is laid out for a 960x480 Browser source."""
+        import json as _json
+        import base64 as _b64
+        prog = program_dir()
+        # 1) data file (rewritten every call) — empty strings when nothing is playing
+        img_uri = ""
+        try:
+            art = pick_discovery_art(path) if path else None
+            if art and os.path.isfile(art):
+                ext = os.path.splitext(art)[1].lower().lstrip(".") or "png"
+                mime = {"jpg": "jpeg"}.get(ext, ext)
+                with open(art, "rb") as af:
+                    img_uri = f"data:image/{mime};base64," + \
+                              _b64.b64encode(af.read()).decode("ascii")
+        except Exception:
+            img_uri = ""
+        data = {"title": title or "", "artist": artist or "", "art": img_uri}
+        with open(os.path.join(prog, "nowplaying.json"), "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False)
+        # 2) static page — write once (or refresh if missing). Never rewritten per song,
+        # so the JS keeps running uninterrupted.
+        self._ensure_nowplaying_html_page(os.path.join(prog, "nowplaying.html"))
+
+    def _ensure_nowplaying_html_page(self, out):
+        page = (
+            "<!doctype html><html><head><meta charset='utf-8'><style>"
+            "html,body{margin:0;background:transparent;overflow:hidden;}"
+            ".card{display:flex;align-items:center;gap:40px;"
+            "font-family:'Segoe UI',Arial,sans-serif;color:#fff;padding:40px;"
+            "opacity:0;transition:opacity .25s ease;}"
+            ".card.show{opacity:1;}"
+            ".art{width:480px;height:480px;object-fit:cover;background:#000;"
+            "flex:0 0 auto;}"
+            ".noart{display:flex;align-items:center;justify-content:center;"
+            "color:#888;font-size:34px;text-align:center;}"
+            ".meta{display:flex;flex-direction:column;justify-content:center;min-width:0;}"
+            ".title{font-size:72px;font-weight:700;line-height:1.1;"
+            "text-shadow:0 3px 8px rgba(0,0,0,.65);word-break:break-word;}"
+            ".artist{font-size:40px;opacity:.85;margin-top:14px;"
+            "text-shadow:0 3px 8px rgba(0,0,0,.65);word-break:break-word;}"
+            "</style></head><body>"
+            "<div id='card' class='card'>"
+            "<div id='art' class='art noart'>(no images)</div>"
+            "<div class='meta'><div id='title' class='title'></div>"
+            "<div id='artist' class='artist'></div></div></div>"
+            "<script>"
+            "var last=null;"
+            "function esc(s){var d=document.createElement('div');d.textContent=s||'';"
+            "return d.innerHTML;}"
+            "function apply(d){"
+            "var card=document.getElementById('card');"
+            "if(!d||!(d.title||d.artist)){card.classList.remove('show');return;}"
+            "var key=(d.title||'')+'\\u0001'+(d.artist||'')+'\\u0001'+(d.art?'1':'0');"
+            "if(key===last){return;}last=key;"
+            "document.getElementById('title').textContent=d.title||'';"
+            "document.getElementById('artist').textContent=d.artist||'';"
+            "var art=document.getElementById('art');"
+            "if(d.art){art.className='art';art.innerHTML=\"<img src='\"+d.art+"
+            "\"' style='width:100%;height:100%;object-fit:cover'>\";}"
+            "else{art.className='art noart';art.textContent='(no images)';}"
+            "card.classList.add('show');}"
+            "function poll(){"
+            "fetch('nowplaying.json?_='+Date.now()).then(function(r){return r.json();})"
+            ".then(apply).catch(function(){});}"
+            "setInterval(poll,1000);poll();"
+            "</script></body></html>"
+        )
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(page)
+        except Exception:
+            pass
 
     def _rpc_now_playing(self, path, title):
         """Push the current song to Discord (no-op if RPC isn't installed)."""

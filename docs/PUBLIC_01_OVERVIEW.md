@@ -37,7 +37,7 @@ Two non-obvious rules the engine implements: `#LNOBJ`-marked lane notes are sile
 The engine holds a module-global library root (`set_library_root`). It serves two purposes: `assert_safe_output` raises if a render would write *into* the library (renders must never modify the library), and because renders run in separate processes, each job re-establishes the root from its job tuple. Any new render job must do the same.
 
 ## Persistence
-All under the program directory: `bms_cache.db` (SQLite metadata cache), `bms_config.json`, `tables.json`, and `Playlists/` (one JSON file per playlist). Config keys include `library`, `output`, `render_threads`, `lib_col_widths`, `window_geometry_qt`, `dark_mode`, `art_viewer_scaling`, `art_viewer_geometry`, and `table_sort`.
+All under the program directory: `bms_cache.db` (SQLite metadata cache), `bms_config.json`, `tables.json`, and `Playlists/` (one JSON file per playlist). Config keys include `library`, `output`, `render_threads`, `lib_col_widths`, `window_geometry_qt`, `dark_mode`, `art_viewer_scaling`, `art_viewer_geometry`, `table_sort`, and `nowplaying_txt`.
 
 ## Conventions
 The engine stays Qt-free and audio-device-free. Render job functions stay picklable and top-level. UI uses native Qt icons (`QStyle.SP_*`), not emoji. Encode/quality options are designed so that unchanged settings reproduce the exact prior output — when adding an option, preserve this.
