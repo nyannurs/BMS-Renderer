@@ -55,6 +55,7 @@ First library scan is slow; after that it's cached and fast.
   first, so scanning or rendering can never modify, overwrite, or delete anything
   in your collection.
 - **Completely optional Discord RPC** — don't want it? delete `discord_rpc.py` and don't worry about it!
+- **Output a self-updating "Now Playing" file for OBS** — in bms_config.json, you can specify "nowplaying_output" as true/false, and "nowplaying_format" as txt or html. txt is just the song title and artist, while html displays automatically selected album art.
 
 ## BMS library folder structure ##
 
