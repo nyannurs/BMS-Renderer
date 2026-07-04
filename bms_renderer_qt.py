@@ -104,6 +104,25 @@ _APP_ICON = None
 _BLACK_COVER = None
 
 
+def _safe_output_stem(title):
+    """Turn a song title into a safe output-file stem (no extension).
+
+    Replaces characters Windows forbids in filenames, and — importantly —
+    strips a trailing BMS chart extension. Charts with no #TITLE fall back to
+    their filename (e.g. 'song.bms'), so without this the exported file would
+    be named 'song.bms.mkv' / 'song.bms.flac', which Windows Explorer shows as
+    'song.bms' when 'hide known extensions' is on — looking like the render
+    produced a .bms file. The render is fine; only the name was misleading.
+    """
+    safe = "".join("_" if c in '<>:"/\\|?*' else c for c in (title or "")).strip()
+    if not safe:
+        return "untitled"
+    stem, ext = os.path.splitext(safe)
+    if ext.lower() in bms_core.BMS_EXTS and stem:
+        safe = stem
+    return safe
+
+
 def _black_cover_bytes():
     """JPEG bytes for a 1000x1000 black square (cached). A clean 'no real art' cover
     without writing any file — same as the Tk app's helper."""
@@ -514,7 +533,7 @@ class RenderWorker(QThread):
         jobs = {}
         for row, it in enumerate(self.items):
             title = it["tags"].get("Title", "untitled")
-            safe = "".join("_" if c in '<>:"/\\|?*' else c for c in title).strip() or "untitled"
+            safe = _safe_output_stem(title)
             jobs[(it["path"], os.path.join(self.out_dir, safe + ext))] = (row, it)
         total = len(jobs); done = 0
         self.log.emit(f"Rendering {total} song(s) with {self.workers} worker process(es)…")
@@ -633,7 +652,7 @@ class BGAWorker(QThread):
             info = detect_bga(it["path"])
             if info["type"] in ("sequence", "static"):
                 title = it["tags"].get("Title", "untitled")
-                safe = "".join("_" if c in '<>:"/\\|?*' else c for c in title).strip() or "untitled"
+                safe = _safe_output_stem(title)
                 out_path = os.path.join(self.out_dir, safe + ".mp4")
                 jobs.append((it["path"], out_path, ff, bms_core._LIBRARY_ROOT,
                              fps, size, self.encode_opts))
@@ -659,7 +678,11 @@ class BGAWorker(QThread):
                 except Exception as e:
                     self.log.emit(f"  [{done}/{total}] worker crashed: {e}")
                     self.item_done.emit(done); continue
-                self.log.emit(f"  [{done}/{total}] {'FAILED: '+title if err else 'done -> '+out_path}")
+                if err:
+                    reason = err.strip().splitlines()[-1] if err.strip() else "unknown error"
+                    self.log.emit(f"  [{done}/{total}] FAILED: {title} — {reason}")
+                else:
+                    self.log.emit(f"  [{done}/{total}] done -> {out_path}")
                 self.item_done.emit(done)
         finally:
             if self._abort:

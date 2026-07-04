@@ -1692,7 +1692,32 @@ def render_bga_video_job(job):
             # source pixels, so bicubic edge ringing can't create a black halo.
             return Image.BICUBIC if up else Image.BOX
 
-        cache = {}                      # img_path -> scaled RGB Image (base use)
+        # All the per-image / per-frame caches below are byte-bounded LRUs. An
+        # unbounded dict here grew to multiple GB on long charts (thousands of
+        # distinct BGA images/frames), exhausting RAM in parallel playlist renders
+        # and yielding 0-byte output. Sequential playback only touches a small
+        # working set at a time, so an LRU keeps the speedup while capping memory.
+        from collections import OrderedDict
+        class _LRUBytes:
+            def __init__(self, cap):
+                self.cap = cap; self.od = OrderedDict(); self.n = 0
+            def get(self, k):
+                v = self.od.get(k)
+                if v is not None:
+                    self.od.move_to_end(k)
+                    return v[0]
+                return None
+            def put(self, k, val, nbytes):
+                if k in self.od:
+                    self.n -= self.od[k][1]
+                self.od[k] = (val, nbytes); self.n += nbytes
+                self.od.move_to_end(k)
+                while self.n > self.cap and len(self.od) > 1:
+                    _k, (_v, _b) = self.od.popitem(last=False); self.n -= _b
+                return val
+        _px = max(1, W * H)
+
+        cache = _LRUBytes(96 * 1024 * 1024)   # img_path -> scaled RGB Image (base)
         def _scaled(img_path):
             """Load an image scaled to fit the frame, centered on black. Cached.
             Used for the BASE layer. If the image has an alpha channel it is composited
@@ -1700,8 +1725,9 @@ def render_bga_video_job(job):
             text on a transparent background) must show as its content over black, not
             have its hidden RGB flattened to fill the whole frame (which turned such
             frames solid white)."""
-            if img_path in cache:
-                return cache[img_path]
+            hit = cache.get(img_path)
+            if hit is not None:
+                return hit
             canvas = black.copy()
             if img_path is not None:
                 try:
@@ -1721,10 +1747,9 @@ def render_bga_video_job(job):
                         canvas.paste(im, pos)
                 except Exception:
                     pass
-            cache[img_path] = canvas
-            return canvas
+            return cache.put(img_path, canvas, _px * 3)
 
-        lcache = {}                     # img_path -> scaled RGBA Image (overlay use)
+        lcache = _LRUBytes(160 * 1024 * 1024)  # img_path -> scaled RGBA (overlay)
         def _scaled_rgba(img_path):
             """Load the OVERLAY (channel 07) image as RGBA for compositing over the
             base, matching how beatoraja renders a layer BMP:
@@ -1752,8 +1777,9 @@ def render_bga_video_job(job):
             The mask is built at SOURCE resolution then scaled together with the RGB,
             so edges anti-alias cleanly (no dark halo) without dimming interior pixels.
             """
-            if img_path in lcache:
-                return lcache[img_path]
+            hit = lcache.get(img_path)
+            if hit is not None:
+                return hit
             canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
             if img_path is not None:
                 try:
@@ -1792,33 +1818,35 @@ def render_bga_video_job(job):
                     canvas.paste(im, ((W - im.width) // 2, (H - im.height) // 2), im)
                 except Exception:
                     pass
-            lcache[img_path] = canvas
-            return canvas
+            return lcache.put(img_path, canvas, _px * 4)
 
-        rgba_base_cache = {}            # base_path -> base as an RGBA PIL image
+        rgba_base_cache = _LRUBytes(96 * 1024 * 1024)   # base_path -> base RGBA
         def _base_rgba_img(base_path):
-            if base_path not in rgba_base_cache:
-                rgba_base_cache[base_path] = _scaled(base_path).convert("RGBA")
-            return rgba_base_cache[base_path]
+            hit = rgba_base_cache.get(base_path)
+            if hit is not None:
+                return hit
+            return rgba_base_cache.put(base_path, _scaled(base_path).convert("RGBA"),
+                                       _px * 4)
 
-        frame_cache = {}                # (base_path, layer_path) -> raw RGB bytes
+        # Cache composited frames so a BGA image held across many output frames is
+        # composited ONCE, not per output frame — the dominant speedup. Byte-bounded
+        # (see _LRUBytes) so long charts with thousands of distinct frames can't
+        # exhaust RAM (which produced 0-byte output before).
+        frame_cache = _LRUBytes(160 * 1024 * 1024)   # (base,layer) -> raw RGB bytes
         def frame_for(base_path, layer_path):
             key = (base_path, layer_path)
-            if key in frame_cache:
-                return frame_cache[key]
+            hit = frame_cache.get(key)
+            if hit is not None:
+                return hit
             if layer_path is None:
                 raw = _scaled(base_path).tobytes()
             else:
                 # Alpha-composite the overlay (channel 07) over the base. PIL's
                 # alpha_composite is C-optimised (faster than a numpy float blend).
-                # The base RGBA image is cached per base so it isn't re-converted for
-                # every overlay paired with it. Overlay alpha is proportional to
-                # brightness (see _scaled_rgba) so edges blend instead of haloing.
                 comp = _base_rgba_img(base_path).copy()
                 comp.alpha_composite(_scaled_rgba(layer_path))
                 raw = comp.convert("RGB").tobytes()
-            frame_cache[key] = raw
-            return raw
+            return frame_cache.put(key, raw, len(raw))
 
         # 4) per-output-frame lookup for BOTH layers: show the last event whose time
         #    <= t. Prepend a blank (None) at t=0 so nothing shows before the first
@@ -1843,29 +1871,31 @@ def render_bga_video_job(job):
         if upscale_to is not None:
             sw, sh = upscale_to
             scale_args = ["-vf", f"scale={sw}:{sh}:flags=lanczos"]
-        cmd = [ff, "-y", "-loglevel", "error",
-               "-f", "rawvideo", "-pixel_format", "rgb24",
-               "-video_size", f"{W}x{H}", "-framerate", str(fps), "-i", "pipe:0",
-               "-i", tmp_wav] + scale_args + enc_args + [real_out]
         out_path = real_out          # report the actual file we wrote
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                **_no_window_kwargs())
-        # CRITICAL: drain ffmpeg's stdout/stderr on background threads while we feed
-        # frames to stdin. If we don't, ffmpeg's stderr pipe fills, ffmpeg blocks,
-        # it stops reading stdin, and our writes block too — a deadlock (0-byte file).
+
         import threading as _th
-        captured = {"err": b"", "out": b""}
-        def _drain(stream, key):
-            try:
-                captured[key] = stream.read()
-            except Exception:
-                pass
-        t_err = _th.Thread(target=_drain, args=(proc.stderr, "err"), daemon=True)
-        t_out = _th.Thread(target=_drain, args=(proc.stdout, "out"), daemon=True)
-        t_err.start(); t_out.start()
-        ei = 0; li = 0
-        try:
+        def _run_encode(enc):
+            """Feed every frame through one ffmpeg encode pass.
+            Returns (returncode, stderr_text). Frames come from the shared caches,
+            so a retry with a different codec reuses already-composited frames."""
+            cmd = [ff, "-y", "-loglevel", "error",
+                   "-f", "rawvideo", "-pixel_format", "rgb24",
+                   "-video_size", f"{W}x{H}", "-framerate", str(fps), "-i", "pipe:0",
+                   "-i", tmp_wav] + scale_args + enc + [real_out]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    **_no_window_kwargs())
+            # CRITICAL: drain ffmpeg's stdout/stderr on background threads while we
+            # feed frames to stdin. Otherwise ffmpeg's stderr pipe fills, ffmpeg
+            # blocks, stops reading stdin, and our writes block too — a deadlock.
+            cap = {"err": b"", "out": b""}
+            def _drain(stream, key):
+                try: cap[key] = stream.read()
+                except Exception: pass
+            te = _th.Thread(target=_drain, args=(proc.stderr, "err"), daemon=True)
+            to = _th.Thread(target=_drain, args=(proc.stdout, "out"), daemon=True)
+            te.start(); to.start()
+            ei = li = 0
             try:
                 for fno in range(total_frames):
                     t = fno / fps
@@ -1881,16 +1911,44 @@ def render_bga_video_job(job):
             except OSError:
                 pass
             proc.wait()
-            t_err.join(timeout=5); t_out.join(timeout=5)
-            if proc.returncode != 0:
-                msg = captured["err"].decode("utf-8", "replace")[-300:]
-                raise RuntimeError("ffmpeg failed: " + msg)
+            te.join(timeout=5); to.join(timeout=5)
+            return proc.returncode, cap["err"].decode("utf-8", "replace")
+
+        try:
+            rc, err_txt = _run_encode(enc_args)
+            # A hardware (NVENC) encoder can fail to OPEN — no NVIDIA GPU, an old
+            # driver, or the consumer-GPU concurrent-session cap being exceeded by a
+            # parallel playlist — which yields a 0-byte file. Retry ONCE on the CPU
+            # equivalent so the chart still renders (slower, but a real file).
+            vcodec = (_opts or {}).get("video", "default")
+            if rc != 0 and isinstance(vcodec, str) and vcodec.endswith("_nvenc"):
+                cpu_opts = dict(_opts)
+                cpu_opts["video"] = {"hevc_nvenc": "hevc",
+                                     "x264_nvenc": "x264"}.get(vcodec, "x264")
+                cpu_args, _ = _bga_encode_args(cpu_opts, out_path)
+                rc2, err_txt2 = _run_encode(cpu_args)
+                if rc2 == 0:
+                    rc, err_txt = 0, ""
+                else:
+                    err_txt = ("NVENC failed AND CPU fallback failed.\n"
+                               "  NVENC: " + err_txt.strip()[-200:] +
+                               "\n  CPU:   " + err_txt2.strip()[-200:])
+            if rc != 0:
+                raise RuntimeError("ffmpeg failed: " + err_txt.strip()[-300:])
         finally:
             if os.path.exists(tmp_wav):
                 try: os.remove(tmp_wav)
                 except OSError: pass
         return (out_path, title, None)
     except Exception:
+        # A failed encode can leave a 0-byte output file (ffmpeg opens the file,
+        # then errors before writing a frame). Remove it so a failure leaves NO
+        # file rather than a broken one the user tries to open in a player.
+        try:
+            if os.path.exists(out_path) and os.path.getsize(out_path) == 0:
+                os.remove(out_path)
+        except OSError:
+            pass
         return (out_path, title, traceback.format_exc())
 
 

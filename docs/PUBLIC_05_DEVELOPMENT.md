@@ -5,6 +5,14 @@
 - Run the engine tests: `python3 -m unittest test_bms_core`
 - Smoke-test the GUI without a display (e.g. in CI): `QT_QPA_PLATFORM=offscreen python3 -c "import bms_renderer_qt as M; from PyQt5.QtWidgets import QApplication; app=QApplication([]); M.MainWindow()"`
 
+## Building a standalone Windows executable
+The app can be packaged into a self-contained `.exe` with PyInstaller, so end users need no Python or pip. The build kit (`bms_renderer.spec`, `build_windows.bat`, `requirements-build.txt`, `rthook_ffmpeg.py`, and a `vendor/` folder for `icon.ico` and an optional bundled `ffmpeg.exe`) drives this. Notes for maintainers:
+- PyInstaller does not cross-compile: the Windows `.exe` must be built on Windows. The packaging logic itself is platform-independent.
+- `program_dir()` already resolves next to the executable when frozen, so the config, cache, and playlists live beside the `.exe` (a portable app) — do not change it to use `__file__`, which points into a temporary unpack directory under a one-file build.
+- The engine finds ffmpeg via `shutil.which("ffmpeg")`. A runtime hook (`rthook_ffmpeg.py`) optionally puts a bundled `ffmpeg.exe` at the front of `PATH`, but only after verifying it is a real 64-bit executable; otherwise it is ignored and the user's own PATH ffmpeg is used. Only `ffmpeg` is needed — `ffprobe` is never called by the app.
+- Prefer the one-folder build for a bundled ffmpeg: a one-file build unpacks the (large) ffmpeg to `%TEMP%` on every launch, which antivirus can interfere with. Bundle a full GPL ffmpeg build if hardware (NVENC) encoding is required.
+- The multiprocessing entry point already calls the freeze-support initialiser first, and the pools use spawn, so worker processes package correctly.
+
 ## Dependencies
 Required: PyQt5, numpy, soundfile, mutagen. In-app playback additionally needs sounddevice. Optional: scipy (higher-quality resampling), pypresence (Discord Rich Presence), Pillow/PyMuPDF (cover-art handling). `ffmpeg`/`ffprobe` must be on PATH for OGG/MP3/FLAC encoding and all BGA video.
 
@@ -29,6 +37,8 @@ The app uses the Fusion style application-wide and switches themes by swapping t
 
 ## Performance
 The target library is very large (on the order of 126,000 charts). Anything that touches scanning, list population, or per-row work should be written to scale to that size — for example, the now-playing marker tracks only the marked rows rather than iterating the whole list.
+
+The BGA video renderer's per-image and per-frame caches are memory-bounded (LRU under a byte cap) rather than unbounded: a long chart can reference around a thousand distinct BGA frames, and caching every one as raw pixels would exhaust memory during parallel renders. Keep them bounded when modifying that path.
 
 ## Process pool
 The offline render job functions must remain top-level and picklable, and each must re-establish the library root in its worker process and call the output-safety guard. The entry point initialises multiprocessing support before constructing the window. The pools use the **spawn** start method (not fork): on Linux, forking duplicates the Qt/X11 application state into workers and causes segfaults on teardown. Because spawn re-imports the main module, all executable startup code stays under the `if __name__ == "__main__"` guard. Aborting a render terminates the worker processes immediately rather than letting in-flight jobs run to completion.

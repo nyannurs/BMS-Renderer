@@ -18,6 +18,8 @@ a `Playlists` folder.
 
 ## Usage
 
+1. Download the executable from the Releases page and place `BMS Renderer.exe` inside of its own folder and run it. If you use the executable binary, you can skip all of the steps below. Your antivirus might throw you a warning. If you have a problem with this, feel free to use the included Python scripts by following the steps below.
+
 1. Install Python from <https://www.python.org/downloads/> (tick **"Add
    python.exe to PATH"**).
 2. Install `ffmpeg` (don't forget to **add it to PATH**).
@@ -25,7 +27,8 @@ a `Playlists` folder.
    ```
    pip install PyQt5 soundfile numpy mutagen Pillow scipy sounddevice pypresence
    ```
-4. Run `bms_renderer_qt.py` (double-click it, or `python bms_renderer_qt.py`).
+4. Make sure all of the files are in their own folder, i.e. `BMS Renderer`
+5. Run `bms_renderer_qt.py` (double-click it, or `python bms_renderer_qt.py`).
 
 First library scan is slow; after that it's cached and fast.
 
@@ -83,4 +86,4 @@ Windows and macOS users can skip this — `pip install sounddevice` includes Por
 
 ## Documentation ##
 
-Just like everything in this project, the included "docs" folder is generated entirely by Claude. Also it could be missing small details.
+Just like everything in this project, the included "docs" folder is generated entirely by Claude, so it could be inaccurate or missing details.

@@ -18,7 +18,9 @@ On shutdown, a handler closes the window (which performs the real cleanup), term
 All are `QThread` subclasses that run at low priority and emit signals back to the GUI:
 - `ScanWorker` — runs the library scan.
 - `RenderWorker` — offline audio render; builds job tuples and runs them in a process pool; resolves cover art per item.
-- `BGAWorker` — offline BGA video render; filters to charts with a renderable image BGA and reports a corrected total once filtering is done.
+- `BGAWorker` — offline BGA video render; filters to charts with a renderable image BGA and reports a corrected total once filtering is done. A failed item logs the actual ffmpeg error rather than a bare "failed".
+
+Output files (audio and BGA) are named from the song's title, with characters illegal in filenames replaced and a trailing chart extension stripped — so an untitled chart, whose title falls back to its filename, produces `song.mkv` rather than `song.bms.mkv` (which Windows would display as `song.bms` with extensions hidden).
 - `PlayWorker` — renders one chart to a buffer for in-app playback.
 - `ThumbWorker` — loads grid thumbnails.
 - A BGA-detection worker — runs `detect_bga` off the GUI thread for the right-panel indicator.
