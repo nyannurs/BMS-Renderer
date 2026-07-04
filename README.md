@@ -18,7 +18,9 @@ a `Playlists` folder.
 
 ## Usage
 
-1. Download the executable from the Releases page and place `BMS Renderer.exe` inside of its own folder and run it. If you use the executable binary, you can skip all of the steps below. Your antivirus might throw you a warning. If you have a problem with this, feel free to use the included Python scripts by following the steps below.
+Download the executable from the Releases page and place `BMS Renderer.exe` inside of its own folder and run it. If you use the executable binary, you can skip all of the steps below. Your antivirus might throw you a warning. If you have a problem with this, feel free to use the included Python scripts by following the steps below.
+
+## Using the Python scripts
 
 1. Install Python from <https://www.python.org/downloads/> (tick **"Add
    python.exe to PATH"**).
