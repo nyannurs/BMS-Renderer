@@ -2,7 +2,7 @@
 
 Developer documentation for contributors. Start here, then read `PUBLIC_02_ENGINE`, `PUBLIC_03_GUI`, `PUBLIC_04_PLAYER_DISCORD_CONTRACTS`, and `PUBLIC_05_DEVELOPMENT`.
 
-**Version:** 2.0.0 (`APP_VERSION` in `bms_core.py`). Entry point: `python bms_renderer_qt.py`.
+**Version:** defined by `APP_VERSION` in `bms_core.py` (single source of truth). Entry point: `python bms_renderer_qt.py`.
 
 ## What it does
 BMS Renderer manages a large library of BMS charts. Each song lives in its own folder with one or more chart files plus the keysound audio and background-animation (BGA) images it references. The app scans the library into a SQLite cache, lets you browse/search/preview charts, plays a chart in-app by rendering it to audio on the fly, renders charts offline to tagged FLAC/WAV/OGG/MP3, and optionally renders the BGA image sequence to an MP4/MKV video with the audio muxed in.
@@ -37,7 +37,7 @@ Two non-obvious rules the engine implements: `#LNOBJ`-marked lane notes are sile
 The engine holds a module-global library root (`set_library_root`). It serves two purposes: `assert_safe_output` raises if a render would write *into* the library (renders must never modify the library), and because renders run in separate processes, each job re-establishes the root from its job tuple. Any new render job must do the same.
 
 ## Persistence
-All under the program directory: `bms_cache.db` (SQLite metadata cache), `bms_config.json`, `tables.json`, and `Playlists/` (one JSON file per playlist). Config keys include `library`, `output`, `render_threads`, `lib_col_widths`, `window_geometry_qt`, `dark_mode`, `art_viewer_scaling`, `art_viewer_geometry`, `table_sort`, and `nowplaying_txt`.
+All under the program directory: `bms_cache.db` (SQLite metadata cache), `bms_config.json`, `tables.json`, and `Playlists/` (one JSON file per playlist). Config keys include `library`, `output`, `render_threads`, `lib_col_widths`, `window_geometry_qt`, `dark_mode`, `art_viewer_scaling`, `art_viewer_geometry`, `table_sort`, `nowplaying_output`, `nowplaying_format`, and `song_visualizer`.
 
 ## Conventions
 The engine stays Qt-free and audio-device-free. Render job functions stay picklable and top-level. UI uses native Qt icons (`QStyle.SP_*`), not emoji. Encode/quality options are designed so that unchanged settings reproduce the exact prior output — when adding an option, preserve this.

@@ -10,7 +10,7 @@ The module exposes `SD_OK` (whether `sounddevice` imported) and `SD_IMPORT_ERROR
 
 ## `discord_rpc.py` — optional Rich Presence
 
-Self-contained and optional: if the module or its `pypresence` dependency is unavailable, every hook becomes a no-op and the app runs normally. The configuration block at the top of the file holds a Discord **Application ID** (which is public and safe to commit) and the large-image asset key and tooltip. Never commit a client secret or bot token — Rich Presence needs neither. The presence class connects, sets a now-playing or paused state, clears, and closes; the app drives it from the play, pause, stop, and close events. It is sent as a "Listening" activity and carries no timestamp of its own. Note that Discord itself displays an elapsed timer on the card that counts from when the activity was received; this is client-side behaviour and is not controlled by, or removable from, the app.
+Self-contained and optional: if the module or its `pypresence` dependency is unavailable, every hook becomes a no-op and the app runs normally. The configuration block at the top of the file holds a Discord **Application ID** (which is public and safe to commit) and the large-image asset key and tooltip. Never commit a client secret or bot token — Rich Presence needs neither. The presence class connects, sets a now-playing or paused state, clears, and closes; the app drives it from the play, pause, stop, and close events. It is sent as a "Listening" activity and carries no timestamp of its own. Note that Discord itself displays an elapsed timer on the card that counts from when the activity was received; this is client-side behaviour and is not controlled by, or removable from, the app. A configurable button (label and URL, e.g. a link to the project's GitHub) is attached to the card and opens the URL when clicked. Note a Discord quirk: you do not see your own activity buttons on your own profile, but everyone else does.
 
 ---
 
@@ -38,4 +38,4 @@ Exact shapes that cross module and process boundaries.
 
 **Process priority** is one of High / Above Normal / Normal / Below Normal / Low.
 
-**Config keys:** `library`, `output`, `render_threads`, `lib_col_widths`, `window_geometry_qt`, `dark_mode`, `art_viewer_scaling`, `art_viewer_geometry`, `table_sort`, `nowplaying_txt`.
+**Config keys:** `library`, `output`, `render_threads`, `lib_col_widths`, `window_geometry_qt`, `dark_mode`, `art_viewer_scaling`, `art_viewer_geometry`, `table_sort`, `nowplaying_output`, `nowplaying_format`, `song_visualizer`.

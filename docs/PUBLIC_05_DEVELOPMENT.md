@@ -1,17 +1,9 @@
 # Development Notes
 
-## Building and running
+## Running
 - Run the app: `python bms_renderer_qt.py`
 - Run the engine tests: `python3 -m unittest test_bms_core`
 - Smoke-test the GUI without a display (e.g. in CI): `QT_QPA_PLATFORM=offscreen python3 -c "import bms_renderer_qt as M; from PyQt5.QtWidgets import QApplication; app=QApplication([]); M.MainWindow()"`
-
-## Building a standalone Windows executable
-The app can be packaged into a self-contained `.exe` with PyInstaller, so end users need no Python or pip. The build kit (`bms_renderer.spec`, `build_windows.bat`, `requirements-build.txt`, `rthook_ffmpeg.py`, and a `vendor/` folder for `icon.ico` and an optional bundled `ffmpeg.exe`) drives this. Notes for maintainers:
-- PyInstaller does not cross-compile: the Windows `.exe` must be built on Windows. The packaging logic itself is platform-independent.
-- `program_dir()` already resolves next to the executable when frozen, so the config, cache, and playlists live beside the `.exe` (a portable app) — do not change it to use `__file__`, which points into a temporary unpack directory under a one-file build.
-- The engine finds ffmpeg via `shutil.which("ffmpeg")`. A runtime hook (`rthook_ffmpeg.py`) optionally puts a bundled `ffmpeg.exe` at the front of `PATH`, but only after verifying it is a real 64-bit executable; otherwise it is ignored and the user's own PATH ffmpeg is used. Only `ffmpeg` is needed — `ffprobe` is never called by the app.
-- Prefer the one-folder build for a bundled ffmpeg: a one-file build unpacks the (large) ffmpeg to `%TEMP%` on every launch, which antivirus can interfere with. Bundle a full GPL ffmpeg build if hardware (NVENC) encoding is required.
-- The multiprocessing entry point already calls the freeze-support initialiser first, and the pools use spawn, so worker processes package correctly.
 
 ## Dependencies
 Required: PyQt5, numpy, soundfile, mutagen. In-app playback additionally needs sounddevice. Optional: scipy (higher-quality resampling), pypresence (Discord Rich Presence), Pillow/PyMuPDF (cover-art handling). `ffmpeg`/`ffprobe` must be on PATH for OGG/MP3/FLAC encoding and all BGA video.

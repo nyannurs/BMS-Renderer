@@ -2,7 +2,7 @@
 
 ![Screenshot](https://i.imgur.com/DiekJzp.png)
 
-This program is built by exclusively iterating with Claude. It's fully vibe coded.
+## This program is built by exclusively iterating with Claude. It's fully vibe coded.
 
 BMS Renderer turns a BMS library into a tagged music collection. It scans your
 charts, lets you browse and play them like a music player, and renders them to
@@ -59,8 +59,9 @@ First library scan is slow; after that it's cached and fast.
   output folder you choose, and every write is checked against your source path
   first, so scanning or rendering can never modify, overwrite, or delete anything
   in your collection.
-- **Completely optional Discord RPC** — don't want it? delete `discord_rpc.py` and don't worry about it!
+- **Completely optional Discord RPC** — don't want it? delete `discord_rpc.py` and don't worry about it! NOTE: the RPC module is enabled by default in the executable distributed on the Releases page.
 - **Output a self-updating "Now Playing" file for OBS** — in bms_config.json, you can specify "nowplaying_output" as true/false, and "nowplaying_format" as txt or html. txt is just the song title and artist, while html displays automatically selected album art.
+- **Music visualization choices** — in bms_config.json, you can specify "song_visualizer" as waveform or moodbar.
 
 ## BMS library folder structure ##
 

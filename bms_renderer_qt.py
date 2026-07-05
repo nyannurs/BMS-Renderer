@@ -385,6 +385,89 @@ class MarqueeList(QListWidget):
         it.setText(rolled + rest)
 
 
+def _draw_playhead_caret(p, x, w, h):
+    """Draw a high-visibility playhead marker at column x: a downward triangle capping
+    the top, an upward triangle capping the bottom, and a vertical line joining their
+    tips. Drawn in white with a thin dark outline so it stands out over any waveform
+    colour or moodbar hue. Shared by WaveformBar and MoodbarBar for a consistent look."""
+    from PyQt5.QtGui import QColor, QPen, QPolygonF, QBrush
+    from PyQt5.QtCore import QPointF, Qt as _Qt
+    x = int(max(0, min(w, x)))
+    tw = 4          # half-width of the triangle caps
+    th = 5          # height of each triangle
+    # connecting line: dark halo under a white core so it reads on light AND dark areas
+    p.setPen(QPen(QColor(0, 0, 0, 160), 3)); p.drawLine(x, 0, x, h)
+    p.setPen(QPen(QColor(255, 255, 255), 1)); p.drawLine(x, 0, x, h)
+    p.setRenderHint(p.Antialiasing, True)
+    p.setPen(QPen(QColor(0, 0, 0, 200), 1))
+    p.setBrush(QBrush(QColor(255, 255, 255)))
+    # top cap: downward-pointing triangle (flat edge along the top)
+    top = QPolygonF([QPointF(x - tw, 0), QPointF(x + tw, 0), QPointF(x, th)])
+    # bottom cap: upward-pointing triangle (flat edge along the bottom)
+    bot = QPolygonF([QPointF(x - tw, h), QPointF(x + tw, h), QPointF(x, h - th)])
+    p.drawPolygon(top); p.drawPolygon(bot)
+
+
+class MoodbarBar(QWidget):
+    """Moodbar-style seekbar: each vertical column is a colour derived from the audio's
+    spectral content at that point in time (bass→red, mids→green, treble→blue), so the
+    whole track reads as a colour signature. Played portion is full-opacity; the
+    upcoming portion is dimmed. Same seek/scrub interface as WaveformBar (click/drag →
+    `seek` fraction, `set_pos` moves the playhead), so it's a drop-in replacement.
+    Inspired by the moodbar project (github.com/exaile/moodbar)."""
+    seek = pyqtSignal(float)             # 0..1 fraction
+    LINE = "#1a1a1a"
+
+    def __init__(self):
+        super().__init__()
+        self._cols = []                  # list of (r,g,b) 0..255 per column
+        self._pos = 0.0
+        self.setMinimumWidth(200); self.setFixedHeight(30)
+
+    def set_colors(self, cols):
+        self._cols = cols or []; self._pos = 0.0; self.update()
+
+    def clear(self):
+        """Blank the bar immediately (e.g. on song change, before the new moodbar is
+        ready) so the previous song's colours don't linger."""
+        self._cols = []; self._pos = 0.0; self.update()
+
+    # alias so callers can treat waveform/moodbar uniformly if desired
+    def set_envelope(self, _env):
+        pass
+
+    def set_pos(self, frac):
+        self._pos = max(0.0, min(1.0, frac)); self.update()
+
+    def _frac(self, x):
+        return max(0.0, min(1.0, x / max(1, self.width())))
+
+    def mousePressEvent(self, e):
+        self.seek.emit(self._frac(e.x()))
+
+    def mouseMoveEvent(self, e):
+        self.seek.emit(self._frac(e.x()))
+
+    def paintEvent(self, _):
+        from PyQt5.QtGui import QPainter, QColor
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        cols = self._cols
+        if not cols:
+            return
+        n = len(cols)
+        played_x = self._pos * w
+        # draw one thin rectangle per pixel column, sampling the colour list
+        for x in range(w):
+            r, g, b = cols[min(n - 1, x * n // max(1, w))]
+            # dim the not-yet-played portion so the playhead is readable
+            if x > played_x:
+                r, g, b = r * 55 // 100, g * 55 // 100, b * 55 // 100
+            p.setPen(QColor(r, g, b))
+            p.drawLine(x, 0, x, h)
+        _draw_playhead_caret(p, played_x, w, h)
+
+
 class WaveformBar(QWidget):
     """Filled amplitude-envelope seekbar: grey base, blue up to the playhead.
     Click/drag to seek. Mirrors the Tk app's _draw_wave (not bars — a filled graph)."""
@@ -396,10 +479,15 @@ class WaveformBar(QWidget):
         super().__init__()
         self._env = []                   # 0..1 amplitude buckets
         self._pos = 0.0                  # 0..1 playhead
-        self.setMinimumWidth(200); self.setFixedHeight(34)
+        self.setMinimumWidth(200); self.setFixedHeight(30)
 
     def set_envelope(self, env):
         self._env = env or []; self._pos = 0.0; self.update()
+
+    def clear(self):
+        """Blank the bar immediately (e.g. on song change, before the new waveform is
+        ready) so the previous song's envelope doesn't linger."""
+        self._env = []; self._pos = 0.0; self.update()
 
     def set_pos(self, frac):
         self._pos = max(0.0, min(1.0, frac)); self.update()
@@ -438,7 +526,7 @@ class WaveformBar(QWidget):
         fill(0, w, self.GREY)
         if played_x > 0:
             fill(0, played_x, self.BLUE)
-        p.setPen(QColor(self.LINE)); p.drawLine(int(played_x), 0, int(played_x), h)
+        _draw_playhead_caret(p, played_x, w, h)
 
 
 class VolumeTriangle(QWidget):
@@ -627,7 +715,8 @@ class BGAWorker(QThread):
     log = pyqtSignal(str)
     done = pyqtSignal()
     total_known = pyqtSignal(int)       # emitted once the skip-filter decides the count
-    item_done = pyqtSignal(int)         # emitted as each BGA finishes
+    item_done = pyqtSignal(int)         # emitted as each BGA finishes (1..total counter)
+    item_rendered = pyqtSignal(str)     # path of a chart that rendered OK (for removal)
 
     def __init__(self, items, out_dir, workers, encode_opts=None, priority="Normal"):
         super().__init__()
@@ -655,7 +744,7 @@ class BGAWorker(QThread):
                 safe = _safe_output_stem(title)
                 out_path = os.path.join(self.out_dir, safe + ".mp4")
                 jobs.append((it["path"], out_path, ff, bms_core._LIBRARY_ROOT,
-                             fps, size, self.encode_opts))
+                             fps, size, self.encode_opts, self.workers))
             else:
                 skipped += 1
         if not jobs:
@@ -673,6 +762,7 @@ class BGAWorker(QThread):
                 if self._abort:
                     break
                 done += 1
+                src_path = futs[fut][0]          # job tuple starts with the chart path
                 try:
                     out_path, title, err = fut.result()
                 except Exception as e:
@@ -683,6 +773,7 @@ class BGAWorker(QThread):
                     self.log.emit(f"  [{done}/{total}] FAILED: {title} — {reason}")
                 else:
                     self.log.emit(f"  [{done}/{total}] done -> {out_path}")
+                    self.item_rendered.emit(src_path)   # remove this one from the queue
                 self.item_done.emit(done)
         finally:
             if self._abort:
@@ -1392,7 +1483,7 @@ class MainWindow(QMainWindow):
 
         self.log(f"BMS Renderer v{APP_VERSION} (Qt) ready.")
         self._warn_missing_deps()
-        self._ensure_nowplaying_config()
+        self._ensure_config_defaults()
         # reopen the last library automatically, like the Tk app
         saved = load_config().get("library")
         if saved and os.path.isdir(saved):
@@ -1512,6 +1603,7 @@ class MainWindow(QMainWindow):
             app.setPalette(QPalette(self._default_palette))
         self._repolish_all(app)
         self._refresh_logo_for_theme()
+        self._refresh_media_icons()
 
     def _repolish_all(self, app):
         # Re-polish every widget so it picks up the NEW app palette. Critically we do
@@ -1553,6 +1645,26 @@ class MainWindow(QMainWindow):
         img.invertPixels(QImage.InvertRgb)     # leaves the alpha channel untouched
         from PyQt5.QtGui import QPixmap as _QPixmap
         return _QPixmap.fromImage(img)
+
+    def _themed_media_icon(self, sp):
+        """Build a transport icon from a Qt standard icon, inverting its (dark) glyph to
+        white on dark themes so it stays visible. Same invert path as the logo."""
+        from PyQt5.QtGui import QIcon
+        base = self.style().standardIcon(sp)
+        if not self._is_dark_theme():
+            return base
+        pm = base.pixmap(16, 16)
+        return QIcon(self._invert_pixmap(pm))
+
+    def _refresh_media_icons(self):
+        """(Re)apply themed icons to the transport buttons — called at build and on every
+        theme switch. Play/pause is delegated to _update_play_icon so its state is kept."""
+        from PyQt5.QtWidgets import QStyle
+        if hasattr(self, "prev_btn"):
+            self.prev_btn.setIcon(self._themed_media_icon(QStyle.SP_MediaSkipBackward))
+            self.stop_btn.setIcon(self._themed_media_icon(QStyle.SP_MediaStop))
+            self.next_btn.setIcon(self._themed_media_icon(QStyle.SP_MediaSkipForward))
+            self._update_play_icon()   # sets play/pause with the right themed glyph
 
     def _build_tabs(self):
         # order: Library, Discovery, Tables, Custom Playlists, Queue
@@ -1750,8 +1862,8 @@ class MainWindow(QMainWindow):
         if s:
             self._start_song(s["path"], s.get("title", "?"), "library", -1)
 
-    def _play_song(self, s):
-        self._start_song(s["path"], s.get("title", "?"), kind="library", index=-1)
+    def _play_song(self, s, kind="library"):
+        self._start_song(s["path"], s.get("title", "?"), kind=kind, index=-1)
 
     # ---- playback ----
     def _fmt_time(self, sec):
@@ -1762,6 +1874,12 @@ class MainWindow(QMainWindow):
             self.log("Playback unavailable — PortAudio/sounddevice isn't loaded. "
                      "See the startup warning for how to install it."); return
         self.player.stop()
+        # blank the visualizer immediately so the PREVIOUS song's waveform/moodbar
+        # doesn't linger while the new one renders (both bars expose clear()).
+        if hasattr(self, "wave"):
+            self.wave.clear()
+        if hasattr(self, "time_lbl"):
+            self.time_lbl.setText("0:00 / 0:00"); self.time_lbl.setVisible(True)
         self._now_path = path
         self._play_gen = getattr(self, "_play_gen", 0) + 1   # invalidate older renders
         gen = self._play_gen
@@ -1769,6 +1887,10 @@ class MainWindow(QMainWindow):
         self._mark_now_row()
         if hasattr(self, "now_lbl"):
             self.now_lbl.setSong(title)
+        if hasattr(self, "now_src_lbl"):
+            src = {"library": "Library", "queue": "Queue", "playlist": "Custom Playlist",
+                   "table": "Tables", "discovery": "Discovery"}.get(kind, "")
+            self.now_src_lbl.setText(f"Playing from: {src}" if src else "")
         self._rpc_now_playing(path, title)
         s = getattr(self, "_path_index", {}).get(path, {})
         self._write_nowplaying(title or (s.get("title", "") if s else ""),
@@ -1933,7 +2055,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.player.load(audio)
-        self._build_wave_envelope(audio)
+        if getattr(self, "_visualizer_kind", "waveform") == "moodbar":
+            self._build_moodbar(audio)
+        else:
+            self._build_wave_envelope(audio)
         if hasattr(self, "vol"):
             self.player.set_volume(self.vol.level())
         self.player.play()
@@ -1953,6 +2078,48 @@ class MainWindow(QMainWindow):
             self.wave.set_envelope((env / peak).tolist())
         except Exception:
             self.wave.set_envelope([])
+
+    def _build_moodbar(self, audio):
+        """Compute a moodbar: split the track into ~600 time columns and colour each by
+        its spectral content — low frequencies → red, mids → green, highs → blue (the
+        classic moodbar mapping). Uses a windowed rFFT per column on the mono mix. Falls
+        back to an empty bar on any error so playback is never affected."""
+        try:
+            import numpy as np
+            a = np.asarray(audio, dtype=np.float32)
+            mono = a.mean(axis=1) if a.ndim > 1 else a
+            ncols = 600
+            N = len(mono)
+            if N < ncols:
+                self.wave.set_colors([]); return
+            colw = N // ncols
+            SR = 44100
+            # band edges (Hz): bass < 250, mid 250–2000, treble > 2000
+            cols = []
+            # precompute frequency bins for the column FFT length
+            freqs = np.fft.rfftfreq(colw, d=1.0 / SR)
+            lo = freqs < 250
+            mid = (freqs >= 250) & (freqs < 2000)
+            hi = freqs >= 2000
+            for i in range(ncols):
+                seg = mono[i * colw:(i + 1) * colw]
+                spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+                r = float(spec[lo].sum()); g = float(spec[mid].sum()); b = float(spec[hi].sum())
+                tot = r + g + b
+                if tot <= 1e-9:
+                    cols.append((20, 20, 20)); continue
+                # normalise to hue, then scale brightness by this column's loudness
+                r, g, b = r / tot, g / tot, b / tot
+                loud = min(1.0, float(np.sqrt((seg ** 2).mean())) * 6.0)
+                bright = 60 + int(195 * loud)      # floor so quiet parts still show colour
+                mx = max(r, g, b) or 1.0
+                cols.append((int(r / mx * bright), int(g / mx * bright), int(b / mx * bright)))
+            self.wave.set_colors(cols)
+        except Exception:
+            try:
+                self.wave.set_colors([])
+            except Exception:
+                pass
 
     def _on_wave_seek(self, frac):
         if self.player is not None and self.player.duration_seconds() > 0:
@@ -1993,8 +2160,12 @@ class MainWindow(QMainWindow):
         if self.player is None:
             return
         self.player.stop()
-        self.time_lbl.setText("0:00 / 0:00")
+        self.time_lbl.setText("0:00 / 0:00"); self.time_lbl.setVisible(False)
+        if hasattr(self, "wave"):
+            self.wave.clear()
         self._update_play_icon()
+        if hasattr(self, "now_src_lbl"):
+            self.now_src_lbl.setText("")
         self._write_nowplaying("", "", "")       # clear the OBS now-playing file
         if self._rpc is not None:
             try:
@@ -2006,20 +2177,22 @@ class MainWindow(QMainWindow):
         s = getattr(self, "_path_index", {}).get(getattr(self, "_now_path", None), {})
         return s.get("title", "") if s else ""
 
-    def _ensure_nowplaying_config(self):
-        """Auto-propagate the now-playing config keys into the user's config the first
-        time this build runs, so a power user who updates sees them appear (with safe
-        defaults) ready to edit — no GUI toggle, no manual key creation. Only writes if
-        a key is actually missing, so it never clobbers an existing choice."""
+    def _ensure_config_defaults(self):
+        """Auto-propagate power-user config keys into the user's config the first time
+        this build runs, so they appear (with safe defaults) ready to edit — no GUI
+        toggle, no manual key creation. Only writes a key that's actually missing, so it
+        never clobbers an existing choice."""
         try:
             cfg = load_config()
+            defaults = {
+                "nowplaying_output": False,     # OBS now-playing file off by default
+                "nowplaying_format": "txt",     # "txt" or "html"
+                "song_visualizer": "waveform",  # "waveform" or "moodbar"
+            }
             changed = False
-            if "nowplaying_output" not in cfg:
-                cfg["nowplaying_output"] = False        # off by default
-                changed = True
-            if "nowplaying_format" not in cfg:
-                cfg["nowplaying_format"] = "txt"     # "txt" or "html"
-                changed = True
+            for k, v in defaults.items():
+                if k not in cfg:
+                    cfg[k] = v; changed = True
             if changed:
                 save_config(cfg)
         except Exception:
@@ -2218,9 +2391,8 @@ class MainWindow(QMainWindow):
 
     def _update_play_icon(self):
         from PyQt5.QtWidgets import QStyle
-        st = self.style()
         playing = self.player is not None and self.player.state == "playing"
-        self.play_btn.setIcon(st.standardIcon(
+        self.play_btn.setIcon(self._themed_media_icon(
             QStyle.SP_MediaPause if playing else QStyle.SP_MediaPlay))
 
     def closeEvent(self, e):
@@ -2403,7 +2575,7 @@ class MainWindow(QMainWindow):
         if self._rmb_down():
             return
         s = self._disc_song(item)
-        if s: self._play_song(s)
+        if s: self._play_song(s, kind="discovery")
 
     def _disc_context_menu(self, pos):
         item = self.disc_list.itemAt(pos)
@@ -2606,7 +2778,7 @@ class MainWindow(QMainWindow):
         if self._rmb_down():
             return
         s = getattr(self, "_path_index", {}).get(item.data(Qt.UserRole))
-        if s: self._play_song(s)
+        if s: self._play_song(s, kind="table")
 
     def _toggle_pl_album(self):
         if self.pl_album.isChecked():
@@ -2621,7 +2793,7 @@ class MainWindow(QMainWindow):
         if self._rmb_down():
             return
         s = getattr(self, "_path_index", {}).get(item.data(Qt.UserRole))
-        if s: self._play_song(s)
+        if s: self._play_song(s, kind="playlist")
 
     def _lib_context_menu(self, pos):
         item = self.ltable.itemAt(pos)
@@ -3440,7 +3612,7 @@ class MainWindow(QMainWindow):
         if chosen == act_rm:
             self._pl_remove()
         elif sel and chosen == act_play:
-            self._play_song(sel[0])
+            self._play_song(sel[0], kind="playlist")
         elif sel and chosen == act_queue:
             self._enqueue_songs(sel)
         elif sel and chosen == send_new:
@@ -3820,11 +3992,11 @@ class MainWindow(QMainWindow):
         from PyQt5.QtWidgets import QStyle
         bar = QHBoxLayout()
         st = self.style()
-        # native standard media icons (no emoji glyphs)
-        self.prev_btn = QPushButton(); self.prev_btn.setIcon(st.standardIcon(QStyle.SP_MediaSkipBackward))
-        self.play_btn = QPushButton(); self.play_btn.setIcon(st.standardIcon(QStyle.SP_MediaPlay))
-        self.stop_btn = QPushButton(); self.stop_btn.setIcon(st.standardIcon(QStyle.SP_MediaStop))
-        self.next_btn = QPushButton(); self.next_btn.setIcon(st.standardIcon(QStyle.SP_MediaSkipForward))
+        # native standard media icons (no emoji glyphs), inverted to white on dark themes
+        self.prev_btn = QPushButton(); self.prev_btn.setIcon(self._themed_media_icon(QStyle.SP_MediaSkipBackward))
+        self.play_btn = QPushButton(); self.play_btn.setIcon(self._themed_media_icon(QStyle.SP_MediaPlay))
+        self.stop_btn = QPushButton(); self.stop_btn.setIcon(self._themed_media_icon(QStyle.SP_MediaStop))
+        self.next_btn = QPushButton(); self.next_btn.setIcon(self._themed_media_icon(QStyle.SP_MediaSkipForward))
         for b in (self.prev_btn, self.play_btn, self.stop_btn, self.next_btn):
             b.setFixedWidth(36); b.setObjectName("iconBtn"); bar.addWidget(b)
         self.dev_btn = QPushButton("Audio device")
@@ -3833,11 +4005,28 @@ class MainWindow(QMainWindow):
         # now-playing marquee (between the device button and the time). Clicking it
         # loads the playing song into the right info panel, like selecting it in a list.
         # The hand cursor only appears once a song is playing (managed in setSong).
+        # A small "Playing from: <source>" line sits beneath the title.
+        now_box = QVBoxLayout(); now_box.setContentsMargins(0, 0, 0, 0); now_box.setSpacing(0)
         self.now_lbl = MarqueeLabel(); self.now_lbl.setFixedWidth(180)
         self.now_lbl.clicked.connect(self._on_now_label_clicked)
-        bar.addWidget(self.now_lbl)
-        self.time_lbl = QLabel("0:00 / 0:00"); bar.addWidget(self.time_lbl)
-        self.wave = WaveformBar(); self.wave.seek.connect(self._on_wave_seek)
+        self.now_src_lbl = QLabel(""); self.now_src_lbl.setFixedWidth(180)
+        self.now_src_lbl.setObjectName("mutedLabel")
+        f = self.now_src_lbl.font(); f.setPointSize(max(1, f.pointSize() - 1))
+        self.now_src_lbl.setFont(f)
+        now_box.addWidget(self.now_lbl); now_box.addWidget(self.now_src_lbl)
+        bar.addLayout(now_box)
+        self.time_lbl = QLabel("0:00 / 0:00"); self.time_lbl.setVisible(False)
+        bar.addWidget(self.time_lbl)
+        # song-scrubbing visualizer: "waveform" (default) or "moodbar", chosen via the
+        # config key `song_visualizer` (no GUI toggle). Both share the same seek/scrub
+        # interface, so the rest of the transport wiring is identical.
+        self._visualizer_kind = (load_config().get("song_visualizer", "waveform")
+                                 or "waveform").lower()
+        if self._visualizer_kind == "moodbar":
+            self.wave = MoodbarBar()
+        else:
+            self.wave = WaveformBar()
+        self.wave.seek.connect(self._on_wave_seek)
         bar.addWidget(self.wave, 1)
         self.vol = VolumeTriangle(); self.vol.changed.connect(self._on_volume)
         bar.addWidget(self.vol)
@@ -4041,11 +4230,23 @@ class MainWindow(QMainWindow):
         self._bga_worker.log.connect(self.log)
         self._bga_worker.total_known.connect(prog.set_total)
         self._bga_worker.item_done.connect(prog.set_value)
+        self._bga_worker.item_rendered.connect(self._on_bga_item_rendered)
         self._bga_worker.done.connect(prog.finish)
         prog.aborted.connect(self._bga_worker.abort)
         self._bga_worker.done.connect(lambda: self.q_bga_btn.setEnabled(True))
         self._bga_worker.start()
         prog.exec_()
+
+    def _on_bga_item_rendered(self, path):
+        """Remove a chart from the queue once its BGA has rendered. Matches by PATH,
+        not row index: BGA jobs finish out of order (parallel `as_completed`) and
+        video/no-BGA charts are skipped entirely, so a positional counter would remove
+        the wrong rows. Removing by identity is order-independent and correct."""
+        for i, it in enumerate(self.queue):
+            if it.get("path") == path:
+                self.queue.pop(i)
+                break
+        self._refresh_queue()
 
 
 def main():

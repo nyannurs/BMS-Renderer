@@ -33,11 +33,17 @@ import os
 import time
 
 # ---------------------------------------------------------------------------
-# CONFIG — edit these three values.
+# CONFIG — edit these values.
 # ---------------------------------------------------------------------------
 CLIENT_ID = "1515472010329850027"   # <-- paste your Discord Application ID
 LARGE_IMAGE_KEY = "bms_logo"                  # Art Asset key, or "" for no image
 LARGE_IMAGE_TEXT = "BMS Renderer"             # tooltip when hovering the large image
+# Button shown on the presence card (opens a URL when clicked). Set BUTTON_URL="" to
+# disable. NOTE: Discord does NOT show your own activity buttons to YOU — the streamer
+# won't see the button on their own profile, but everyone else does, and clicking it
+# works. This is confirmed working on the "Listening" activity this app uses.
+BUTTON_LABEL = "GitHub"
+BUTTON_URL = "https://github.com/nyannurs/BMS-Renderer"
 # ---------------------------------------------------------------------------
 
 try:
@@ -137,6 +143,11 @@ class RichPresence:
             },
             # deliberately NO "timestamps" key -> Discord shows no elapsed timer
         }
+        if BUTTON_URL:
+            # up to 2 buttons allowed; each {label, url}. Works on the Listening card;
+            # Discord just doesn't render your OWN buttons to you (others see them).
+            activity["buttons"] = [{"label": BUTTON_LABEL or "Open",
+                                    "url": BUTTON_URL}]
         override = {
             "cmd": "SET_ACTIVITY",
             "args": {"pid": os.getpid(), "activity": activity},
@@ -155,12 +166,16 @@ class RichPresence:
                         details=details, state=state,
                         large_image=LARGE_IMAGE_KEY or None,
                         large_text=LARGE_IMAGE_TEXT or None,
+                        buttons=([{"label": BUTTON_LABEL or "Open", "url": BUTTON_URL}]
+                                 if BUTTON_URL else None),
                     )
                 except TypeError:
                     self._rpc.update(
                         details=details, state=state,
                         large_image=LARGE_IMAGE_KEY or None,
                         large_text=LARGE_IMAGE_TEXT or None,
+                        buttons=([{"label": BUTTON_LABEL or "Open", "url": BUTTON_URL}]
+                                 if BUTTON_URL else None),
                     )
             self.last_error = ""
         except Exception as e:
