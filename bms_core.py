@@ -192,7 +192,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.3.1"
 CHANGELOG = []
 
 # ============================================================================
@@ -256,6 +256,14 @@ def read_bms_text(path):
         except UnicodeDecodeError:
             continue
     return data.decode("latin-1", errors="replace")
+
+# Pre-compiled patterns for the per-line parse loop (runs across every line of every
+# chart during a library scan — 126k+ charts). Python memoises compiled patterns
+# internally, but hoisting the hot ones is explicit and avoids the lookup entirely.
+_RE_CHANNEL = re.compile(r"(\d{3})([0-9A-Za-z]{2}):(.*)")
+_RE_INDEXED = re.compile(r"(WAV|BPM|STOP)([0-9A-Za-z]{2})\s+(.+)", re.IGNORECASE)
+_RE_HEADER  = re.compile(r"([A-Za-z]+)\s+(.+)")
+
 
 def parse_bms(path):
     """Parse a BMS chart. Returns a dict with:
@@ -415,7 +423,7 @@ def parse_bms(path):
             continue
 
         # channel data: mmmCC:payload  (mmm=measure base-10, CC=channel base-36)
-        m = re.match(r"(\d{3})([0-9A-Za-z]{2}):(.*)", body)
+        m = _RE_CHANNEL.match(body)
         if m:
             measure = int(m.group(1))
             chan = m.group(2).upper()
@@ -424,7 +432,7 @@ def parse_bms(path):
             continue
 
         # indexed header arrays: WAVxx / BPMxx / STOPxx
-        m = re.match(r"(WAV|BPM|STOP)([0-9A-Za-z]{2})\s+(.+)", body, re.IGNORECASE)
+        m = _RE_INDEXED.match(body)
         if m:
             kind = m.group(1).upper()
             idx = b36(m.group(2).upper())
@@ -440,7 +448,7 @@ def parse_bms(path):
             continue
 
         # generic header: KEY value
-        m = re.match(r"([A-Za-z]+)\s+(.+)", body)
+        m = _RE_HEADER.match(body)
         if m:
             key = m.group(1).upper()
             val = m.group(2).strip()

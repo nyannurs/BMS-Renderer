@@ -93,5 +93,5 @@ Just like everything in this project, the included "docs" folder is generated en
 
 ## License ##
 
-BMS Renderer is licensed under the GNU General Public License v3.0 (see LICENSE).
+BMS Renderer is licensed under the GNU General Public License v3.0 (see `LICENSE`).
 Binary releases bundle FFmpeg (the gyan.dev "full" build, GPLv3) for audio and video encoding. FFmpeg is called as a separate executable and is unmodified. Its source and license are available at https://ffmpeg.org and https://www.gyan.dev/ffmpeg/builds/. FFmpeg is a trademark of Fabrice Bellard; BMS Renderer is not affiliated with the FFmpeg project.

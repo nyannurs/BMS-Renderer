@@ -32,7 +32,7 @@ except ImportError:
 import bms_core
 from bms_core import (
     APP_VERSION, ffmpeg_path, render_one_job, load_config, save_config,
-    set_library_root, parse_bms, render_bga_video_job, detect_bga, pick_playable_chart,
+    set_library_root, render_bga_video_job, detect_bga, pick_playable_chart,
     render_bms, SR, fetch_table, load_tables_file, save_tables_file, TABLES_PATH,
     load_playlists, save_one_playlist, delete_playlist_file, program_dir,
     pick_discovery_art,
@@ -391,7 +391,7 @@ def _draw_playhead_caret(p, x, w, h):
     tips. Drawn in white with a thin dark outline so it stands out over any waveform
     colour or moodbar hue. Shared by WaveformBar and MoodbarBar for a consistent look."""
     from PyQt5.QtGui import QColor, QPen, QPolygonF, QBrush
-    from PyQt5.QtCore import QPointF, Qt as _Qt
+    from PyQt5.QtCore import QPointF
     x = int(max(0, min(w, x)))
     tw = 4          # half-width of the triangle caps
     th = 5          # height of each triangle
@@ -422,15 +422,37 @@ class MoodbarBar(QWidget):
         super().__init__()
         self._cols = []                  # list of (r,g,b) 0..255 per column
         self._pos = 0.0
+        self._bright = None              # QPixmap: full-brightness bar (1px tall)
+        self._dim = None                 # QPixmap: dimmed bar (upcoming portion)
         self.setMinimumWidth(200); self.setFixedHeight(30)
 
+    def _build_pixmaps(self):
+        """Pre-render the colour strip once (bright + dimmed) as 1px-tall pixmaps at the
+        colour-list resolution. paintEvent then just scales/blits these — turning an
+        O(width) Python loop every repaint into two C++ blits. Rebuilt only when the
+        colour data changes, not per playhead tick."""
+        from PyQt5.QtGui import QPixmap, QImage
+        n = len(self._cols)
+        if n == 0:
+            self._bright = self._dim = None; return
+        imgB = QImage(n, 1, QImage.Format_RGB32)
+        imgD = QImage(n, 1, QImage.Format_RGB32)
+        for i, (r, g, b) in enumerate(self._cols):
+            imgB.setPixel(i, 0, (0xFF << 24) | (r << 16) | (g << 8) | b)
+            dr, dg, db = r * 55 // 100, g * 55 // 100, b * 55 // 100
+            imgD.setPixel(i, 0, (0xFF << 24) | (dr << 16) | (dg << 8) | db)
+        self._bright = QPixmap.fromImage(imgB)
+        self._dim = QPixmap.fromImage(imgD)
+
     def set_colors(self, cols):
-        self._cols = cols or []; self._pos = 0.0; self.update()
+        self._cols = cols or []; self._pos = 0.0
+        self._build_pixmaps(); self.update()
 
     def clear(self):
         """Blank the bar immediately (e.g. on song change, before the new moodbar is
         ready) so the previous song's colours don't linger."""
-        self._cols = []; self._pos = 0.0; self.update()
+        self._cols = []; self._pos = 0.0
+        self._bright = self._dim = None; self.update()
 
     # alias so callers can treat waveform/moodbar uniformly if desired
     def set_envelope(self, _env):
@@ -449,23 +471,21 @@ class MoodbarBar(QWidget):
         self.seek.emit(self._frac(e.x()))
 
     def paintEvent(self, _):
-        from PyQt5.QtGui import QPainter, QColor
+        from PyQt5.QtGui import QPainter
+        from PyQt5.QtCore import QRect
+        if self._bright is None:
+            return
         p = QPainter(self)
         w, h = self.width(), self.height()
-        cols = self._cols
-        if not cols:
-            return
-        n = len(cols)
-        played_x = self._pos * w
-        # draw one thin rectangle per pixel column, sampling the colour list
-        for x in range(w):
-            r, g, b = cols[min(n - 1, x * n // max(1, w))]
-            # dim the not-yet-played portion so the playhead is readable
-            if x > played_x:
-                r, g, b = r * 55 // 100, g * 55 // 100, b * 55 // 100
-            p.setPen(QColor(r, g, b))
-            p.drawLine(x, 0, x, h)
-        _draw_playhead_caret(p, played_x, w, h)
+        played = int(self._pos * w)
+        # dimmed strip across the whole width, then the bright strip only up to the
+        # playhead — each is a single scaled blit of a pre-built 1px-tall pixmap.
+        p.drawPixmap(QRect(0, 0, w, h), self._dim)
+        if played > 0:
+            p.drawPixmap(QRect(0, 0, played, h), self._bright,
+                         QRect(0, 0, max(1, played * self._bright.width() // max(1, w)),
+                               1))
+        _draw_playhead_caret(p, played, w, h)
 
 
 class WaveformBar(QWidget):
@@ -4066,24 +4086,6 @@ class MainWindow(QMainWindow):
             cfg = load_config(); cfg["output"] = d; save_config(cfg)
 
     # ---- Queue actions ----
-    def q_add_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Add BMS charts", self.lib_edit.text() or "",
-            "BMS charts (*.bms *.bme *.bml *.pms)")
-        for p in paths:
-            try:
-                h = parse_bms(p)["header"]
-                tags = {"Title": h.get("TITLE", os.path.basename(p)),
-                        "Artist": h.get("ARTIST", ""), "Genre": h.get("GENRE", ""),
-                        "BPM": h.get("BPM", "")}
-                mode = "7K" if not p.lower().endswith(".pms") else "PMS"
-            except Exception:
-                tags, mode = {"Title": os.path.basename(p)}, "?"
-            self.queue.append({"path": p, "tags": tags, "mode": mode, "notes": ""})
-        if self.queue and bms_core._LIBRARY_ROOT is None:
-            set_library_root(os.path.dirname(self.queue[0]["path"]))
-        self._refresh_queue()
-
     def q_remove(self):
         rows = sorted({self.qtable.indexOfTopLevelItem(i)
                        for i in self.qtable.selectedItems()}, reverse=True)
