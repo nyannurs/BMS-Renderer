@@ -597,6 +597,56 @@ class VolumeTriangle(QWidget):
         tri(self._level * w, self.BLUE)
 
 
+def _version_tuple(v):
+    """Parse a version string like 'v2.3.8' or '2.3.10' into a comparable tuple of ints.
+    Strips a leading 'v' and any pre-release suffix; non-numeric parts become 0 so a
+    malformed tag can never crash the comparison."""
+    v = (v or "").strip().lstrip("vV")
+    # keep only the leading dotted-number part (drop '-beta', '+build', etc.)
+    import re as _re
+    m = _re.match(r"\d+(?:\.\d+)*", v)
+    if not m:
+        return (0,)
+    return tuple(int(x) for x in m.group(0).split("."))
+
+
+def _is_newer_version(latest, current):
+    """True if `latest` is a strictly newer version than `current`. Tuple compare with
+    zero-padding so 2.3.10 > 2.3.9 (a string compare would get that wrong)."""
+    lt, ct = _version_tuple(latest), _version_tuple(current)
+    n = max(len(lt), len(ct))
+    lt += (0,) * (n - len(lt)); ct += (0,) * (n - len(ct))
+    return lt > ct
+
+
+class UpdateChecker(QThread):
+    """Checks GitHub's Releases API for a newer version, once, in the background at
+    startup. Emits update_available(latest_tag) only if the latest release is strictly
+    newer than APP_VERSION. Entirely fail-safe: any network/parse error is swallowed and
+    NO signal is emitted, so the app behaves exactly as before when offline or
+    rate-limited. Uses the Releases API (not tags) — the method most desktop apps use,
+    since a release is a deliberate publish event and its tag_name maps to APP_VERSION."""
+    update_available = pyqtSignal(str)      # latest tag, e.g. "v2.4.0"
+
+    API_URL = "https://api.github.com/repos/nyannurs/BMS-Renderer/releases/latest"
+
+    def run(self):
+        try:
+            import json, urllib.request
+            from bms_core import APP_VERSION
+            req = urllib.request.Request(
+                self.API_URL,
+                headers={"Accept": "application/vnd.github+json",
+                         "User-Agent": "BMS-Renderer"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            tag = data.get("tag_name") or ""
+            if tag and _is_newer_version(tag, APP_VERSION):
+                self.update_available.emit(tag)
+        except Exception:
+            pass                            # offline / rate-limited / parse error → no-op
+
+
 class RenderWorker(QThread):
     log = pyqtSignal(str)
     item_done = pyqtSignal(int)
@@ -1516,6 +1566,10 @@ class MainWindow(QMainWindow):
         self.log(f"BMS Renderer v{APP_VERSION} (Qt) ready.")
         self._warn_missing_deps()
         self._ensure_config_defaults()
+        # check GitHub for a newer release in the background (fail-safe, one-shot)
+        self._update_checker = UpdateChecker()
+        self._update_checker.update_available.connect(self._on_update_available)
+        self._update_checker.start()
         # reopen the last library automatically, like the Tk app
         saved = load_config().get("library")
         if saved and os.path.isdir(saved):
@@ -1579,7 +1633,8 @@ class MainWindow(QMainWindow):
         lib_btn.setFixedWidth(160); out_btn.setFixedWidth(160)
         grid.addWidget(lib_btn, 0, 0); grid.addWidget(self.lib_edit, 0, 1)
         grid.addWidget(out_btn, 1, 0); grid.addWidget(self.out_edit, 1, 1)
-        # embedded wordmark logo, top-right (spans both rows)
+        # embedded wordmark logo, top-right (spans both rows), with a small
+        # "update available" line beneath it (hidden until an update is found)
         from PyQt5.QtGui import QPixmap
         import base64
         logo = QLabel()
@@ -1597,7 +1652,18 @@ class MainWindow(QMainWindow):
             from PyQt5.QtCore import QUrl
             QDesktopServices.openUrl(QUrl("https://github.com/nyannurs/BMS-Renderer"))
         logo.mousePressEvent = _open_repo
-        grid.addWidget(logo, 0, 2, 2, 1)
+        # "update available" caption under the logo — blue, right-aligned, click-through
+        # to the repo, hidden until UpdateChecker reports a newer release.
+        self.update_lbl = QLabel("")
+        self.update_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.update_lbl.setStyleSheet("color:#2d7dff; font-size:11px; font-weight:bold;")
+        self.update_lbl.setCursor(Qt.PointingHandCursor)
+        self.update_lbl.mousePressEvent = _open_repo
+        self.update_lbl.setVisible(False)
+        logo_box = QWidget(); lb = QVBoxLayout(logo_box)
+        lb.setContentsMargins(0, 0, 0, 0); lb.setSpacing(0)
+        lb.addWidget(logo); lb.addWidget(self.update_lbl)
+        grid.addWidget(logo_box, 0, 2, 2, 1)
         grid.setColumnStretch(1, 1)
         return grid
 
@@ -1658,6 +1724,11 @@ class MainWindow(QMainWindow):
     def _refresh_logo_for_theme(self):
         if getattr(self, "_logo_raw", None) is None or self._logo_raw.isNull():
             return
+        # if the update pulse is running, rebuild its frames for the new theme (the base
+        # logo differs light vs dark) instead of setting the static pixmap.
+        if getattr(self, "_pulse_timer", None) is not None and self._pulse_timer.isActive():
+            self._start_logo_pulse()
+            return
         shown = self._invert_pixmap(self._logo_raw) if self._is_dark_theme() \
             else self._logo_raw
         self.logo_label.setPixmap(shown.scaledToHeight(40, Qt.SmoothTransformation))
@@ -1677,6 +1748,93 @@ class MainWindow(QMainWindow):
         img.invertPixels(QImage.InvertRgb)     # leaves the alpha channel untouched
         from PyQt5.QtGui import QPixmap as _QPixmap
         return _QPixmap.fromImage(img)
+
+    def _tint_pixmap(self, pm, color, strength):
+        """Return a copy of `pm` blended toward `color` by `strength` (0..1), preserving
+        alpha. Used to pulse the logo blue when an update is available — works on either
+        the light or dark (inverted) base logo, so it's theme-correct. Vectorised with
+        numpy so building a full pulse animation (dozens of frames) is near-instant
+        rather than a per-pixel Python loop."""
+        from PyQt5.QtGui import QImage, QPixmap as _QPixmap
+        img = pm.toImage().convertToFormat(QImage.Format_ARGB32)
+        w, h = img.width(), img.height()
+        try:
+            import numpy as np
+            ptr = img.bits(); ptr.setsize(img.byteCount())
+            arr = np.frombuffer(ptr, np.uint8).reshape(h, w, 4)  # BGRA in memory
+            s = max(0.0, min(1.0, strength))
+            cr, cg, cb = color
+            rgb = arr[:, :, :3].astype(np.float32)               # B,G,R order
+            tgt = np.array([cb, cg, cr], np.float32)             # match BGR
+            blended = rgb * (1 - s) + tgt * s
+            arr[:, :, :3] = blended.astype(np.uint8)             # alpha (idx 3) untouched
+            return _QPixmap.fromImage(img.copy())
+        except Exception:
+            # numpy-less fallback: per-pixel (slow but correct)
+            cr, cg, cb = color; s = max(0.0, min(1.0, strength))
+            for y in range(h):
+                for x in range(w):
+                    px = img.pixelColor(x, y)
+                    if px.alpha() == 0:
+                        continue
+                    px.setRed(int(px.red() * (1 - s) + cr * s))
+                    px.setGreen(int(px.green() * (1 - s) + cg * s))
+                    px.setBlue(int(px.blue() * (1 - s) + cb * s))
+                    img.setPixelColor(x, y, px)
+            return _QPixmap.fromImage(img)
+
+    def _base_logo_pixmap(self):
+        """The logo as it should look for the CURRENT theme (inverted white on dark),
+        before any update-pulse tint."""
+        raw = getattr(self, "_logo_raw", None)
+        if raw is None or raw.isNull():
+            return None
+        return self._invert_pixmap(raw) if self._is_dark_theme() else raw
+
+    def _on_update_available(self, tag):
+        """An update is live on GitHub: start the blue pulse, show the caption under the
+        logo, and change the tooltip. The click action (open repo) is unchanged."""
+        self._update_tag = tag
+        self.logo_label.setToolTip(
+            f"Update available: {tag} — click to open the GitHub page")
+        if hasattr(self, "update_lbl"):
+            self.update_lbl.setText(f"update available ({tag}) ↗")
+            self.update_lbl.setVisible(True)
+        self._start_logo_pulse()
+
+    def _start_logo_pulse(self):
+        from PyQt5.QtCore import QTimer
+        import math
+        base = self._base_logo_pixmap()
+        if base is None:
+            return
+        base = base.scaledToHeight(40, Qt.SmoothTransformation)
+        # Precompute a full breathing cycle as many finely-spaced frames with a SINE ease
+        # (not linear) so the blend accelerates/decelerates smoothly instead of stepping.
+        # A raised sine over [0, 2π] gives a symmetric ease-in-out fade both directions,
+        # so it reads as a gentle breath rather than a choppy crossfade. Frames are
+        # precomputed once (per-pixel tint isn't free) then just swapped on the timer.
+        BLUE = (45, 125, 255)
+        PEAK = 0.72                         # max blend toward blue at the top of the breath
+        N = 60                              # frames per full cycle → smooth at ~60fps feel
+        self._pulse_frames = []
+        for i in range(N):
+            # (1 - cos)/2 sweeps 0→1→0 smoothly over the cycle, eased at both ends
+            phase = (1 - math.cos(2 * math.pi * i / N)) / 2
+            self._pulse_frames.append(self._tint_pixmap(base, BLUE, PEAK * phase))
+        self._pulse_i = 0
+        if getattr(self, "_pulse_timer", None) is None:
+            self._pulse_timer = QTimer(self)
+            self._pulse_timer.timeout.connect(self._pulse_step)
+        # ~33ms/frame × 60 frames ≈ a 2s breath: same speed as before, far smoother
+        self._pulse_timer.start(33)
+
+    def _pulse_step(self):
+        frames = getattr(self, "_pulse_frames", None)
+        if not frames:
+            return
+        self.logo_label.setPixmap(frames[self._pulse_i])
+        self._pulse_i = (self._pulse_i + 1) % len(frames)
 
     def _themed_media_icon(self, sp):
         """Build a transport icon from a Qt standard icon, inverting its (dark) glyph to
