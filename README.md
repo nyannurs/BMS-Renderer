@@ -27,7 +27,7 @@ Download the executable from the Releases page and place `BMS Renderer.exe` insi
 2. Install `ffmpeg` (don't forget to **add it to PATH**).
 3. Install the dependencies (you can ignore `pypresence` if you don't want Discord RPC):
    ```
-   pip install PyQt5 soundfile numpy mutagen Pillow scipy sounddevice pypresence
+   pip install PyQt5 soundfile numpy mutagen Pillow soxr sounddevice pypresence
    ```
 4. Make sure all of the files are in their own folder, i.e. `BMS Renderer`
 5. Run `bms_renderer_qt.py` (double-click it, or `python bms_renderer_qt.py`).

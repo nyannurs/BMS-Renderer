@@ -478,13 +478,16 @@ class MoodbarBar(QWidget):
         p = QPainter(self)
         w, h = self.width(), self.height()
         played = int(self._pos * w)
-        # dimmed strip across the whole width, then the bright strip only up to the
-        # playhead — each is a single scaled blit of a pre-built 1px-tall pixmap.
+        # Draw BOTH strips scaled to the FULL widget width — identical transform every
+        # frame, so no wobble. The bright strip is simply clipped to the played region.
+        # (Scaling a proportional sub-rect of the source per frame caused the playhead
+        # jitter: the source-width rounding jumped unevenly as `played` advanced.)
         p.drawPixmap(QRect(0, 0, w, h), self._dim)
         if played > 0:
-            p.drawPixmap(QRect(0, 0, played, h), self._bright,
-                         QRect(0, 0, max(1, played * self._bright.width() // max(1, w)),
-                               1))
+            p.save()
+            p.setClipRect(QRect(0, 0, played, h))
+            p.drawPixmap(QRect(0, 0, w, h), self._bright)
+            p.restore()
         _draw_playhead_caret(p, played, w, h)
 
 
@@ -813,6 +816,7 @@ class ScanWorker(QThread):
     cached library loads fast."""
     log = pyqtSignal(str)
     finished_songs = pyqtSignal(list)
+    progress = pyqtSignal(int, int)         # (done, total) for the loading bar
 
     def __init__(self, folder):
         super().__init__(); self.folder = folder
@@ -825,13 +829,21 @@ class ScanWorker(QThread):
             pass
         from bms_core import _migrate_old_cache, db_connect, scan_library
         t0 = time.time()
+        # Throttle progress: at 126k charts, emitting per-file would flood the signal
+        # queue. Emit at most ~200 updates (every 0.5%) plus a log line every 5000.
+        _last = [0]
+        def _prog(d, t):
+            if t and (d - _last[0] >= max(1, t // 200) or d >= t):
+                _last[0] = d
+                self.progress.emit(d, t)
+            if d and d % 5000 == 0:
+                self.log.emit(f"  …{d}/{t}")
         try:
             _migrate_old_cache()
             conn = db_connect()
             try:
                 songs, stats = scan_library(self.folder, conn, log=self.log.emit,
-                    progress=lambda d, t: self.log.emit(f"  …{d}/{t}")
-                    if d and d % 5000 == 0 else None)
+                                            progress=_prog)
             finally:
                 conn.close()
             for s in songs:
@@ -1758,10 +1770,37 @@ class MainWindow(QMainWindow):
         self._filtered = []
         return w
 
+    def _show_loading(self, on, text="Loading library…"):
+        """Swap the transport visualizer area between the waveform/moodbar (page 0) and
+        the boot loading bar (page 1). Shown during the initial library scan / cache
+        load, hidden once songs are ready. The bar starts indeterminate (the scanner is
+        still walking the tree to learn the total) and becomes a real 0–100% bar once
+        the first progress update with a known total arrives."""
+        if not hasattr(self, "_wave_stack"):
+            return
+        if on:
+            self._load_lbl.setText(text)
+            self._load_bar.setRange(0, 0)          # indeterminate until first progress
+            self._wave_stack.setCurrentIndex(1)
+        else:
+            self._wave_stack.setCurrentIndex(0)
+
+    def _on_scan_progress(self, done, total):
+        """Drive the loading bar from the scanner's real (done, total) counts."""
+        if not hasattr(self, "_load_bar") or total <= 0:
+            return
+        if self._load_bar.maximum() != total:
+            self._load_bar.setRange(0, total)      # flip from indeterminate to real
+        self._load_bar.setValue(done)
+        pct = int(done * 100 / total)
+        self._load_lbl.setText(f"Loading library… {pct}%")
+
     def _start_scan(self, folder):
         self.log(f"Scanning library: {folder}")
+        self._show_loading(True, "Loading library…")
         self._scan = ScanWorker(folder)
         self._scan.log.connect(self.log)
+        self._scan.progress.connect(self._on_scan_progress)
         self._scan.finished_songs.connect(self._scan_done)
         self._scan.start()
 
@@ -1779,6 +1818,7 @@ class MainWindow(QMainWindow):
         self._load_playlists()
         # populate Discovery now that we have songs (cheap; thumbnails load lazily)
         self._discovery_reset()
+        self._show_loading(False)          # scan finished — reveal the visualizer
 
     def _apply_lib_filter(self):
         q = self.lib_search.text().lower().strip()
@@ -1888,6 +1928,74 @@ class MainWindow(QMainWindow):
     # ---- playback ----
     def _fmt_time(self, sec):
         sec = int(sec); return f"{sec//60}:{sec%60:02d}"
+
+    def _next_path_for_prefetch(self):
+        """Return the path of the track that a +1 advance WOULD play next in the current
+        context, WITHOUT starting it — used to pre-render the next song while the current
+        one plays. Mirrors `_advance(+1)`'s per-context next-selection. Returns None if
+        there's no obvious next track (e.g. shuffle, end of list, or unknown context)."""
+        ctx = getattr(self, "_playing_ctx", None)
+        if not ctx:
+            return None
+        # Shuffle makes "next" non-deterministic, so there's nothing stable to prefetch.
+        if hasattr(self, "shuffle_cb") and self.shuffle_cb.isChecked():
+            return None
+        kind, index = ctx[0], ctx[1]
+        try:
+            if kind == "queue":
+                nxt = self._step_index(index, len(self.queue), +1)
+                return self.queue[nxt]["path"] if nxt is not None else None
+            if kind == "playlist":
+                tree = self.pltree; count = tree.topLevelItemCount()
+                row_song = lambda r: self._path_index.get(
+                    tree.topLevelItem(r).data(0, Qt.UserRole)) if tree.topLevelItem(r) else None
+                playable = lambda r: row_song(r) is not None
+                now = getattr(self, "_now_path", None)
+                cur = next((r for r in range(count)
+                            if tree.topLevelItem(r).data(0, Qt.UserRole) == now), index)
+                nxt = self._step_index(cur, count, +1, playable)
+                s = row_song(nxt) if nxt is not None else None
+                return s["path"] if s else None
+            if kind == "table":
+                order = getattr(self, "_tbl_play_order", [])
+                nxt = self._step_index(index, len(order), +1)
+                return order[nxt]["path"] if nxt is not None else None
+            if kind == "library":
+                order = self._filtered
+                cur = next((i for i, s in enumerate(order) if s["path"] == ctx[2]), -1)
+                nxt = self._step_index(cur, len(order), +1)
+                return order[nxt]["path"] if nxt is not None else None
+        except Exception:
+            return None
+        return None
+
+    def _prefetch_next(self):
+        """Kick off a low-priority background render of the NEXT track into `_play_cache`
+        so hitting next/auto-advancing plays it instantly (no on-click render wait). No-op
+        if there's no stable next track, it's already cached, or a prefetch is in flight."""
+        if self.player is None:
+            return
+        path = self._next_path_for_prefetch()
+        if not path or path in self._play_cache:
+            return
+        # don't stack prefetch workers; one at a time is enough to stay a step ahead
+        pw = getattr(self, "_prefetch_worker", None)
+        if pw is not None and pw.isRunning():
+            if getattr(self, "_prefetch_path", None) == path:
+                return                      # already prefetching this exact track
+            return                          # let the in-flight one finish first
+        self._prefetch_path = path
+        self._prefetch_worker = PlayWorker(path)
+        # cache-only: store the result, never begins playback (guarded by path check)
+        self._prefetch_worker.ready.connect(self._on_prefetch_ready)
+        self._prefetch_worker.failed.connect(lambda _e: None)   # silent; it's opportunistic
+        self._prefetch_worker.start()
+
+    def _on_prefetch_ready(self, audio, path):
+        """Store a prefetched render in the cache. Never starts playback."""
+        self._play_cache[path] = audio
+        if len(self._play_cache) > 12:
+            self._play_cache.pop(next(iter(self._play_cache)))
 
     def _start_song(self, path, title, kind="library", index=-1):
         if self.player is None:
@@ -2083,6 +2191,11 @@ class MainWindow(QMainWindow):
             self.player.set_volume(self.vol.level())
         self.player.play()
         self._update_play_icon()
+        # now that the current song is playing, pre-render the NEXT one in the background
+        # so hitting next / auto-advance is instant (gapless). Deferred a beat so it never
+        # competes with starting the current song.
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(400, self._prefetch_next)
 
     def _build_wave_envelope(self, audio):
         try:
@@ -4047,7 +4160,25 @@ class MainWindow(QMainWindow):
         else:
             self.wave = WaveformBar()
         self.wave.seek.connect(self._on_wave_seek)
-        bar.addWidget(self.wave, 1)
+        # During the initial library scan / cache load, the visualizer area shows a
+        # loading bar instead of the (empty) waveform. A QStackedWidget swaps between
+        # the two: page 0 = visualizer, page 1 = loading. Switched by _show_loading().
+        from PyQt5.QtWidgets import QStackedWidget, QProgressBar
+        self._wave_stack = QStackedWidget()
+        self._wave_stack.addWidget(self.wave)                 # page 0
+        load_page = QWidget(); lp = QVBoxLayout(load_page)
+        lp.setContentsMargins(0, 0, 0, 0); lp.setSpacing(1)
+        self._load_lbl = QLabel("Loading library…"); self._load_lbl.setObjectName("mutedLabel")
+        self._load_bar = QProgressBar(); self._load_bar.setTextVisible(False)
+        self._load_bar.setFixedHeight(14); self._load_bar.setRange(0, 0)   # indeterminate
+        # expand horizontally so the bar fills the whole transport width (no dead gap)
+        from PyQt5.QtWidgets import QSizePolicy
+        self._load_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        load_page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        lp.addWidget(self._load_lbl); lp.addWidget(self._load_bar)
+        self._wave_stack.addWidget(load_page)                 # page 1
+        self._wave_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        bar.addWidget(self._wave_stack, 1)
         self.vol = VolumeTriangle(); self.vol.changed.connect(self._on_volume)
         bar.addWidget(self.vol)
         self.shuffle_cb = QCheckBox("Shuffle"); self.loop_cb = QCheckBox("Loop")

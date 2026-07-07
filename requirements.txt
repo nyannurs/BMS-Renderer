@@ -2,5 +2,5 @@ soundfile
 numpy
 mutagen
 Pillow
-scipy
+soxr
 sounddevice

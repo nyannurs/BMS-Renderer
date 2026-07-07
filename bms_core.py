@@ -18,20 +18,23 @@ try:
     _PIL_OK = True
 except Exception:
     _PIL_OK = False
-_SCIPY_OK = None          # tri-state: None = not yet probed, True/False after first use
-resample_poly = None
-def _ensure_scipy():
-    """Import scipy lazily — it's a slow import and is only needed when a keysound
-    has to be resampled, not at startup. Returns True if available."""
-    global _SCIPY_OK, resample_poly
-    if _SCIPY_OK is None:
+_SOXR_OK = None           # tri-state: None = not yet probed, True/False after first use
+soxr = None
+def _ensure_resampler():
+    """Lazily probe for the soxr resampler (the SoX resampler — high quality, fast, and
+    only ~0.5 MB, bundled into the frozen build). Returns "soxr" if available, else None
+    (caller falls back to numpy linear interpolation). Probed once, on the first keysound
+    that actually needs resampling — never at startup. NOTE: soxr is the intended
+    resampler and is bundled in release builds; the linear fallback exists only for a
+    from-source run without soxr installed (it works, just without anti-aliasing)."""
+    global _SOXR_OK, soxr
+    if _SOXR_OK is None:
         try:
-            from scipy.signal import resample_poly as _rp
-            resample_poly = _rp
-            _SCIPY_OK = True
+            import soxr as _sx
+            soxr = _sx; _SOXR_OK = True
         except Exception:
-            _SCIPY_OK = False
-    return _SCIPY_OK
+            _SOXR_OK = False
+    return "soxr" if _SOXR_OK else None
 try:
     from player import Player, SD_OK as _SD_OK
 except Exception:
@@ -192,7 +195,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.3.6"
 CHANGELOG = []
 
 # ============================================================================
@@ -1049,20 +1052,15 @@ def process_cover(path, max_px=1000, max_bytes=500_000):
     return data, img.size, 50          # smallest achievable, even if still over
 
 def _resample_to_sr(audio, sr):
-    """Resample stereo float32 audio from `sr` to the output SR.
-    Uses high-quality polyphase resampling (scipy) when available — this is
-    objectively better than the linear interpolation bmx2wav uses, with far
-    less aliasing. Falls back to linear interpolation (still much better than
-    nearest-neighbor) if scipy isn't installed."""
+    """Resample stereo float32 audio from `sr` to the output SR using soxr (SoX
+    resampler — high quality, anti-aliased). Falls back to plain linear interpolation
+    (no anti-aliasing, but still fine) only if soxr isn't installed — release builds
+    always bundle soxr."""
     if sr == SR:
         return audio
-    if _ensure_scipy():
-        g = gcd(int(SR), int(sr))
-        up, down = int(SR) // g, int(sr) // g
-        # resample_poly applies an anti-aliasing FIR filter internally
-        out = resample_poly(audio, up, down, axis=0).astype(np.float32)
-        return out
-    # fallback: linear interpolation per channel
+    if _ensure_resampler() == "soxr":
+        return soxr.resample(audio, sr, SR).astype(np.float32)
+    # fallback (from-source run without soxr): linear interpolation per channel
     n_out = int(len(audio) * SR / sr)
     xp = np.arange(len(audio))
     xq = np.linspace(0, len(audio) - 1, n_out)
@@ -1226,7 +1224,12 @@ def render_bms(path, log=lambda s: None):
                 return wid, _decode_clip(ap), None
             except Exception as e:
                 return wid, None, f"{fn}: {e}"
-        workers = min(8, (os.cpu_count() or 4) * 2, len(to_decode))
+        # Decoding is I/O-bound (reading many small keysound files), not CPU-bound, so
+        # we can run more concurrent reads than cores to hide per-file disk latency —
+        # this is the dominant cost on a FIRST (cold-cache) render of a song, where the
+        # OS hasn't cached the files yet. Capped at 16 (diminishing returns past that,
+        # and it bounds open file handles). Warm renders are fast regardless.
+        workers = min(16, max(4, (os.cpu_count() or 4) * 2), len(to_decode))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for wid, clip, err in ex.map(_decode_one, to_decode):
                 if err:
@@ -1243,27 +1246,31 @@ def render_bms(path, log=lambda s: None):
         # nothing decoded successfully — return a short silence so callers don't crash
         return np.zeros((SR, 2), dtype=np.float32), header
 
-    # total length = furthest (onset + clip length)
+    # Single pass over the schedule: bucket note onsets per wav-id AND track the
+    # furthest sample any clip reaches. A chart often places the SAME keysound on both
+    # the BGM autoplay channel (01) AND a player lane at the SAME instant — in-game the
+    # player either hits the note OR it autoplays, never both, so it sounds once. A
+    # renderer has no player, so without de-duping we'd play both copies and that note
+    # would be 2x as loud. Collapsing identical (position, wav) pairs fixes that spurious
+    # doubling while leaving genuine musical layering (different sounds, or the same sound
+    # at different times) untouched.
+    onsets = {}
     last_end = 0
     for pos, wid in schedule:
         clip = clips.get(wid)
-        if clip is not None:
-            e = int(pos) + len(clip)
+        if clip is None:
+            continue
+        p = int(pos)
+        bucket = onsets.get(wid)
+        if bucket is None:
+            bucket = onsets[wid] = set()
+        if p not in bucket:
+            bucket.add(p)
+            e = p + len(clip)
             if e > last_end:
                 last_end = e
     out = np.zeros((last_end + SR, 2), dtype=np.float32)  # +1s tail
 
-    # bucket onsets per wav-id. A chart often places the SAME keysound on both the
-    # BGM autoplay channel (01) AND a player lane at the SAME instant — in-game the
-    # player either hits the note OR it autoplays, never both, so it sounds once. A
-    # renderer has no player, so without de-duping we'd play both copies and that
-    # note would be 2x as loud. Collapsing identical (position, wav) pairs fixes that
-    # spurious doubling while leaving genuine musical layering (different sounds, or
-    # the same sound at different times) untouched.
-    onsets = {}
-    for pos, wid in schedule:
-        if wid in clips:
-            onsets.setdefault(wid, set()).add(int(pos))
     for wid, positions in onsets.items():
         clip = clips[wid]; clen = len(clip)
         for s in positions:

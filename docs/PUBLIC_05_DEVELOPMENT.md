@@ -6,7 +6,7 @@
 - Smoke-test the GUI without a display (e.g. in CI): `QT_QPA_PLATFORM=offscreen python3 -c "import bms_renderer_qt as M; from PyQt5.QtWidgets import QApplication; app=QApplication([]); M.MainWindow()"`
 
 ## Dependencies
-Required: PyQt5, numpy, soundfile, mutagen. In-app playback additionally needs sounddevice. Optional: scipy (higher-quality resampling), pypresence (Discord Rich Presence), Pillow/PyMuPDF (cover-art handling). `ffmpeg`/`ffprobe` must be on PATH for OGG/MP3/FLAC encoding and all BGA video.
+Required: PyQt5, numpy, soundfile, mutagen. In-app playback additionally needs sounddevice. Optional: soxr (high-quality anti-aliased resampling — required for release-quality audio; without it resampling falls back to plain linear interpolation), pypresence (Discord Rich Presence), Pillow (cover-art handling). `ffmpeg` must be on PATH for OGG/MP3/FLAC encoding and all BGA video.
 
 ### PortAudio on Linux
 In-app playback uses PortAudio through sounddevice. On Linux, `pip install sounddevice` does not bundle PortAudio (it bundles it only on Windows and macOS), so the system library must be installed separately: `sudo apt install libportaudio2` (Debian/Ubuntu), `sudo pacman -S portaudio` (Arch), or `sudo dnf install portaudio` (Fedora). A "playback unavailable" message almost always means this library is missing, not that there is no audio device — PipeWire and PulseAudio both work through PortAudio. Offline rendering works without it; only in-app playback requires it.
