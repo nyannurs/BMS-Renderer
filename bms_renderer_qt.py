@@ -1781,8 +1781,12 @@ class MainWindow(QMainWindow):
         if on:
             self._load_lbl.setText(text)
             self._load_bar.setRange(0, 0)          # indeterminate until first progress
+            if hasattr(self, "_now_box_w"):
+                self._now_box_w.setVisible(False)  # reclaim its 180px so the bar starts flush
             self._wave_stack.setCurrentIndex(1)
         else:
+            if hasattr(self, "_now_box_w"):
+                self._now_box_w.setVisible(True)
             self._wave_stack.setCurrentIndex(0)
 
     def _on_scan_progress(self, done, total):
@@ -3654,8 +3658,12 @@ class MainWindow(QMainWindow):
         self.pl_fmt.setCurrentText(fmt)
         self.pl_threads.setValue(threads)
         self.pl_render_btn.setEnabled(False)
+        # apply the assigned "Album art (whole queue)" cover to every rendered track,
+        # exactly like the Queue render does — without this the playlist render ignored
+        # the assigned cover and each FLAC kept its own per-song art (bug).
+        cover_cfg = ("__BLACK__" if self._art_black else (self._art_path or None))
         self._pl_worker = RenderWorker(items, out_dir, fmt, threads,
-                                       quality=quality, priority=priority)
+                                       cover_cfg, quality=quality, priority=priority)
         prog = RenderProgressDialog(self, "Rendering Playlist", len(items))
         self._pl_worker.log.connect(self.log)
         self._pl_worker.item_done.connect(lambda _row: prog.step())
@@ -4147,7 +4155,11 @@ class MainWindow(QMainWindow):
         f = self.now_src_lbl.font(); f.setPointSize(max(1, f.pointSize() - 1))
         self.now_src_lbl.setFont(f)
         now_box.addWidget(self.now_lbl); now_box.addWidget(self.now_src_lbl)
-        bar.addLayout(now_box)
+        # wrapped in a container so the whole 180px now-playing block can be hidden
+        # during the initial load (nothing's playing then) — otherwise its reserved
+        # width leaves a dead gap to the left of the loading bar.
+        self._now_box_w = QWidget(); self._now_box_w.setLayout(now_box)
+        bar.addWidget(self._now_box_w)
         self.time_lbl = QLabel("0:00 / 0:00"); self.time_lbl.setVisible(False)
         bar.addWidget(self.time_lbl)
         # song-scrubbing visualizer: "waveform" (default) or "moodbar", chosen via the
