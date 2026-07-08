@@ -61,7 +61,7 @@ First library scan is slow; after that it's cached and fast.
   in your collection.
 - **Completely optional Discord RPC** — don't want it? delete `discord_rpc.py` and don't worry about it! NOTE: the RPC module is enabled by default in the executable distributed on the Releases page.
 - **Output a self-updating "Now Playing" file for OBS** — in bms_config.json, you can specify "nowplaying_output" as true/false, and "nowplaying_format" as txt or html. txt is just the song title and artist, while html displays automatically selected album art.
-- **Music visualization choices** — in bms_config.json, you can specify "song_visualizer" as waveform or moodbar.
+- **Music visualization choices** — in bms_config.json, you can specify "song_visualizer" as waveform, moodbar, or spectrogram.
 
 ## BMS library folder structure ##
 

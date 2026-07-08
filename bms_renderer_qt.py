@@ -491,6 +491,88 @@ class MoodbarBar(QWidget):
         _draw_playhead_caret(p, played, w, h)
 
 
+class SpectrogramBar(QWidget):
+    """Spectrogram-strip seekbar: a 2D freq×time heat-map. X is time, Y is frequency
+    (low at the bottom, high at the top), brightness/colour is energy — so you see the
+    song's frequency LAYERS (kick on the bottom, hats/melody higher up) rather than the
+    moodbar's single averaged colour per moment. Same seek/scrub interface as the other
+    bars (click/drag → `seek`, `set_pos` moves the playhead), so it's a drop-in. The
+    played portion is full-brightness; the upcoming portion is dimmed."""
+    seek = pyqtSignal(float)             # 0..1 fraction
+
+    def __init__(self):
+        super().__init__()
+        self._pos = 0.0
+        self._bright = None              # QPixmap: full spectrogram (ncols × H)
+        self._dim = None                 # QPixmap: dimmed copy
+        self.setMinimumWidth(200); self.setFixedHeight(30)
+
+    def set_image(self, rows):
+        """rows: a 2D list/array shaped (H, ncols) of (r,g,b) — one row per frequency
+        band (top = highest freq), one column per time slice. Pre-rendered to two
+        pixmaps (bright + dimmed) so painting is a plain scaled blit. Built from a numpy
+        buffer in one shot (not per-pixel) so it's a few ms even at 30×600."""
+        from PyQt5.QtGui import QPixmap, QImage
+        if rows is None or len(rows) == 0 or len(rows[0]) == 0:
+            self._bright = self._dim = None; self._pos = 0.0; self.update(); return
+        try:
+            import numpy as np
+            arr = np.asarray(rows, dtype=np.uint8)          # (H, n, 3) RGB
+            h, n = arr.shape[0], arr.shape[1]
+            # QImage.Format_RGB32 is BGRA in memory; build a (H,n,4) buffer
+            buf = np.empty((h, n, 4), np.uint8)
+            buf[:, :, 0] = arr[:, :, 2]                     # B
+            buf[:, :, 1] = arr[:, :, 1]                     # G
+            buf[:, :, 2] = arr[:, :, 0]                     # R
+            buf[:, :, 3] = 255
+            imgB = QImage(buf.tobytes(), n, h, QImage.Format_RGB32)
+            dim = (arr.astype(np.uint16) * 55 // 100).astype(np.uint8)
+            bufd = np.empty((h, n, 4), np.uint8)
+            bufd[:, :, 0] = dim[:, :, 2]; bufd[:, :, 1] = dim[:, :, 1]
+            bufd[:, :, 2] = dim[:, :, 0]; bufd[:, :, 3] = 255
+            imgD = QImage(bufd.tobytes(), n, h, QImage.Format_RGB32)
+            self._bright = QPixmap.fromImage(imgB.copy())
+            self._dim = QPixmap.fromImage(imgD.copy())
+            self._pos = 0.0; self.update()
+        except Exception:
+            self._bright = self._dim = None; self.update()
+
+    def clear(self):
+        self._bright = self._dim = None; self._pos = 0.0; self.update()
+
+    def set_envelope(self, _env):
+        pass
+
+    def set_pos(self, frac):
+        self._pos = max(0.0, min(1.0, frac)); self.update()
+
+    def _frac(self, x):
+        return max(0.0, min(1.0, x / max(1, self.width())))
+
+    def mousePressEvent(self, e):
+        self.seek.emit(self._frac(e.x()))
+
+    def mouseMoveEvent(self, e):
+        self.seek.emit(self._frac(e.x()))
+
+    def paintEvent(self, _):
+        from PyQt5.QtGui import QPainter
+        from PyQt5.QtCore import QRect
+        if self._bright is None:
+            return
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        played = int(self._pos * w)
+        # full spectrogram scaled to the widget, dimmed; bright copy clipped to played
+        p.drawPixmap(QRect(0, 0, w, h), self._dim)
+        if played > 0:
+            p.save()
+            p.setClipRect(QRect(0, 0, played, h))
+            p.drawPixmap(QRect(0, 0, w, h), self._bright)
+            p.restore()
+        _draw_playhead_caret(p, played, w, h)
+
+
 class WaveformBar(QWidget):
     """Filled amplitude-envelope seekbar: grey base, blue up to the playhead.
     Click/drag to seek. Mirrors the Tk app's _draw_wave (not bars — a filled graph)."""
@@ -2345,8 +2427,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.player.load(audio)
-        if getattr(self, "_visualizer_kind", "waveform") == "moodbar":
+        kind = getattr(self, "_visualizer_kind", "waveform")
+        if kind == "moodbar":
             self._build_moodbar(audio)
+        elif kind == "spectrogram":
+            self._build_spectrogram(audio)
         else:
             self._build_wave_envelope(audio)
         if hasattr(self, "vol"):
@@ -2413,6 +2498,53 @@ class MainWindow(QMainWindow):
         except Exception:
             try:
                 self.wave.set_colors([])
+            except Exception:
+                pass
+
+    def _build_spectrogram(self, audio):
+        """Compute a spectrogram strip: ~600 time columns × H frequency rows (H = the
+        bar's pixel height). Each cell's colour encodes the energy in that freq band at
+        that time. Log-spaced frequency bins (music is perceived logarithmically), and a
+        dark-blue→cyan→white 'heat' ramp so louder bands glow. Vectorised (one rFFT over
+        all columns via reshape) so it builds in a few ms. Fail-safe to an empty bar."""
+        try:
+            import numpy as np
+            a = np.asarray(audio, dtype=np.float32)
+            mono = a.mean(axis=1) if a.ndim > 1 else a
+            ncols = 600
+            H = 30                                   # match the bar height
+            N = len(mono)
+            if N < ncols * 2:
+                self.wave.set_image([]); return
+            colw = N // ncols
+            # stack columns → (ncols, colw), windowed rFFT along each
+            frames = mono[:ncols * colw].reshape(ncols, colw)
+            win = np.hanning(colw).astype(np.float32)
+            spec = np.abs(np.fft.rfft(frames * win, axis=1))     # (ncols, colw/2+1)
+            nfreq = spec.shape[1]
+            # log-spaced band edges across the frequency axis → H bands
+            edges = np.unique(np.logspace(0, np.log10(nfreq - 1), H + 1).astype(int))
+            if len(edges) < 2:
+                self.wave.set_image([]); return
+            # per-band energy: mean of |spec| within each band, for all columns at once
+            bands = np.empty((len(edges) - 1, ncols), dtype=np.float32)
+            for bi in range(len(edges) - 1):
+                lo, hi = edges[bi], max(edges[bi] + 1, edges[bi + 1])
+                bands[bi] = spec[:, lo:hi].mean(axis=1)
+            # log-compress + normalise so quiet detail is visible without blowing highs
+            bands = np.log1p(bands)
+            bands /= (bands.max() or 1.0)
+            # map energy→colour with a blue→cyan→white ramp; low freq at the BOTTOM
+            v = np.clip(bands * 1.3, 0, 1)               # (nb, ncols)
+            r = (40 + v * 200).astype(np.uint8)
+            g = (30 + v * 210).astype(np.uint8)
+            b = (60 + v * 195).astype(np.uint8)
+            img = np.stack([r, g, b], axis=2)            # (nb, ncols, 3)
+            img = img[::-1]                              # top row = highest band
+            self.wave.set_image(img)
+        except Exception:
+            try:
+                self.wave.set_image([])
             except Exception:
                 pass
 
@@ -4375,6 +4507,8 @@ class MainWindow(QMainWindow):
                                  or "waveform").lower()
         if self._visualizer_kind == "moodbar":
             self.wave = MoodbarBar()
+        elif self._visualizer_kind == "spectrogram":
+            self.wave = SpectrogramBar()
         else:
             self.wave = WaveformBar()
         self.wave.seek.connect(self._on_wave_seek)
