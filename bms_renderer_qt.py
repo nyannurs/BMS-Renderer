@@ -2431,8 +2431,56 @@ class MainWindow(QMainWindow):
             except (ValueError, TypeError):
                 pass
 
+    def _current_selected_song(self):
+        """Return (song_dict, kind) for the first selected item in whatever tab is
+        currently open, or (None, None) if nothing's selected. Lets the play button
+        start the selection from ANY tab (issue #2), not just the Library. `kind` feeds
+        the 'Playing from:' label and playback context."""
+        try:
+            idx = self.tabs.currentIndex()
+            if idx == 0:                                   # Library
+                sel = self._selected_lib_songs()
+                if sel:
+                    return sel[0], "library"
+            elif idx == 1:                                 # Discovery
+                items = self.disc_list.selectedItems()
+                if items:
+                    s = self._disc_song(items[0])
+                    if s:
+                        return s, "discovery"
+            elif idx == 2:                                 # Tables
+                sel = self._table_selected_songs()
+                if sel:
+                    return sel[0], "table"
+            elif idx == 3:                                 # Custom Playlists
+                sel = self._pl_selected_songs()
+                if sel:
+                    return sel[0], "playlist"
+            elif idx == 4:                                 # Queue
+                items = self.qtable.selectedItems()
+                if items:
+                    i = self.qtable.indexOfTopLevelItem(items[0])
+                    if 0 <= i < len(self.queue):
+                        q = self.queue[i]
+                        s = getattr(self, "_path_index", {}).get(q["path"]) or \
+                            {"path": q["path"], "title": q.get("tags", {}).get("Title", "?")}
+                        return s, "queue"
+        except Exception:
+            pass
+        return None, None
+
     def _toggle_play(self):
         if self.player is None:
+            return
+        # If nothing is loaded/playing (fresh launch or after Stop), the play button
+        # starts the currently SELECTED song in whatever tab is open — so you can click a
+        # row in any tab and press play instead of double-clicking (issue #2). Falls
+        # through to normal pause/resume toggling whenever something is already loaded.
+        state = getattr(self.player, "state", "stopped")
+        if state == "stopped":
+            s, kind = self._current_selected_song()
+            if s:
+                self._start_song(s["path"], s.get("title", "?"), kind, -1)
             return
         self.player.toggle()
         self._update_play_icon()
