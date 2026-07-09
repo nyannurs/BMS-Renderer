@@ -2,7 +2,7 @@
 
 ![Screenshot](https://i.imgur.com/o4MoblI.png)
 
-## This program is built by exclusively iterating with Claude. It's fully vibe coded.
+## This software is entirely vibe-coded.
 
 BMS Renderer turns a BMS library into a tagged music collection. It scans your
 charts, lets you browse and play them like a music player, and renders them to
