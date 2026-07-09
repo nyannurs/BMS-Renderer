@@ -1,4 +1,4 @@
-# BMS Renderer
+![Logo](https://i.imgur.com/sGdj5qY.png)
 
 ![Screenshot](https://i.imgur.com/o4MoblI.png)
 
@@ -11,10 +11,9 @@ and `#RANDOM`/`#SWITCH` charts are handled the way bmx2wav does it.
 
 ## Folder structure
 
-Keep `BMS Renderer.exe` (or `bms_renderer_qt.py`, `bms_core.py`, and `player.py`) together in one folder.
+Keep `BMS Renderer.exe` (or `bms_renderer_qt.py`, `bms_core.py`, `player.py`, and optionally `discord_rpc.py`) together in one folder.
 That folder is also where the app writes its own files: the cache
-(`bms_cache.db`), settings (`bms_config.json`), saved tables (`tables.json`), and
-a `Playlists` folder.
+(`bms_cache.db`), settings (`bms_config.json`), saved tables (`tables.json`), a `Playlists` folder, and (optionally) the files related to the self-updating "Now Playing" feature for use in OBS.
 
 ## Usage
 
