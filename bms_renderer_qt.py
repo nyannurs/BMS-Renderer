@@ -1157,8 +1157,9 @@ class BGAExportDialog(QDialog):
         "vp9":        (4, 4, 2),
     }
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, default_threads=4):
         super().__init__(parent)
+        self._default_threads = max(1, int(default_threads))
         self.setWindowTitle("Render All BGA — Export Settings")
         self.setMinimumWidth(620)
         root = QVBoxLayout(self)
@@ -1215,8 +1216,17 @@ class BGAExportDialog(QDialog):
         alay.addStretch(1)
         cols.addWidget(abox, 1)
 
-        # ---------------- priority ----------------
+        # ---------------- threads + priority ----------------
         prow = QHBoxLayout()
+        prow.addWidget(QLabel("Threads:"))
+        import os as _os
+        self.threads = QSpinBox()
+        self.threads.setRange(1, max(1, (_os.cpu_count() or 4)))
+        self.threads.setValue(self._default_threads)
+        self.threads.setToolTip("How many BGA videos to encode in parallel. Each uses a "
+                                "full ffmpeg process, so more threads = faster but heavier.")
+        prow.addWidget(self.threads)
+        prow.addSpacing(16)
         prow.addWidget(QLabel("Process priority:"))
         self.prio = QComboBox(); self.prio.addItems(self.PRIORITIES)
         self.prio.setCurrentText("Normal")
@@ -1305,7 +1315,7 @@ class BGAExportDialog(QDialog):
 
     # -- result -------------------------------------------------------------
     def options(self):
-        """Return the encode-options dict + the chosen priority string."""
+        """Return the encode-options dict, the chosen priority string, and thread count."""
         a = self._audio_key()
         opts = {
             "video": self._video_key(),
@@ -1314,7 +1324,7 @@ class BGAExportDialog(QDialog):
             "abitrate": self.a_slider.value() if a not in ("flac", "wav") else 192,
             "flac_level": self.a_slider.value() if a == "flac" else 8,
         }
-        return opts, self.prio.currentText()
+        return opts, self.prio.currentText(), self.threads.value()
 
 
 class _CodecPerfGraphic(QWidget):
@@ -1322,7 +1332,7 @@ class _CodecPerfGraphic(QWidget):
     so users get an at-a-glance feel for the trade-offs."""
     def __init__(self):
         super().__init__()
-        self.setFixedHeight(64)
+        self.setMinimumHeight(78)         # room for 3 labelled rows without clipping
         self._perf = BGAExportDialog.CODEC_PERF["default"]
 
     def set_codec(self, key):
@@ -4262,12 +4272,12 @@ class MainWindow(QMainWindow):
         items = self._pl_collect_items()
         if not items:
             self.log("No owned songs in this playlist to render."); return
-        dlg = BGAExportDialog(self)
+        dlg = BGAExportDialog(self, default_threads=self.pl_threads.value())
         if dlg.exec() != QDialog.Accepted:
             return
-        opts, priority = dlg.options()
+        opts, priority, threads = dlg.options()
         self.pl_bga_btn.setEnabled(False)
-        self._pl_bga_worker = BGAWorker(items, out_dir, self.pl_threads.value(),
+        self._pl_bga_worker = BGAWorker(items, out_dir, threads,
                                         encode_opts=opts, priority=priority)
         prog = RenderProgressDialog(self, "Rendering BGA Videos", len(items))
         self._pl_bga_worker.log.connect(self.log)
@@ -4976,12 +4986,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No output folder", "Choose an output folder first."); return
         if not ffmpeg_path():
             QMessageBox.information(self, "ffmpeg required", "BGA video export needs ffmpeg on PATH."); return
-        dlg = BGAExportDialog(self)
+        dlg = BGAExportDialog(self, default_threads=self.q_threads.value())
         if dlg.exec() != QDialog.Accepted:
             return
-        opts, priority = dlg.options()
+        opts, priority, threads = dlg.options()
         self.q_bga_btn.setEnabled(False)
-        self._bga_worker = BGAWorker(list(self.queue), out_dir, self.q_threads.value(),
+        self._bga_worker = BGAWorker(list(self.queue), out_dir, threads,
                                      encode_opts=opts, priority=priority)
         prog = RenderProgressDialog(self, "Rendering BGA Videos", len(self.queue))
         self._bga_worker.log.connect(self.log)

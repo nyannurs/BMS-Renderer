@@ -1,6 +1,6 @@
 # BMS Renderer
 
-![Screenshot](https://i.imgur.com/DiekJzp.png)
+![Screenshot](https://i.imgur.com/o4MoblI.png)
 
 ## This program is built by exclusively iterating with Claude. It's fully vibe coded.
 
@@ -11,7 +11,7 @@ and `#RANDOM`/`#SWITCH` charts are handled the way bmx2wav does it.
 
 ## Folder structure
 
-Keep `bms_renderer_qt.py`, `bms_core.py`, and `player.py` together in one folder.
+Keep `BMS Renderer.exe` (or `bms_renderer_qt.py`, `bms_core.py`, and `player.py`) together in one folder.
 That folder is also where the app writes its own files: the cache
 (`bms_cache.db`), settings (`bms_config.json`), saved tables (`tables.json`), and
 a `Playlists` folder.
@@ -27,7 +27,7 @@ Download the executable from the Releases page and place `BMS Renderer.exe` insi
 2. Install `ffmpeg` (don't forget to **add it to PATH**).
 3. Install the dependencies (you can ignore `pypresence` if you don't want Discord RPC):
    ```
-   pip install PySide6 soundfile numpy mutagen Pillow soxr sounddevice pypresence
+   pip install pyside6 soundfile numpy mutagen Pillow soxr sounddevice pypresence
    ```
 4. Make sure all of the files are in their own folder, i.e. `BMS Renderer`
 5. Run `bms_renderer_qt.py` (double-click it, or `python bms_renderer_qt.py`).
@@ -75,7 +75,6 @@ If your keyboard has media keys, they should just work. These will only work if 
 - CTRL + left arrow/right arrow: play previous/next song respectively
 - CTRL + up arrow/down arrow: increase/decrease volume respectively
 - CTRL + spacebar: pause/unpause the currently playing song
-
 
 ## Linux users ##
 
