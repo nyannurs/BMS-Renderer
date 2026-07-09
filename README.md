@@ -4,6 +4,8 @@
 
 ## This software is entirely vibe-coded.
 
+## What is BMS Renderer?
+
 BMS Renderer turns a BMS library into a tagged music collection. It scans your
 charts, lets you browse and play them like a music player, and renders them to
 FLAC, WAV, or OGG with proper tags and cover art — keysounds, BPM changes, stops,
