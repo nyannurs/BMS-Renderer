@@ -4,6 +4,8 @@
 
 ## This software is entirely vibe-coded.
 
+I built this by exclusively iterating with Claude. I wrote no line of code.
+
 ## What is BMS Renderer?
 
 BMS Renderer turns a BMS library into a tagged music collection. It scans your
