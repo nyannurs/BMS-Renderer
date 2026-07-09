@@ -4,3 +4,5 @@ mutagen
 Pillow
 soxr
 sounddevice
+pyside6
+pypresence

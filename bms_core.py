@@ -9,6 +9,7 @@ source of truth shared by the app and the test suite.
 """
 
 import os, re, sys, json, io, traceback
+import threading as _threading
 from math import gcd
 import numpy as np
 import soundfile as sf
@@ -195,7 +196,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "2.3.13"
+APP_VERSION = "2.4.0"
 CHANGELOG = []
 
 # ============================================================================
@@ -249,6 +250,32 @@ def assert_safe_output(out_path):
 
 def b36(s):
     return int(s, 36)
+
+# BMS object IDs (the 2-char WAV/BPM/STOP slot ids and channel payload objects) are
+# normally base-36 (0-9, A-Z, case-insensitive). A chart may opt into base-62 with a
+# `#BASE 62` header, which makes lowercase letters DISTINCT from uppercase — 3844 slots
+# instead of 1296. base36 collapses case (int(s,36) treats 'a'=='A'), so a base62 chart
+# decoded as base36 gets ID COLLISIONS (different keysounds landing on the same slot).
+_B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_B62_IDX = {c: i for i, c in enumerate(_B62)}
+
+def b62(s):
+    """Decode a base-62 id (case-SENSITIVE). Tolerates stray chars (treats an unknown
+    char as its uppercase base62 value, else 0) so it never raises on odd input."""
+    v = 0
+    for c in s:
+        d = _B62_IDX.get(c)
+        if d is None:
+            d = _B62_IDX.get(c.upper(), 0)
+        v = v * 62 + d
+    return v
+
+def _decode_id(s, base):
+    """Decode a 2-char object id using the chart's numbering base (36 or 62). base36 is
+    case-insensitive (matches historical behaviour exactly); base62 is case-sensitive."""
+    if base == 62:
+        return b62(s)
+    return int(s.upper(), 36)
 
 def read_bms_text(path):
     with open_readonly(path) as f:
@@ -310,7 +337,13 @@ def parse_bms(path):
         return (all(f["active"] for f in if_stack) and
                 all(s["active"] for s in sw_stack))
 
-    for line in read_bms_text(path).splitlines():
+    text = read_bms_text(path)
+    # Object-ID numbering base: 36 (default) or 62 if the chart declares `#BASE 62`.
+    # Pre-scanned up-front because ids are decoded during the loop but #BASE can sit
+    # anywhere in the header. base62 makes lowercase ids distinct from uppercase.
+    base = 62 if re.search(r"(?im)^\s*#BASE\s+62\b", text) else 36
+
+    for line in text.splitlines():
         line = line.strip()
         if not line.startswith("#"):
             continue
@@ -438,7 +471,7 @@ def parse_bms(path):
         m = _RE_INDEXED.match(body)
         if m:
             kind = m.group(1).upper()
-            idx = b36(m.group(2).upper())
+            idx = _decode_id(m.group(2), base)
             val = m.group(3).strip()
             if kind == "WAV":
                 wav_table[idx] = val
@@ -457,12 +490,12 @@ def parse_bms(path):
             val = m.group(2).strip()
             header[key] = val
             if key == "LNOBJ":
-                try: lnobj.add(b36(val.upper()))
+                try: lnobj.add(_decode_id(val, base))
                 except ValueError: pass
             continue
 
     return {"header": header, "wav_table": wav_table, "bpm_table": bpm_table,
-            "stop_table": stop_table, "lnobj": lnobj, "bars": bars,
+            "stop_table": stop_table, "lnobj": lnobj, "bars": bars, "base": base,
             "is_pms": path.lower().endswith(".pms"), "has_random": has_random}
 
 # ---- channel classification (mirrors the bmx2wav reference) ----
@@ -481,15 +514,17 @@ def detect_bga(path):
     images at 2+ points in time (an animation); 'static' means a single image shown
     the whole song; 'video' means at least one referenced BGA file is a video.
     """
+    text = read_bms_text(path)
+    base = 62 if re.search(r"(?im)^\s*#BASE\s+62\b", text) else 36
     bmp_table = {}            # id(int) -> filename (from #BMPxx)
-    for line in read_bms_text(path).splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line.startswith("#"):
             continue
         m = re.match(r"#BMP([0-9A-Za-z]{2})\s+(.+)", line, re.IGNORECASE)
         if m:
             try:
-                bmp_table[b36(m.group(1).upper())] = m.group(2).strip()
+                bmp_table[_decode_id(m.group(1), base)] = m.group(2).strip()
             except ValueError:
                 pass
     if not bmp_table:
@@ -500,7 +535,7 @@ def detect_bga(path):
     # animation on layer 07 (composited over the base with black = transparent),
     # so ignoring 07 would wrongly report 'no BGA' for those charts.
     base_objs = []            # list of bmp ids actually placed on the timeline
-    for line in read_bms_text(path).splitlines():
+    for line in text.splitlines():
         line = line.strip()
         mm = re.match(r"#(\d{3})(04|07):(.*)", line)
         if not mm:
@@ -510,7 +545,7 @@ def detect_bga(path):
             obj = payload[i:i+2]
             if obj != "00":
                 try:
-                    base_objs.append(b36(obj.upper()))
+                    base_objs.append(_decode_id(obj, base))
                 except ValueError:
                     pass
 
@@ -594,6 +629,7 @@ def count_playable_notes(parsed):
        `parsed` is the dict returned by parse_bms()."""
     bars = parsed["bars"]
     lnobj = parsed.get("lnobj", set())
+    base = parsed.get("base", 36)
     total = 0
     ln_open = {}  # channel -> bool, tracks an open long note so we count the pair once
     for measure in sorted(bars.keys()):
@@ -608,7 +644,7 @@ def count_playable_notes(parsed):
                     if pair == "00" or pair == "":
                         continue
                     try:
-                        wid = b36(pair.upper())
+                        wid = _decode_id(pair, base)
                     except ValueError:
                         continue
                     if is_ln:
@@ -717,6 +753,19 @@ def load_config():
     file aside to `bms_config.json.bad` (so its contents aren't lost and the user can
     see something went wrong) and start fresh from there."""
     if not os.path.exists(CONFIG_PATH):
+        # If a previous run quarantined a corrupt config to .bad, try to salvage it —
+        # a truncated write may still be mostly-valid JSON, and recovering the user's
+        # library path etc. is far better than silently starting blank.
+        bad = CONFIG_PATH + ".bad"
+        if os.path.exists(bad):
+            try:
+                with open(bad, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    save_config(data)          # restore it as the live config
+                    return data
+            except Exception:
+                pass
         return {}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -728,12 +777,26 @@ def load_config():
             pass
         return {}
 
+_config_write_lock = _threading.Lock()
+
 def save_config(cfg):
-    tmp = CONFIG_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp, CONFIG_PATH)
+    """Atomically persist the config. Serialise to a STRING first (so a serialisation
+    error can never leave a half-written file), write to a UNIQUE temp path (pid+thread,
+    so two concurrent writers never clobber a shared .tmp), then os.replace into place.
+    A process-wide lock serialises writers — several boot-time handlers (theme, sort
+    restore, geometry) can call this near-simultaneously, and a shared temp path used to
+    race and occasionally corrupt the config (which then got quarantined to .bad)."""
+    data = json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    tmp = "%s.%d.%d.tmp" % (CONFIG_PATH, os.getpid(), _threading.get_ident())
+    with _config_write_lock:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, CONFIG_PATH)
 
 def file_md5(path):
     """MD5 of the raw .bms file bytes — the LR2/BMS-standard chart identifier."""
@@ -892,48 +955,77 @@ def scan_library(root, conn, log=lambda s: None, progress=lambda d, t: None):
     existing = {row[0]: (row[1], row[2])
                 for row in conn.execute("SELECT path, size, mtime FROM charts")}
 
-    # cheap pass: every chart path on disk
-    disk_paths = []
-    for dirpath, _, files in os.walk(root):
-        for fn in files:
-            if fn.lower().endswith(BMS_EXTS):
-                disk_paths.append(os.path.join(dirpath, fn))
-    total = len(disk_paths)
-    disk_set = set(disk_paths)
-
-    upserts = []
-    for i, p in enumerate(disk_paths):
+    # Walk once. We keep only a SET of on-disk paths (needed later for the deletion
+    # diff); a set is iterable, so we don't also keep a parallel list — that halves the
+    # peak memory of the walk on a huge library (126k paths). We also stat here and
+    # split into "unchanged" (reuse cached row) vs "to_parse" (new/modified) so the
+    # expensive parse only touches what actually changed.
+    # Walk with os.scandir (NOT os.walk): scandir yields DirEntry objects whose stat
+    # info (size, mtime) is CACHED from the directory read — on Windows it comes free
+    # with the listing, so entry.stat() costs no extra syscall. os.walk yields only
+    # names, which forced a separate os.stat() per file — 126k extra syscalls on a big
+    # library, which roughly tripled cached-load time. We keep only a SET of on-disk
+    # paths (for the deletion diff) plus the to_parse list of changed charts.
+    disk_set = set()
+    to_parse = []                        # (path, sig) for new/modified charts only
+    stack = [root]
+    while stack:
+        d = stack.pop()
         try:
-            st = os.stat(p)
+            with os.scandir(d) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if not entry.name.lower().endswith(BMS_EXTS):
+                            continue
+                        p = entry.path
+                        disk_set.add(p)
+                        st = entry.stat()          # cached — no extra syscall on Windows
+                        sig = (st.st_size, int(st.st_mtime))
+                        if existing.get(p) == sig:
+                            reused += 1
+                        else:
+                            to_parse.append((p, sig))
+                    except OSError:
+                        continue
         except OSError:
             continue
-        sig = (st.st_size, int(st.st_mtime))
-        if existing.get(p) == sig:
-            reused += 1
-        else:
-            try:
-                d = parse_bms(p); h = d["header"]
-                notes = count_playable_notes(d)
-                mode = detect_mode_from_bars(d)
-                has_random = 1 if d.get("has_random", False) else 0
-            except Exception:
-                h, notes, mode, has_random = {}, 0, "?", 0
-            try:
-                md5 = file_md5(p)
-            except Exception:
-                md5 = ""
-            upserts.append((p, sig[0], sig[1],
-                            h.get("TITLE", os.path.basename(p)),
-                            h.get("ARTIST", ""), h.get("GENRE", ""),
-                            h.get("BPM", ""), mode, notes, has_random, md5))
-            parsed += 1
-            # commit in batches so a huge first scan isn't one giant transaction
-            if len(upserts) >= 500:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO charts VALUES (?,?,?,?,?,?,?,?,?,?,?)", upserts)
-                conn.commit(); upserts.clear()
+    total = len(disk_set)
+
+    # Parse changed charts SEQUENTIALLY. A thread pool was tried here (v2.3.5–2.3.19)
+    # but reverted: parsing is largely CPU/GIL-bound (regex + note counting), so the
+    # threads gave only a modest, I/O-limited speedup, and at a 126k-chart library scale
+    # the pool + SQLite-commit contention froze the UI ("not responding") on the scan's
+    # completion and occasionally crashed. Single-threaded is proven stable on large
+    # real libraries, and incremental re-scans (the common case) skip unchanged charts
+    # anyway, so the first-scan cost is a one-time hit. Do NOT reintroduce threading here
+    # without solving the freeze on a real 100k+ library first.
+    upserts = []
+    for i, (p, sig) in enumerate(to_parse):
+        try:
+            d = parse_bms(p); h = d["header"]
+            notes = count_playable_notes(d)
+            mode = detect_mode_from_bars(d)
+            has_random = 1 if d.get("has_random", False) else 0
+        except Exception:
+            h, notes, mode, has_random = {}, 0, "?", 0
+        try:
+            md5 = file_md5(p)
+        except Exception:
+            md5 = ""
+        upserts.append((p, sig[0], sig[1],
+                        h.get("TITLE", os.path.basename(p)),
+                        h.get("ARTIST", ""), h.get("GENRE", ""),
+                        h.get("BPM", ""), mode, notes, has_random, md5))
+        parsed += 1
+        if len(upserts) >= 500:              # batch commits: no giant single txn
+            conn.executemany(
+                "INSERT OR REPLACE INTO charts VALUES (?,?,?,?,?,?,?,?,?,?,?)", upserts)
+            conn.commit(); upserts.clear()
         if i % 200 == 0:
-            progress(i, total)
+            progress(reused + i, total)
     if upserts:
         conn.executemany(
             "INSERT OR REPLACE INTO charts VALUES (?,?,?,?,?,?,?,?,?,?,?)", upserts)
@@ -1088,6 +1180,7 @@ def render_bms(path, log=lambda s: None):
     d = parse_bms(path)
     header, wav_table = d["header"], d["wav_table"]
     bpm_table, stop_table, lnobj, bars = d["bpm_table"], d["stop_table"], d["lnobj"], d["bars"]
+    base = d.get("base", 36)
     folder = os.path.dirname(path)
 
     try:
@@ -1158,7 +1251,7 @@ def render_bms(path, log=lambda s: None):
                     if pair == "00" or pair == "":
                         continue
                     try:
-                        wid = b36(pair.upper())
+                        wid = _decode_id(pair, base)
                     except ValueError:
                         continue
 
@@ -1417,6 +1510,7 @@ def bga_timeline(path):
     d = parse_bms(path)
     header, bars = d["header"], d["bars"]
     bpm_table, stop_table = d["bpm_table"], d["stop_table"]
+    base = d.get("base", 36)
     folder = os.path.dirname(path)
 
     # #BMPxx table (re-read; parse_bms doesn't keep it)
@@ -1426,7 +1520,7 @@ def bga_timeline(path):
         m = re.match(r"#BMP([0-9A-Za-z]{2})\s+(.+)", line, re.IGNORECASE)
         if m:
             try:
-                bmp_table[b36(m.group(1).upper())] = m.group(2).strip()
+                bmp_table[_decode_id(m.group(1), base)] = m.group(2).strip()
             except ValueError:
                 pass
 
@@ -1479,7 +1573,7 @@ def bga_timeline(path):
                     if pair == "00" or pair == "":
                         continue
                     try:
-                        val = b36(pair.upper())
+                        val = _decode_id(pair, base)
                     except ValueError:
                         continue
                     if chan == "03":                      # inline hex BPM
