@@ -1,6 +1,6 @@
 ![Logo](https://i.imgur.com/7fq90bX.png)
 
-![Screenshot](https://i.imgur.com/o4MoblI.png)
+![Screenshot](https://i.imgur.com/BH6us0n.png)
 
 ## This software is entirely vibe-coded.
 
@@ -65,6 +65,8 @@ First library scan is slow; after that it's cached and fast.
 - **Completely optional Discord RPC** — don't want it? delete `discord_rpc.py` and don't worry about it! NOTE: the RPC module is enabled by default in the executable distributed on the Releases page.
 - **Output a self-updating "Now Playing" file for OBS** — in bms_config.json, you can specify "nowplaying_output" as true/false, and "nowplaying_format" as txt or html. txt is just the song title and artist, while html displays automatically selected album art.
 - **Music visualization choices** — in bms_config.json, you can specify "song_visualizer" as waveform, moodbar, or spectrogram.
+- **EQ Visualizer** — driven by live FFT of the audio at the current playback position
+- **Art viewer** — click on a song's art to spawn a new window to navigate the song's art
 
 ## BMS library folder structure ##
 

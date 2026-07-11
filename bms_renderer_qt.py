@@ -477,23 +477,51 @@ def _draw_playhead_caret(p, x, w, h):
     p.drawPolygon(top); p.drawPolygon(bot)
 
 
-class MoodbarBar(QWidget):
+class _SeekBar(QWidget):
+    """Shared base for the seekable visualiser bars (waveform / moodbar / spectrogram).
+    They all present the same 30px-tall, click-and-drag-to-seek surface and track a 0..1
+    playhead position; only the paintEvent (how the track is drawn) differs. Centralising
+    the seek/position plumbing here keeps the three bars in lock-step — previously each
+    reimplemented set_pos/_frac/mousePress/mouseMove identically, so a change to the seek
+    behaviour had to be made in three places."""
+    seek = Signal(float)             # 0..1 fraction
+
+    def __init__(self):
+        super().__init__()
+        self._pos = 0.0              # 0..1 playhead position
+        self.setMinimumWidth(200); self.setFixedHeight(30)
+
+    def set_pos(self, frac):
+        self._pos = max(0.0, min(1.0, frac)); self.update()
+
+    def _frac(self, x):
+        return max(0.0, min(1.0, x / max(1, self.width())))
+
+    def mousePressEvent(self, e):
+        self.seek.emit(self._frac(e.x()))
+
+    def mouseMoveEvent(self, e):
+        self.seek.emit(self._frac(e.x()))
+
+    def set_envelope(self, _env):
+        """No-op by default so callers can treat any bar uniformly; WaveformBar overrides."""
+        pass
+
+
+class MoodbarBar(_SeekBar):
     """Moodbar-style seekbar: each vertical column is a colour derived from the audio's
     spectral content at that point in time (bass→red, mids→green, treble→blue), so the
     whole track reads as a colour signature. Played portion is full-opacity; the
     upcoming portion is dimmed. Same seek/scrub interface as WaveformBar (click/drag →
     `seek` fraction, `set_pos` moves the playhead), so it's a drop-in replacement.
     Inspired by the moodbar project (github.com/exaile/moodbar)."""
-    seek = Signal(float)             # 0..1 fraction
     LINE = "#1a1a1a"
 
     def __init__(self):
         super().__init__()
         self._cols = []                  # list of (r,g,b) 0..255 per column
-        self._pos = 0.0
         self._bright = None              # QPixmap: full-brightness bar (1px tall)
         self._dim = None                 # QPixmap: dimmed bar (upcoming portion)
-        self.setMinimumWidth(200); self.setFixedHeight(30)
 
     def _build_pixmaps(self):
         """Pre-render the colour strip once (bright + dimmed) as 1px-tall pixmaps at the
@@ -523,22 +551,6 @@ class MoodbarBar(QWidget):
         self._cols = []; self._pos = 0.0
         self._bright = self._dim = None; self.update()
 
-    # alias so callers can treat waveform/moodbar uniformly if desired
-    def set_envelope(self, _env):
-        pass
-
-    def set_pos(self, frac):
-        self._pos = max(0.0, min(1.0, frac)); self.update()
-
-    def _frac(self, x):
-        return max(0.0, min(1.0, x / max(1, self.width())))
-
-    def mousePressEvent(self, e):
-        self.seek.emit(self._frac(e.x()))
-
-    def mouseMoveEvent(self, e):
-        self.seek.emit(self._frac(e.x()))
-
     def paintEvent(self, _):
         from PySide6.QtGui import QPainter
         from PySide6.QtCore import QRect
@@ -560,21 +572,18 @@ class MoodbarBar(QWidget):
         _draw_playhead_caret(p, played, w, h)
 
 
-class SpectrogramBar(QWidget):
+class SpectrogramBar(_SeekBar):
     """Spectrogram-strip seekbar: a 2D freq×time heat-map. X is time, Y is frequency
     (low at the bottom, high at the top), brightness/colour is energy — so you see the
     song's frequency LAYERS (kick on the bottom, hats/melody higher up) rather than the
     moodbar's single averaged colour per moment. Same seek/scrub interface as the other
     bars (click/drag → `seek`, `set_pos` moves the playhead), so it's a drop-in. The
     played portion is full-brightness; the upcoming portion is dimmed."""
-    seek = Signal(float)             # 0..1 fraction
 
     def __init__(self):
         super().__init__()
-        self._pos = 0.0
         self._bright = None              # QPixmap: full spectrogram (ncols × H)
         self._dim = None                 # QPixmap: dimmed copy
-        self.setMinimumWidth(200); self.setFixedHeight(30)
 
     def set_image(self, rows):
         """rows: a 2D list/array shaped (H, ncols) of (r,g,b) — one row per frequency
@@ -609,21 +618,6 @@ class SpectrogramBar(QWidget):
     def clear(self):
         self._bright = self._dim = None; self._pos = 0.0; self.update()
 
-    def set_envelope(self, _env):
-        pass
-
-    def set_pos(self, frac):
-        self._pos = max(0.0, min(1.0, frac)); self.update()
-
-    def _frac(self, x):
-        return max(0.0, min(1.0, x / max(1, self.width())))
-
-    def mousePressEvent(self, e):
-        self.seek.emit(self._frac(e.x()))
-
-    def mouseMoveEvent(self, e):
-        self.seek.emit(self._frac(e.x()))
-
     def paintEvent(self, _):
         from PySide6.QtGui import QPainter
         from PySide6.QtCore import QRect
@@ -642,18 +636,14 @@ class SpectrogramBar(QWidget):
         _draw_playhead_caret(p, played, w, h)
 
 
-class WaveformBar(QWidget):
+class WaveformBar(_SeekBar):
     """Filled amplitude-envelope seekbar: grey base, blue up to the playhead.
     Click/drag to seek. Mirrors the Tk app's _draw_wave (not bars — a filled graph)."""
-    seek = Signal(float)             # 0..1 fraction
-
     GREY = "#c2c2c2"; BLUE = "#2d7dff"; LINE = "#1a1a1a"
 
     def __init__(self):
         super().__init__()
         self._env = []                   # 0..1 amplitude buckets
-        self._pos = 0.0                  # 0..1 playhead
-        self.setMinimumWidth(200); self.setFixedHeight(30)
 
     def set_envelope(self, env):
         self._env = env or []; self._pos = 0.0; self.update()
@@ -662,18 +652,6 @@ class WaveformBar(QWidget):
         """Blank the bar immediately (e.g. on song change, before the new waveform is
         ready) so the previous song's envelope doesn't linger."""
         self._env = []; self._pos = 0.0; self.update()
-
-    def set_pos(self, frac):
-        self._pos = max(0.0, min(1.0, frac)); self.update()
-
-    def _frac(self, x):
-        return max(0.0, min(1.0, x / max(1, self.width())))
-
-    def mousePressEvent(self, e):
-        self.seek.emit(self._frac(e.x()))
-
-    def mouseMoveEvent(self, e):
-        self.seek.emit(self._frac(e.x()))
 
     def paintEvent(self, _):
         from PySide6.QtGui import QPainter, QColor, QPolygonF
@@ -703,6 +681,143 @@ class WaveformBar(QWidget):
         _draw_playhead_caret(p, played_x, w, h)
 
 
+class EQVisualizer(QWidget):
+    """A foobar2000-style spectrum analyser: thin vertical frequency bars driven by an
+    FFT of the audio at the current playback position, with slow-falling peak caps. It
+    pulls samples from a callback (so it stays decoupled from the player) and animates on
+    its own timer. Colours adapt to light/dark theme. Purely cosmetic."""
+
+    N_BARS = 40                     # number of frequency bars
+    FFT = 2048                      # samples per FFT window
+    FLOOR_DB = 6.0                  # bottom of the visible dynamic window (dB)
+    CEIL_DB = 54.0                  # top of the visible dynamic window (dB)
+    SMOOTH = 0.5                    # spectrum time-smoothing (like Web Audio's
+                                    # smoothingTimeConstant): tames raw-FFT jitter.
+                                    # 0 = raw/twitchy, ~0.8 = calm. 0.5 is responsive.
+    GRAVITY = 0.9                   # bar fall speed per frame (units/sec); higher = faster
+    PEAK_GRAVITY = 1.4              # peak-cap fall speed (units/sec)
+
+    def __init__(self, sample_provider):
+        super().__init__()
+        # sample_provider() -> (mono_float_window, samplerate) or None when not playing
+        self._provider = sample_provider
+        self._levels = [0.0] * self.N_BARS      # current bar heights 0..1 (displayed)
+        self._peaks = [0.0] * self.N_BARS       # peak-hold caps 0..1
+        self._smooth = [0.0] * self.N_BARS      # time-smoothed band magnitudes 0..1
+        self._dark = True
+        self.setMinimumHeight(56)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._band_edges = None
+        self._band_sr = None
+        from PySide6.QtCore import QTimer, QElapsedTimer
+        self._clock = QElapsedTimer(); self._clock.start()
+        self._last_ms = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(16)                   # ~60 fps
+
+    def set_dark(self, dark):
+        self._dark = bool(dark); self.update()
+
+    def _compute_bands(self, sr):
+        import numpy as np
+        lo, hi = 40.0, min(16000.0, sr / 2.0)
+        edges = np.logspace(np.log10(lo), np.log10(hi), self.N_BARS + 1)
+        self._band_edges = edges
+        self._band_sr = sr
+
+    def _tick(self):
+        import numpy as np
+        # frame-time in seconds, so fall speeds are frame-rate independent
+        now = self._clock.elapsed()
+        dt = max(0.001, (now - self._last_ms) / 1000.0)
+        self._last_ms = now
+
+        data = None
+        try:
+            data = self._provider() if self._provider else None
+        except Exception:
+            data = None
+
+        if data is not None:
+            win, sr = data
+            if win is not None and len(win) >= 8:
+                if self._band_sr != sr:
+                    self._compute_bands(sr)
+                w = np.asarray(win, dtype=np.float32)
+                n = min(self.FFT, len(w))
+                w = w[:n] * np.hanning(n)
+                spec = np.abs(np.fft.rfft(w))
+                freqs = np.fft.rfftfreq(n, 1.0 / sr)
+                edges = self._band_edges
+                for i in range(self.N_BARS):
+                    m = (freqs >= edges[i]) & (freqs < edges[i + 1])
+                    mag = float(spec[m].max()) if m.any() else 0.0   # peak bin = punchy
+                    db = 20.0 * np.log10(mag + 1e-6)
+                    tgt = (db - self.FLOOR_DB) / (self.CEIL_DB - self.FLOOR_DB)
+                    tgt = max(0.0, min(1.0, tgt))
+                    # time-smooth the band magnitude (Web-Audio-style) to kill raw-FFT
+                    # jitter without adding positional lag
+                    self._smooth[i] = self.SMOOTH * self._smooth[i] + (1.0 - self.SMOOTH) * tgt
+        else:
+            # not playing — collapse the smoothed magnitudes to zero so the bars fall to
+            # the floor under GRAVITY (below) rather than hovering or blinking out
+            for i in range(self.N_BARS):
+                self._smooth[i] = 0.0
+
+        # bars: INSTANT ATTACK (jump up to a louder value), GRAVITY DECAY (fall smoothly).
+        # This is the foobar/audioMotion feel — sharp rise, graceful fall — and on
+        # pause/stop the bars glide down instead of blinking out.
+        for i in range(self.N_BARS):
+            target = self._smooth[i]
+            if target >= self._levels[i]:
+                self._levels[i] = target                     # instant attack
+            else:
+                self._levels[i] = max(target, self._levels[i] - self.GRAVITY * dt)
+            # peak caps: hold at the bar top, then fall a bit faster under gravity
+            if self._levels[i] >= self._peaks[i]:
+                self._peaks[i] = self._levels[i]
+            else:
+                self._peaks[i] = max(self._levels[i], self._peaks[i] - self.PEAK_GRAVITY * dt)
+        self.update()
+
+    def paintEvent(self, _):
+        from PySide6.QtGui import QPainter, QColor, QLinearGradient
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        W, H = self.width(), self.height()
+        if self._dark:
+            base = QColor("#2d7dff"); top = QColor("#7db4ff")
+            peak = QColor("#ffffff"); grid = QColor(255, 255, 255, 16)
+        else:
+            base = QColor("#2565cc"); top = QColor("#66a0ff")
+            peak = QColor("#111111"); grid = QColor(0, 0, 0, 20)
+        # no background fill — the widget is transparent to the window behind it, in both
+        # themes (light mode never drew a distinct box; dark mode shouldn't either)
+        # faint horizontal grid lines (foobar look)
+        p.setPen(grid)
+        for gy in range(1, 4):
+            y = int(H * gy / 4)
+            p.drawLine(0, y, W, y)
+        n = self.N_BARS
+        gap = 2
+        bw = max(1, (W - gap * (n + 1)) / n)
+        x = gap
+        for i in range(n):
+            lv = self._levels[i]
+            bh = int(lv * (H - 2))
+            if bh > 0:
+                grad = QLinearGradient(0, H, 0, H - bh)
+                grad.setColorAt(0.0, base); grad.setColorAt(1.0, top)
+                p.fillRect(int(x), H - bh, int(bw), bh, grad)
+            pk = self._peaks[i]
+            if pk > 0.01:
+                py = H - int(pk * (H - 2)) - 2
+                p.fillRect(int(x), max(0, py), int(bw), 2, peak)
+            x += bw + gap
+        p.end()
+
+
 class VolumeTriangle(QWidget):
     """Horizontal triangle (thin left, tall right) that fills blue over grey to the
     current level. Click/drag to set. Mirrors the Tk app's _draw_vol."""
@@ -729,6 +844,15 @@ class VolumeTriangle(QWidget):
 
     def mousePressEvent(self, e):
         self._set_from_x(e.x())
+
+    def wheelEvent(self, e):
+        # scroll up = louder, down = quieter, in small steps
+        step = 0.05
+        delta = e.angleDelta().y()
+        if delta == 0:
+            return
+        self.set_level(self._level + (step if delta > 0 else -step))
+        e.accept()
 
     def mouseMoveEvent(self, e):
         self._set_from_x(e.x())
@@ -798,22 +922,65 @@ class UpdateChecker(QThread):
             pass                            # offline / rate-limited / parse error → no-op
 
 
-class RenderWorker(QThread):
+class _PoolWorker(QThread):
+    """Shared base for the process-pool render workers (RenderWorker for audio, BGAWorker
+    for BGA video). Centralises the pieces both need identically: the log/done/item_done
+    signals, the abort flag, the low-priority + process-priority setup at the top of run(),
+    and the _kill_pool teardown that hard-stops in-flight worker processes on abort. The
+    subclasses only implement run() (the actual job list differs). Keeping this shared
+    means a fix to the abort/teardown logic can't be applied to one worker and forgotten
+    on the other — a class of bug that has bitten this code before."""
     log = Signal(str)
-    item_done = Signal(int)
     done = Signal()
+    item_done = Signal(int)
 
-    def __init__(self, items, out_dir, fmt, workers, cover_cfg=None,
-                 quality=None, priority="Normal"):
+    def __init__(self, priority="Normal"):
         super().__init__()
-        self.items, self.out_dir, self.fmt, self.workers = items, out_dir, fmt, workers
-        self.cover_cfg = cover_cfg      # None | "__BLACK__" | path to whole-queue art
-        self.quality = quality          # None = current default encode settings
         self.priority = priority
         self._abort = False             # set by abort() to stop after the current item
 
     def abort(self):
         self._abort = True
+
+    def _begin_run(self):
+        """Common run() preamble: drop this thread's priority and apply the user-chosen
+        OS process priority (inherited by the pool's worker processes)."""
+        try:
+            self.setPriority(QThread.LowestPriority)
+        except Exception:
+            pass
+        _apply_process_priority(self.priority)
+
+    @staticmethod
+    def _kill_pool(ex):
+        """Terminate a ProcessPoolExecutor's worker processes immediately, so an aborted
+        render doesn't keep rendering in the background."""
+        procs = list(getattr(ex, "_processes", {}).values())
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            ex.shutdown(wait=False)        # older Python without cancel_futures
+        for p in procs:
+            try:
+                p.join(timeout=2)
+                if p.is_alive():
+                    p.kill()               # SIGKILL anything still standing
+            except Exception:
+                pass
+
+
+class RenderWorker(_PoolWorker):
+    def __init__(self, items, out_dir, fmt, workers, cover_cfg=None,
+                 quality=None, priority="Normal"):
+        super().__init__(priority=priority)
+        self.items, self.out_dir, self.fmt, self.workers = items, out_dir, fmt, workers
+        self.cover_cfg = cover_cfg      # None | "__BLACK__" | path to whole-queue art
+        self.quality = quality          # None = current default encode settings
 
     def _resolve_cover(self, item):
         from bms_core import process_cover, _PIL_OK
@@ -835,11 +1002,7 @@ class RenderWorker(QThread):
         return None
 
     def run(self):
-        try:
-            self.setPriority(QThread.LowestPriority)
-        except Exception:
-            pass
-        _apply_process_priority(self.priority)
+        self._begin_run()
         ext = {"FLAC": ".flac", "WAV": ".wav", "OGG": ".ogg", "MP3": ".mp3"}.get(self.fmt, ".flac")
         ff = ffmpeg_path() if self.fmt in ("OGG", "MP3", "FLAC") else None
         jobs = {}
@@ -887,30 +1050,6 @@ class RenderWorker(QThread):
                 self.log.emit("Queue render complete.")
         self.done.emit()
 
-    @staticmethod
-    def _kill_pool(ex):
-        """Terminate a ProcessPoolExecutor's worker processes immediately, so an
-        aborted render doesn't keep rendering in the background."""
-        procs = list(getattr(ex, "_processes", {}).values())
-        for p in procs:
-            try:
-                p.terminate()
-            except Exception:
-                pass
-        # don't wait on the children (we just killed them); tear down the executor's
-        # bookkeeping without blocking
-        try:
-            ex.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            ex.shutdown(wait=False)        # older Python without cancel_futures
-        for p in procs:
-            try:
-                p.join(timeout=2)
-                if p.is_alive():
-                    p.kill()               # SIGKILL anything still standing
-            except Exception:
-                pass
-
 
 # ----------------------------------------------------------------------------
 # Main window
@@ -933,31 +1072,19 @@ class _BGADetectWorker(QThread):
             self.result.emit(self.path, kind)
 
 
-class BGAWorker(QThread):
+class BGAWorker(_PoolWorker):
     """Renders queued charts that have an image BGA to MP4s, in parallel. Video/none
     BGAs are skipped. Mirrors the Tk app's _render_bga_queue."""
-    log = Signal(str)
-    done = Signal()
     total_known = Signal(int)       # emitted once the skip-filter decides the count
-    item_done = Signal(int)         # emitted as each BGA finishes (1..total counter)
     item_rendered = Signal(str)     # path of a chart that rendered OK (for removal)
 
     def __init__(self, items, out_dir, workers, encode_opts=None, priority="Normal"):
-        super().__init__()
+        super().__init__(priority=priority)
         self.items, self.out_dir, self.workers = items, out_dir, workers
         self.encode_opts = encode_opts        # None = original default behavior
-        self.priority = priority
-        self._abort = False
-
-    def abort(self):
-        self._abort = True
 
     def run(self):
-        try:
-            self.setPriority(QThread.LowestPriority)
-        except Exception:
-            pass
-        _apply_process_priority(self.priority)
+        self._begin_run()
         ff = ffmpeg_path()
         fps, size = 30, (720, 720)
         jobs = []; skipped = 0
@@ -1003,7 +1130,7 @@ class BGAWorker(QThread):
             if self._abort:
                 for f in futs:
                     f.cancel()
-                RenderWorker._kill_pool(ex)
+                self._kill_pool(ex)
                 self.log.emit("BGA render aborted.")
             else:
                 ex.shutdown(wait=True)
@@ -1368,16 +1495,20 @@ class ArtViewerDialog(QDialog):
     scaling-mode selector in the top-left whose choice auto-saves to config. Purely
     cosmetic — for enjoying the art alongside the music."""
 
-    # (label, key, Qt transformation mode | None for 1:1). 1:1 shows the image at its
-    # true pixel size (scrollable if larger than the window).
+    # (label, key). smooth/nearest use Qt's scaler; lanczos/bicubic use PIL for
+    # higher-quality resampling. 'actual' shows the image at true pixel size.
     MODES = [
-        ("Smooth (best)", "smooth"),
+        ("Smooth (bilinear)", "smooth"),
+        ("Lanczos (sharpest)", "lanczos"),
+        ("Bicubic", "bicubic"),
         ("Fast (nearest)", "nearest"),
         ("1:1 actual size", "actual"),
     ]
 
-    def __init__(self, parent, image_path, title=""):
+    def __init__(self, parent, image_path, title="", files=None, index=0):
         super().__init__(parent)
+        self._files = list(files) if files else [image_path]
+        self._idx = index if (files and 0 <= index < len(files)) else 0
         self.setWindowTitle(title or os.path.basename(image_path))
         self.setMinimumSize(200, 200)
         # restore the saved window size/position if we have one, else a sensible default
@@ -1417,10 +1548,97 @@ class ArtViewerDialog(QDialog):
         self._scroll.setStyleSheet("background:#111;")
         self._img = QLabel(); self._img.setAlignment(Qt.AlignCenter)
         self._img.setStyleSheet("background:#111;")
+        # right-click → copy the artwork to the clipboard (for pasting in chat)
+        self._img.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._img.customContextMenuRequested.connect(self._show_art_menu)
         self._scroll.setWidget(self._img)
         lay.addWidget(self._scroll, 1)
 
+        # navigation row (prev / slider / next) — only when there's more than one image.
+        # Sized 1:1 with the panel's nav (30x26 arrows) and centered, not full-width, so
+        # the slider doesn't stretch awkwardly across a wide window.
+        if len(self._files) > 1:
+            from PySide6.QtWidgets import QStyle, QSlider
+            navwrap = QHBoxLayout()
+            navwrap.addStretch(1)
+            nav = QHBoxLayout(); nav.setSpacing(4)
+            # use the parent's themed icon maker so the arrows invert in dark mode
+            # (raw standardIcon gives black arrows that vanish on a dark background)
+            _icon = getattr(self.parent(), "_themed_media_icon", None)
+            def _arrow(sp):
+                return _icon(sp) if _icon else self.style().standardIcon(sp)
+            self._prev = QPushButton(); self._prev.setFixedSize(30, 26)
+            self._prev.setIcon(_arrow(QStyle.SP_ArrowLeft))
+            self._prev.clicked.connect(lambda: self._step(-1))
+            self._slider = QSlider(Qt.Horizontal); self._slider.setFixedWidth(200)
+            self._slider.setMinimum(1); self._slider.setMaximum(len(self._files))
+            self._slider.setValue(self._idx + 1)
+            self._slider.valueChanged.connect(self._on_slider)
+            self._next = QPushButton(); self._next.setFixedSize(30, 26)
+            self._next.setIcon(_arrow(QStyle.SP_ArrowRight))
+            self._next.clicked.connect(lambda: self._step(1))
+            nav.addWidget(self._prev); nav.addWidget(self._slider); nav.addWidget(self._next)
+            navwrap.addLayout(nav); navwrap.addStretch(1)
+            lay.addLayout(navwrap)
+            self._status = QLabel(""); self._status.setAlignment(Qt.AlignCenter)
+            self._status.setStyleSheet("color:#999; font-size:11px;")
+            lay.addWidget(self._status)
+
         self._rescale()
+
+    def _step(self, delta):
+        self._idx = (self._idx + delta) % len(self._files)
+        self._load_current()
+
+    def refresh_theme_icons(self):
+        """Re-apply themed (dark-mode-inverting) arrow icons — called by the parent when
+        the theme toggles, so an already-open viewer's arrows update live."""
+        if not hasattr(self, "_prev"):
+            return
+        from PySide6.QtWidgets import QStyle
+        icon = getattr(self.parent(), "_themed_media_icon", None)
+        if icon:
+            self._prev.setIcon(icon(QStyle.SP_ArrowLeft))
+            self._next.setIcon(icon(QStyle.SP_ArrowRight))
+
+    def _on_slider(self, val):
+        self._idx = max(0, min(val - 1, len(self._files) - 1))
+        self._load_current()
+
+    def _load_current(self):
+        """Switch to the image at self._idx: reload the source, refresh the title/status,
+        keep the slider in sync, and rescale to the current mode."""
+        self._path = self._files[self._idx]
+        self._src = QPixmap(self._path)
+        self.setWindowTitle(os.path.basename(self._path))
+        if hasattr(self, "_slider"):
+            self._slider.blockSignals(True); self._slider.setValue(self._idx + 1)
+            self._slider.blockSignals(False)
+        if hasattr(self, "_status"):
+            self._status.setText(f"{self._idx+1} / {len(self._files)}  ·  {os.path.basename(self._path)}")
+        self._rescale()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        # The viewport only has its real size once the window is actually shown; rescaling
+        # in __init__ used a not-yet-laid-out viewport, so a fit-to-window image came out
+        # at ~1:1 until the first resize. Rescale here so it fits correctly on first open
+        # AND on every re-open.
+        self._rescale()
+
+    def _show_art_menu(self, pos):
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        act_copy = menu.addAction("Copy image to clipboard")
+        act = menu.exec(self._img.mapToGlobal(pos))
+        if act == act_copy:
+            self._copy_to_clipboard()
+
+    def _copy_to_clipboard(self):
+        if self._src.isNull():
+            return
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setPixmap(self._src)   # copy the FULL-res original
 
     def _mode_key(self):
         return self.MODES[self.mode.currentIndex()][1]
@@ -1432,6 +1650,26 @@ class ArtViewerDialog(QDialog):
         except Exception:
             cfg = load_config(); cfg["art_viewer_scaling"] = self._mode_key(); save_config(cfg)
         self._rescale()
+
+    def _pil_scaled(self, area, key):
+        """High-quality resample via PIL (Lanczos/Bicubic), returned as a QPixmap.
+        Falls back to Qt's smooth scaling if PIL isn't available or errors."""
+        try:
+            from PIL import Image
+            import io as _io
+            from PySide6.QtGui import QImage
+            resample = Image.LANCZOS if key == "lanczos" else Image.BICUBIC
+            im = Image.open(self._path).convert("RGBA")
+            iw, ih = im.size
+            aw, ah = max(1, area.width()), max(1, area.height())
+            scale = min(aw / iw, ah / ih)                # KeepAspectRatio
+            nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+            im = im.resize((nw, nh), resample)
+            buf = _io.BytesIO(); im.save(buf, format="PNG")
+            qi = QImage.fromData(buf.getvalue(), "PNG")
+            return QPixmap.fromImage(qi)
+        except Exception:
+            return self._src.scaled(area, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
     def _rescale(self):
         if self._src.isNull():
@@ -1447,8 +1685,11 @@ class ArtViewerDialog(QDialog):
             return
         self._scroll.setWidgetResizable(True)
         area = self._scroll.viewport().size()
-        mode = Qt.SmoothTransformation if key == "smooth" else Qt.FastTransformation
-        scaled = self._src.scaled(area, Qt.KeepAspectRatio, mode)
+        if key in ("lanczos", "bicubic"):
+            scaled = self._pil_scaled(area, key)
+        else:
+            mode = Qt.SmoothTransformation if key == "smooth" else Qt.FastTransformation
+            scaled = self._src.scaled(area, Qt.KeepAspectRatio, mode)
         self._img.setPixmap(scaled)
 
     def resizeEvent(self, e):
@@ -1649,6 +1890,16 @@ class AudioExportDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    LOGO_W = 340         # wordmark logo target width (px) = full right-pane width
+    LOGO_MAX_H = 72      # but never taller than this, so a wide pane doesn't balloon it
+
+    def _scaled_logo(self, pm):
+        """Scale the logo to the pane width (LOGO_W), capped at LOGO_MAX_H, preserving
+        aspect ratio — as wide as the right pane without overflowing or getting too tall."""
+        from PySide6.QtCore import QSize
+        return pm.scaled(QSize(self.LOGO_W, self.LOGO_MAX_H),
+                         Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
     def __init__(self):
         super().__init__()
         self.queue = []                 # {path, tags:{...}, mode, notes}
@@ -1708,40 +1959,69 @@ class MainWindow(QMainWindow):
         central = QWidget(); self.setCentralWidget(central)
         outer = QVBoxLayout(central)
 
+        # top bar: path buttons/fields on the left, logo on the right (full width row)
         outer.addLayout(self._build_top_bar())
 
-        # main split: tabs (left) | right panel
+        # main split: tabs+log (left) | info panel (right). The panel starts at the top of
+        # this row — i.e. at the tab line — so it sits below the logo/top-bar header.
         mid = QHBoxLayout()
         self.tabs = QTabWidget()
-        # native dark-mode toggle (persisted), top-right of the tab bar
-        # Dark-mode toggle as a small square icon button (no text): shows a moon in
-        # light mode (click → dark) and a sun in dark mode (click → light).
         self.dark_toggle = QPushButton(); self.dark_toggle.setCheckable(True)
         self.dark_toggle.setChecked(bool(load_config().get("dark_mode", False)))
         self.dark_toggle.setObjectName("darkBtn")
-        self.dark_toggle.setFixedSize(26, 26)          # 1:1 square
+        self.dark_toggle.setFixedSize(26, 26)
         from PySide6.QtCore import QSize as _QSize
         self.dark_toggle.setIconSize(_QSize(16, 16))
         self.dark_toggle.setToolTip("Toggle dark / light mode")
         self.dark_toggle.toggled.connect(self._on_dark_toggled)
         self._refresh_dark_icon()
-        # wrap with margins and RIGHT-align the square button. Zero right margin so it
-        # sits flush to the panel/window edge (a right margin leaves a visible gap
-        # between the button and the edge).
         _dark_wrap = QWidget(); _dw = QHBoxLayout(_dark_wrap)
         _dw.setContentsMargins(6, 2, 0, 2)
         _dw.addStretch(1); _dw.addWidget(self.dark_toggle, 0, Qt.AlignRight | Qt.AlignVCenter)
         self.tabs.setCornerWidget(_dark_wrap, Qt.TopRightCorner)
         self._build_tabs()
-        mid.addWidget(self.tabs, 1)
-        mid.addWidget(self._build_right_panel())
-        outer.addLayout(mid, 1)
 
-        # log + transport at the bottom
+        left_col = QVBoxLayout(); left_col.setContentsMargins(0, 0, 0, 0)
+        left_col.addWidget(self.tabs, 1)
         self.logbox = QPlainTextEdit(readOnly=True); self.logbox.setFixedHeight(110)
         self.logbox.setMaximumBlockCount(800)
-        outer.addWidget(self.logbox)
+        left_col.addWidget(self.logbox)
+        mid.addLayout(left_col, 1)
+        # Right side: push the info panel DOWN so its top aligns with the tab CONTENT
+        # (the library list), not the tab strip. The offset = the tab bar's height plus
+        # the in-tab toolbar row (Songs only / Search / Type) above the list. We compute
+        # it after the widgets exist (see showEvent) and apply it as a top spacer, so the
+        # panel starts on the same horizontal line the main content does.
+        right_wrap = QVBoxLayout(); right_wrap.setContentsMargins(0, 0, 0, 0); right_wrap.setSpacing(0)
+        self._right_top_spacer = QWidget()
+        self._right_top_spacer.setFixedHeight(0)     # set for real in _align_right_panel
+        right_wrap.addWidget(self._right_top_spacer)
+        right_wrap.addWidget(self._build_right_panel(), 1)
+        mid.addLayout(right_wrap)
+        outer.addLayout(mid, 1)
+
+        # transport spans the full window width at the very bottom
         outer.addLayout(self._build_transport())
+
+    def _align_right_panel(self):
+        """Push the info panel's top down so it lines up with the tab strip's bottom edge
+        (the line just under the Library/Discovery/… tabs). The panel's row starts level
+        with the tabs widget, so the spacer = the tab bar height drops the panel onto that
+        line. Measured at show time so it matches the real font/DPI. A tiny +2 accounts
+        for the tab widget's frame so it sits ON the line, not a hair above it."""
+        if not hasattr(self, "_right_top_spacer"):
+            return
+        try:
+            self._right_top_spacer.setFixedHeight(max(0, self.tabs.tabBar().height() - 2))
+        except Exception:
+            pass
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        # widgets now have real sizes — align the right panel to the content line once
+        if not getattr(self, "_right_aligned", False):
+            self._right_aligned = True
+            self._align_right_panel()
 
         self.log(f"BMS Renderer v{APP_VERSION} (Qt) ready.")
         self._warn_missing_deps()
@@ -1806,14 +2086,31 @@ class MainWindow(QMainWindow):
 
     def _build_top_bar(self):
         grid = QGridLayout()
-        self.lib_edit = QLineEdit(load_config().get("library", ""))
-        self.out_edit = QLineEdit(load_config().get("output", ""))
+        # The path text fields are kept as hidden widgets (the rest of the code reads/writes
+        # their .text() as the current library/output paths), but they're no longer shown —
+        # a foobar-style EQ spectrum visualiser takes their place. The Choose… buttons stay.
+        self.lib_edit = QLineEdit(load_config().get("library", "")); self.lib_edit.hide()
+        self.out_edit = QLineEdit(load_config().get("output", "")); self.out_edit.hide()
         lib_btn = QPushButton("Choose library folder…"); lib_btn.clicked.connect(self.choose_library)
         out_btn = QPushButton("Choose output folder…");  out_btn.clicked.connect(self.choose_output)
         lib_btn.setFixedWidth(160); out_btn.setFixedWidth(160)
-        grid.addWidget(lib_btn, 0, 0); grid.addWidget(self.lib_edit, 0, 1)
-        grid.addWidget(out_btn, 1, 0); grid.addWidget(self.out_edit, 1, 1)
-        # embedded wordmark logo, top-right (spans both rows), with a small
+        grid.addWidget(lib_btn, 0, 0); grid.addWidget(out_btn, 1, 0)
+        # EQ spectrum visualiser, horizontally CENTERED in the window: it lives in a
+        # stretch-flanked wrapper spanning the middle grid column, so equal slack sits on
+        # each side rather than the bar hugging the path buttons.
+        self.eq_vis = EQVisualizer(self._eq_sample_provider)
+        self.eq_vis.set_dark(self._is_dark_theme())
+        self.eq_vis.setFixedWidth(480)
+        _eqwrap = QWidget(); _eql = QHBoxLayout(_eqwrap)
+        _eql.setContentsMargins(0, 0, 0, 0)
+        _eql.addWidget(self.eq_vis)
+        # Span the EQ across the FULL top-bar width and center it. Buttons sit far left
+        # (col 0), logo far right (col 2); the centered EQ in a full-width span lands at
+        # the window center without overlapping either.
+        grid.addWidget(_eqwrap, 0, 0, 2, 3, Qt.AlignHCenter | Qt.AlignVCenter)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(2, 1)
+        # embedded wordmark logo, top-right (spans both button rows), with a small
         # "update available" line beneath it (hidden until an update is found)
         from PySide6.QtGui import QPixmap
         import base64
@@ -1822,7 +2119,7 @@ class MainWindow(QMainWindow):
         self._logo_raw = pm                      # keep the original for theme toggles
         if not pm.isNull():
             shown = self._invert_pixmap(pm) if self._is_dark_theme() else pm
-            logo.setPixmap(shown.scaledToHeight(40, Qt.SmoothTransformation))
+            logo.setPixmap(self._scaled_logo(shown))
         self.logo_label = logo
         logo.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         logo.setCursor(Qt.PointingHandCursor)
@@ -1843,8 +2140,11 @@ class MainWindow(QMainWindow):
         logo_box = QWidget(); lb = QVBoxLayout(logo_box)
         lb.setContentsMargins(0, 0, 0, 0); lb.setSpacing(0)
         lb.addWidget(logo); lb.addWidget(self.update_lbl)
-        grid.addWidget(logo_box, 0, 2, 2, 1)
-        grid.setColumnStretch(1, 1)
+        self._logo_box = logo_box
+        # logo occupies the top-right, spanning both button rows. Column 1 (the path
+        # fields) stretches to fill the gap, pushing the logo to the right edge.
+        grid.addWidget(logo_box, 0, 2, 2, 1, Qt.AlignRight | Qt.AlignVCenter)
+        grid.setColumnStretch(2, 1)
         return grid
 
     def _refresh_dark_icon(self):
@@ -1924,6 +2224,15 @@ class MainWindow(QMainWindow):
         self._refresh_logo_for_theme()
         self._refresh_media_icons()
         self._refresh_dark_icon()
+        if hasattr(self, "eq_vis"):
+            self.eq_vis.set_dark(self._is_dark_theme())
+        # update the arrow icons of any OPEN art-viewer windows so they invert live on
+        # theme toggle (previously they only refreshed when reopened)
+        for dlg in getattr(self, "_art_viewers", []):
+            try:
+                dlg.refresh_theme_icons()
+            except Exception:
+                pass
 
     def _repolish_all(self, app):
         # Re-polish every widget so it picks up the NEW app palette. Critically we do
@@ -1953,7 +2262,7 @@ class MainWindow(QMainWindow):
             return
         shown = self._invert_pixmap(self._logo_raw) if self._is_dark_theme() \
             else self._logo_raw
-        self.logo_label.setPixmap(shown.scaledToHeight(40, Qt.SmoothTransformation))
+        self.logo_label.setPixmap(self._scaled_logo(shown))
 
     def _is_dark_theme(self):
         """True when the window background is darker than its text — i.e. a dark/Night
@@ -2031,7 +2340,7 @@ class MainWindow(QMainWindow):
         base = self._base_logo_pixmap()
         if base is None:
             return
-        base = base.scaledToHeight(40, Qt.SmoothTransformation)
+        base = self._scaled_logo(base)
         # Precompute a full breathing cycle as many finely-spaced frames with a SINE ease
         # (not linear) so the blend accelerates/decelerates smoothly instead of stepping.
         # A raised sine over [0, 2π] gives a symmetric ease-in-out fade both directions,
@@ -2090,6 +2399,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_tables_tab(), "Tables")
         self.tabs.addTab(self._build_playlists_tab(), "Custom Playlists")
         self.tabs.addTab(self._build_queue_tab(), "Queue (0)")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self._queue_tab_index = self.tabs.count() - 1
 
     # ---- Library tab ----
@@ -2213,9 +2523,18 @@ class MainWindow(QMainWindow):
         self._apply_lib_filter()
         self._load_tables_list()
         self._load_playlists()
-        # populate Discovery now that we have songs (cheap; thumbnails load lazily)
-        self._discovery_reset()
+        # Discovery builds tens of thousands of list items — but it's NOT the visible tab
+        # after a scan (Library is), so building it here just adds seconds to the post-scan
+        # freeze for a grid the user isn't looking at yet. Defer it: mark it dirty and
+        # build on first visit to the Discovery tab (see _on_tab_changed).
+        self._disc_dirty = True
         self._show_loading(False)          # scan finished — reveal the visualizer
+
+    def _on_tab_changed(self, idx):
+        # lazily populate Discovery (tab index 1) the first time it's opened after a scan
+        if idx == 1 and getattr(self, "_disc_dirty", False):
+            self._disc_dirty = False
+            self._discovery_reset()
 
     def _apply_lib_filter(self):
         q = self.lib_search.text().lower().strip()
@@ -2765,6 +3084,49 @@ class MainWindow(QMainWindow):
         MIN_DB = -48.0                      # fader bottom (just above silence)
         db = MIN_DB * (1.0 - pos)           # pos=1 -> 0 dB, pos=0 -> MIN_DB
         return 10.0 ** (db / 20.0)          # dB -> linear amplitude
+
+    def _eq_sample_provider(self):
+        """Return (mono_window, samplerate) at the current playback position for the EQ
+        visualiser, or None when nothing is actively playing. Reads straight from the
+        player's own buffer + cursor (the source of truth) so it can't drift out of sync
+        with what's actually being fed to the speakers."""
+        try:
+            p = self.player
+            if p is None:
+                return None
+            # read the state robustly: some builds expose .state() as a method, others as
+            # an attribute; the underlying _state string is unambiguous
+            st = getattr(p, "_state", None)
+            if st is None:
+                s = getattr(p, "state", None)
+                st = s() if callable(s) else s
+            if st != "playing":
+                return None
+            buf = getattr(p, "_buf", None)
+            if buf is None:
+                return None
+            import numpy as np
+            n = EQVisualizer.FFT
+            total = len(buf)
+            if total < n:
+                return None
+            sr = int(getattr(p, "sr", 44100))
+            # Read at the AUDIBLE position, not the feeder cursor. The feeder races ahead
+            # of the speaker by the stream's output latency, so reading the raw cursor
+            # shows audio slightly BEFORE you hear it (the EQ "reacts before the music").
+            # position_seconds() already subtracts that latency, so use it.
+            try:
+                cur = int(p.position_seconds() * sr)
+            except Exception:
+                cur = int(getattr(p, "_cursor", 0))
+            if cur < 0:
+                return None
+            start = max(0, min(cur, total - n))
+            seg = buf[start:start + n]
+            mono = seg.mean(axis=1) if getattr(seg, "ndim", 1) == 2 else seg
+            return (np.asarray(mono, dtype=np.float32), sr)
+        except Exception:
+            return None
 
     def _on_volume(self, level):
         # a manual (or programmatic non-mute) volume change above 0 clears mute
@@ -3689,10 +4051,20 @@ class MainWindow(QMainWindow):
         self.info_fields["BPM"].setText(str(s.get("bpm", "—")))
         self.info_fields["Notes"].setText(str(s.get("notes", "—")))
         self.info_fields["Play type"].setText(s.get("mode", "—") or "—")
-        self.info_fields["File"].setText(s.get("path", "—"))
+        # File path: normalise to forward slashes (os.path.join mixes in backslashes on
+        # Windows since the stored library root uses '/') and elide the middle with "…"
+        # so a long path doesn't blow out the panel width. The FULL path is kept in
+        # _info_file_full for the staleness check + shown in the hover tooltip.
+        raw_path = s.get("path", "—") or "—"
+        self._info_file_full = raw_path
+        disp = raw_path.replace("\\", "/")
+        self.info_fields["File"].setText(self._elide_path(self.info_fields["File"], disp))
         self.info_fields["MD5"].setText(s.get("md5", "—") or "—")
         # full value on hover (Windows-style) so truncated fields are still readable
-        for w in self.info_fields.values():
+        for k, w in self.info_fields.items():
+            if k == "File":
+                w.setToolTip(disp if disp and disp != "—" else "")
+                continue
             t = w.text()
             w.setToolTip(t if t and t != "—" else "")
         # also load the song's folder art into the picker
@@ -3700,6 +4072,20 @@ class MainWindow(QMainWindow):
         # update the sequence-BGA indicator (off the GUI thread — detect_bga parses
         # the whole chart, which can be large)
         self._update_bga_indicator(s.get("path"))
+
+    def _elide_path(self, label, text):
+        """Middle-elide `text` with '…' to fit the label's current width, so long paths
+        don't overflow. Falls back to the raw text if metrics aren't available yet."""
+        try:
+            from PySide6.QtGui import QFontMetrics
+            from PySide6.QtCore import Qt as _Qt
+            w = label.width()
+            if w < 40:                       # not laid out yet — use a sane default cap
+                w = 230
+            fm = QFontMetrics(label.font())
+            return fm.elidedText(text, _Qt.ElideMiddle, w)
+        except Exception:
+            return text
 
     def _update_bga_indicator(self, path):
         if not hasattr(self, "bga_indicator"):
@@ -3719,8 +4105,9 @@ class MainWindow(QMainWindow):
         probe.start()
 
     def _on_bga_detected(self, path, kind):
-        # ignore stale results (selection moved on)
-        cur = self.info_fields["File"].text() if hasattr(self, "info_fields") else ""
+        # ignore stale results (selection moved on) — compare against the FULL path we
+        # stashed, since the visible File label is now middle-elided
+        cur = getattr(self, "_info_file_full", "")
         if path != cur:
             return
         if kind == "sequence":
@@ -3802,7 +4189,8 @@ class MainWindow(QMainWindow):
         path = files[idx]
         if not os.path.isfile(path):
             return
-        dlg = ArtViewerDialog(self, path, title=os.path.basename(path))
+        dlg = ArtViewerDialog(self, path, title=os.path.basename(path),
+                              files=list(files), index=idx)
         # keep a reference so the modeless dialog isn't garbage-collected; drop it
         # when the dialog finishes. We do NOT use WA_DeleteOnClose — deleting the C++
         # object while a Python reference lingers makes any later access (e.g. pruning
@@ -4661,6 +5049,8 @@ class MainWindow(QMainWindow):
         self.info_fields = {}
         for k in ("Title", "Artist", "Genre", "BPM", "Notes", "Play type", "File", "MD5"):
             lbl = QLabel("—"); lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            if k in ("File", "MD5"):
+                lbl.setMaximumWidth(230)     # long values elide/clip instead of stretching
             self.info_fields[k] = lbl; iform.addRow(k + ":", lbl)
             lbl.installEventFilter(self)        # right-positioned full-value tooltip
         col.addWidget(info)
@@ -4768,9 +5158,9 @@ class MainWindow(QMainWindow):
         # during the initial load (nothing's playing then) — otherwise its reserved
         # width leaves a dead gap to the left of the loading bar.
         self._now_box_w = QWidget(); self._now_box_w.setLayout(now_box)
-        bar.addWidget(self._now_box_w, 0, Qt.AlignVCenter)
         self.time_lbl = QLabel("0:00 / 0:00"); self.time_lbl.setVisible(False)
-        bar.addWidget(self.time_lbl, 0, Qt.AlignVCenter)
+        # NOTE: now-playing box + time are added to the bar AFTER the visualizer below,
+        # to get the order: … AudioDevice [visualizer] [now playing] [time] Volume …
         # song-scrubbing visualizer: "waveform" (default) or "moodbar", chosen via the
         # config key `song_visualizer` (no GUI toggle). Both share the same seek/scrub
         # interface, so the rest of the transport wiring is identical.
@@ -4802,6 +5192,11 @@ class MainWindow(QMainWindow):
         self._wave_stack.addWidget(load_page)                 # page 1
         self._wave_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         bar.addWidget(self._wave_stack, 1)
+        # now-playing block + time come right after the visualizer
+        bar.addWidget(self._now_box_w, 0, Qt.AlignVCenter)
+        bar.addSpacing(14)          # equal gap before the time so it's centred between
+        bar.addWidget(self.time_lbl, 0, Qt.AlignVCenter)
+        bar.addSpacing(14)          # ...and after it, before the volume control
         self.vol = VolumeTriangle(); self.vol.changed.connect(self._on_volume)
         # now the same height as the buttons, so plain vertical centering aligns it
         bar.addWidget(self.vol, 0, Qt.AlignVCenter)

@@ -196,7 +196,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "2.4.1"
+APP_VERSION = "2.5.0"
 CHANGELOG = []
 
 # ============================================================================
@@ -345,9 +345,28 @@ def parse_bms(path):
 
     for line in text.splitlines():
         line = line.strip()
-        if not line.startswith("#"):
+        if not line or line[0] != "#":
             continue
         body = line[1:]
+
+        # FAST PATH: channel data (#mmmCC:payload) is by far the most common line in a
+        # chart. It always starts with a digit, so we detect it cheaply and handle it
+        # BEFORE doing the expensive .upper()/.split() and the long control-flow ladder
+        # below. This avoids uppercasing hundreds of payload chars per line and walking
+        # ~15 header comparisons for every note row — the dominant cost of a cold scan.
+        if body[:1].isdigit():
+            m = _RE_CHANNEL.match(body)
+            if m:
+                # honour active #IF/#SWITCH branches (only pay for this when a branch is
+                # actually open; the common case has no control flow)
+                if (if_stack or sw_stack) and not _emitting():
+                    continue
+                measure = int(m.group(1))
+                chan = m.group(2).upper()
+                payload = m.group(3).strip()
+                bars.setdefault(measure, {}).setdefault(chan, []).append(payload)
+                continue
+
         up = body.upper()
 
         # ---- control-flow commands (consumed here, never stored) ----
@@ -456,15 +475,6 @@ def parse_bms(path):
 
         # outside an active branch? skip this line entirely
         if (if_stack or sw_stack) and not _emitting():
-            continue
-
-        # channel data: mmmCC:payload  (mmm=measure base-10, CC=channel base-36)
-        m = _RE_CHANNEL.match(body)
-        if m:
-            measure = int(m.group(1))
-            chan = m.group(2).upper()
-            payload = m.group(3).strip()
-            bars.setdefault(measure, {}).setdefault(chan, []).append(payload)
             continue
 
         # indexed header arrays: WAVxx / BPMxx / STOPxx
@@ -626,38 +636,47 @@ def count_playable_notes(parsed):
        objects in player lanes (11-1Z, 21-2Z) + long-note channels (51-5Z, 61-6Z),
        excluding BGM/autoplay and control channels. Long notes count as ONE note
        per head/tail pair, and #LNOBJ terminators are not counted.
-       `parsed` is the dict returned by parse_bms()."""
+       `parsed` is the dict returned by parse_bms().
+
+    Hot path: this is the single most expensive step of a cold library scan, so it's
+    written to avoid work. The key trick is NOT decoding object ids unless we actually
+    need the decoded value — id decoding (_decode_id) was ~50% of scan time, but the
+    decoded id is only needed to recognise #LNOBJ terminators, which most charts don't
+    use. When there are no LNOBJ ids we count non-"00" objects directly with no decode."""
     bars = parsed["bars"]
     lnobj = parsed.get("lnobj", set())
     base = parsed.get("base", 36)
+    has_lnobj = bool(lnobj)
     total = 0
     ln_open = {}  # channel -> bool, tracks an open long note so we count the pair once
-    for measure in sorted(bars.keys()):
-        bar = bars[measure]
-        for chan, payloads in bar.items():
+    for measure_bar in bars.values():                 # order doesn't affect the COUNT
+        for chan, payloads in measure_bar.items():
             if not ch_is_player_note(chan):
                 continue
             is_ln = ch_is_long_note(chan)
             for payload in payloads:
-                pairs = [payload[i:i+2] for i in range(0, len(payload) - len(payload) % 2, 2)]
-                for pair in pairs:
-                    if pair == "00" or pair == "":
-                        continue
-                    try:
-                        wid = _decode_id(pair, base)
-                    except ValueError:
+                # walk 2-char objects without building an intermediate list
+                for i in range(0, len(payload) - 1, 2):
+                    pair = payload[i:i+2]
+                    if pair == "00":
                         continue
                     if is_ln:
-                        # head starts the note (count it); tail closes it (don't double-count)
-                        if not ln_open.get(chan):
+                        # head starts the note (count it); tail closes it (don't recount)
+                        if ln_open.get(chan):
+                            ln_open[chan] = False
+                        else:
                             ln_open[chan] = True
                             total += 1
-                        else:
-                            ln_open[chan] = False
-                    else:
-                        if wid in lnobj:
-                            continue  # LNOBJ terminator: not a separate note
+                    elif has_lnobj:
+                        # only here do we need the decoded id — to skip LNOBJ terminators
+                        try:
+                            if _decode_id(pair, base) in lnobj:
+                                continue
+                        except ValueError:
+                            continue
                         total += 1
+                    else:
+                        total += 1                    # common case: no decode needed
     return total
 
 def detect_mode_from_bars(parsed):
@@ -945,6 +964,39 @@ def fetch_table(url, log=lambda s: None):
         })
     return {"name": name, "symbol": symbol, "entries": entries}
 
+def _os_cpu():
+    """os.cpu_count() but never returns None/0 (defaults to 4 if unknown)."""
+    try:
+        return os.cpu_count() or 4
+    except Exception:
+        return 4
+
+
+def _scan_parse_one(item):
+    """Parse a single chart to its DB row tuple. Module-level and dependency-free (only
+    touches bms_core functions + stdlib) so it's picklable and safe to run in a separate
+    PROCESS — process workers sidestep the GIL, which matters because a cold scan is
+    CPU-bound (parse + note-count dominate; file I/O is a few percent). Returns the
+    11-column row ready for INSERT OR REPLACE. Never raises: on any error it returns a
+    minimal row so one bad chart can't abort the whole scan."""
+    p, sig = item
+    try:
+        d = parse_bms(p); h = d["header"]
+        notes = count_playable_notes(d)
+        mode = detect_mode_from_bars(d)
+        has_random = 1 if d.get("has_random", False) else 0
+    except Exception:
+        h, notes, mode, has_random = {}, 0, "?", 0
+    try:
+        md5 = file_md5(p)
+    except Exception:
+        md5 = ""
+    return (p, sig[0], sig[1],
+            h.get("TITLE", os.path.basename(p)),
+            h.get("ARTIST", ""), h.get("GENRE", ""),
+            h.get("BPM", ""), mode, notes, has_random, md5)
+
+
 def scan_library(root, conn, log=lambda s: None, progress=lambda d, t: None):
     """Incrementally update the SQLite cache for `root`, then return
     (songs list, stats). Only changed/new charts are parsed; vanished charts
@@ -994,38 +1046,54 @@ def scan_library(root, conn, log=lambda s: None, progress=lambda d, t: None):
             continue
     total = len(disk_set)
 
-    # Parse changed charts SEQUENTIALLY. A thread pool was tried here (v2.3.5–2.3.19)
-    # but reverted: parsing is largely CPU/GIL-bound (regex + note counting), so the
-    # threads gave only a modest, I/O-limited speedup, and at a 126k-chart library scale
-    # the pool + SQLite-commit contention froze the UI ("not responding") on the scan's
-    # completion and occasionally crashed. Single-threaded is proven stable on large
-    # real libraries, and incremental re-scans (the common case) skip unchanged charts
-    # anyway, so the first-scan cost is a one-time hit. Do NOT reintroduce threading here
-    # without solving the freeze on a real 100k+ library first.
+    # Parse changed charts. A cold scan of a big library is CPU-bound (parse + note
+    # count), so we fan the parsing out across PROCESSES (not threads — the GIL makes
+    # threads useless for this; that earlier thread attempt was reverted). Each worker
+    # returns a plain row tuple; the SQLite writes stay HERE on the scan thread (sqlite
+    # connections aren't shareable across processes/threads, and keeping commits single-
+    # threaded is what avoids the contention that froze the UI last time). We use a
+    # 'spawn' context: on Linux the default 'fork' copies Qt/X11 state into workers and
+    # segfaults on teardown. Falls back to sequential parsing if a pool can't start
+    # (frozen exe edge cases, single-core boxes, or too few charts to be worth it).
     upserts = []
-    for i, (p, sig) in enumerate(to_parse):
+    use_pool = len(to_parse) >= 200
+    pool_ok = False
+    if use_pool:
         try:
-            d = parse_bms(p); h = d["header"]
-            notes = count_playable_notes(d)
-            mode = detect_mode_from_bars(d)
-            has_random = 1 if d.get("has_random", False) else 0
-        except Exception:
-            h, notes, mode, has_random = {}, 0, "?", 0
-        try:
-            md5 = file_md5(p)
-        except Exception:
-            md5 = ""
-        upserts.append((p, sig[0], sig[1],
-                        h.get("TITLE", os.path.basename(p)),
-                        h.get("ARTIST", ""), h.get("GENRE", ""),
-                        h.get("BPM", ""), mode, notes, has_random, md5))
-        parsed += 1
-        if len(upserts) >= 500:              # batch commits: no giant single txn
-            conn.executemany(
-                "INSERT OR REPLACE INTO charts VALUES (?,?,?,?,?,?,?,?,?,?,?)", upserts)
-            conn.commit(); upserts.clear()
-        if i % 200 == 0:
-            progress(reused + i, total)
+            import multiprocessing as _mp
+            from concurrent.futures import ProcessPoolExecutor
+            n_workers = max(1, min(_os_cpu(), 8))
+            if n_workers >= 2:
+                ctx = _mp.get_context("spawn")
+                log(f"Parsing {len(to_parse)} charts across {n_workers} processes…")
+                with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
+                    # chunksize amortises the per-task pickle/IPC overhead over many
+                    # charts — critical when each task is only a few ms.
+                    done = 0
+                    for row in ex.map(_scan_parse_one, to_parse, chunksize=64):
+                        upserts.append(row); parsed += 1; done += 1
+                        if len(upserts) >= 500:
+                            conn.executemany(
+                                "INSERT OR REPLACE INTO charts VALUES (?,?,?,?,?,?,?,?,?,?,?)", upserts)
+                            conn.commit(); upserts.clear()
+                        if done % 500 == 0:
+                            progress(reused + done, total)
+                pool_ok = True
+        except Exception as e:
+            # any pool failure: fall back to sequential (never leave the scan broken)
+            log(f"Parallel parse unavailable ({e}); parsing sequentially.")
+            upserts.clear(); parsed = 0; pool_ok = False
+
+    if not pool_ok:
+        for i, (p, sig) in enumerate(to_parse):
+            upserts.append(_scan_parse_one((p, sig)))
+            parsed += 1
+            if len(upserts) >= 500:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO charts VALUES (?,?,?,?,?,?,?,?,?,?,?)", upserts)
+                conn.commit(); upserts.clear()
+            if i % 200 == 0:
+                progress(reused + i, total)
     if upserts:
         conn.executemany(
             "INSERT OR REPLACE INTO charts VALUES (?,?,?,?,?,?,?,?,?,?,?)", upserts)
