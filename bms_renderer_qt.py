@@ -2023,6 +2023,14 @@ class MainWindow(QMainWindow):
             self._right_aligned = True
             self._align_right_panel()
 
+        # One-shot startup. showEvent fires EVERY time the window is shown (unminimise,
+        # restore from tray, regaining visibility), so this MUST be guarded — otherwise
+        # the app re-logs "ready", spawns another UpdateChecker thread, and re-scans the
+        # whole library (a multi-second freeze) every time you un-minimise it.
+        if getattr(self, "_booted", False):
+            return
+        self._booted = True
+
         self.log(f"BMS Renderer v{APP_VERSION} (Qt) ready.")
         self._warn_missing_deps()
         self._ensure_config_defaults()
