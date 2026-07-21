@@ -15,15 +15,18 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
-    from PySide6.QtCore import Qt, QThread, Signal, QSize, QEvent
-    from PySide6.QtGui import QPixmap, QIcon
+    from PySide6.QtCore import Qt, QThread, Signal, QSize, QEvent, QTimer, QPointF
+    from PySide6.QtGui import (
+        QPixmap, QIcon, QPainter, QColor, QImage, QPalette, QDesktopServices,
+    )
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
         QPushButton, QLineEdit, QLabel, QTabWidget,
         QSpinBox, QComboBox, QPlainTextEdit, QFileDialog, QHeaderView,
         QAbstractItemView, QMessageBox, QGroupBox, QFormLayout,
         QScrollArea, QSizePolicy, QTreeWidget, QTreeWidgetItem,
-        QListWidget, QListWidgetItem, QDialog, QSlider, QDialogButtonBox,
+        QListWidget, QListWidgetItem, QDialog, QSlider, QDialogButtonBox, QCheckBox,
+        QStyle, QMenu, QStackedWidget, QInputDialog,
     )
 except ImportError:
     sys.stderr.write("\nPySide6 is not installed. Install it first:\n\n    pip install PySide6\n\n")
@@ -32,7 +35,7 @@ except ImportError:
 import bms_core
 from bms_core import (
     APP_VERSION, ffmpeg_path, render_one_job, load_config, save_config,
-    set_library_root, render_bga_video_job, detect_bga, pick_playable_chart,
+    set_library_root, render_bga_video_job, render_bga_muxed_job, detect_bga, pick_playable_chart,
     render_bms, SR, fetch_table, load_tables_file, save_tables_file, TABLES_PATH,
     load_playlists, save_one_playlist, delete_playlist_file, program_dir,
     pick_discovery_art,
@@ -270,7 +273,6 @@ class MarqueeLabel(QLabel):
         self._offset = 0
         # no hardcoded colour — inherit the palette text colour so it's dark on a
         # light theme and white on a dark theme
-        from PySide6.QtCore import QTimer
         self._timer = QTimer(self); self._timer.timeout.connect(self._scroll)
 
     def mousePressEvent(self, e):
@@ -324,7 +326,6 @@ class MarqueeList(QListWidget):
     def __init__(self):
         super().__init__()
         self.setMouseTracking(True)
-        from PySide6.QtCore import QTimer
         self._marquee_row = -1
         self._marquee_pos = 0
         self._marquee_timer = QTimer(self)
@@ -454,7 +455,6 @@ def _draw_playhead_caret(p, x, w, h):
     tips. Drawn in white with a thin dark outline so it stands out over any waveform
     colour or moodbar hue. Shared by WaveformBar and MoodbarBar for a consistent look."""
     from PySide6.QtGui import QColor, QPen, QPolygonF, QBrush, QPainter
-    from PySide6.QtCore import QPointF
     x = int(max(0, min(w, x)))
     tw = 4          # half-width of the triangle caps
     th = 5          # height of each triangle
@@ -552,7 +552,6 @@ class MoodbarBar(_SeekBar):
         self._bright = self._dim = None; self.update()
 
     def paintEvent(self, _):
-        from PySide6.QtGui import QPainter
         from PySide6.QtCore import QRect
         if self._bright is None:
             return
@@ -619,7 +618,6 @@ class SpectrogramBar(_SeekBar):
         self._bright = self._dim = None; self._pos = 0.0; self.update()
 
     def paintEvent(self, _):
-        from PySide6.QtGui import QPainter
         from PySide6.QtCore import QRect
         if self._bright is None:
             return
@@ -655,7 +653,6 @@ class WaveformBar(_SeekBar):
 
     def paintEvent(self, _):
         from PySide6.QtGui import QPainter, QColor, QPolygonF
-        from PySide6.QtCore import QPointF
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height(); mid = h / 2
         env = self._env
@@ -779,7 +776,17 @@ class EQVisualizer(QWidget):
                 self._peaks[i] = self._levels[i]
             else:
                 self._peaks[i] = max(self._levels[i], self._peaks[i] - self.PEAK_GRAVITY * dt)
-        self.update()
+        # Only repaint when there's actually something to draw or something still moving.
+        # Without this the widget repaints 60×/sec forever (even sitting idle at rest),
+        # and those constant repaints steal GIL/CPU from the render worker — a palpable
+        # stutter right before playback. When fully at rest, go quiet until audio returns.
+        active = data is not None or any(self._levels) or any(self._peaks)
+        was_active = getattr(self, "_active", False)
+        self._active = active
+        # repaint while active, PLUS one final repaint on the active->inactive edge so the
+        # grid lines (and last bars) are cleared instead of lingering on screen
+        if active or was_active:
+            self.update()
 
     def paintEvent(self, _):
         from PySide6.QtGui import QPainter, QColor, QLinearGradient
@@ -794,11 +801,13 @@ class EQVisualizer(QWidget):
             peak = QColor("#111111"); grid = QColor(0, 0, 0, 20)
         # no background fill — the widget is transparent to the window behind it, in both
         # themes (light mode never drew a distinct box; dark mode shouldn't either)
-        # faint horizontal grid lines (foobar look)
-        p.setPen(grid)
-        for gy in range(1, 4):
-            y = int(H * gy / 4)
-            p.drawLine(0, y, W, y)
+        # faint horizontal grid lines (foobar look) — only while the visualiser is active,
+        # so an idle/empty visualiser doesn't leave stray lines floating in the top bar
+        if getattr(self, "_active", False):
+            p.setPen(grid)
+            for gy in range(1, 4):
+                y = int(H * gy / 4)
+                p.drawLine(0, y, W, y)
         n = self.N_BARS
         gap = 2
         bw = max(1, (W - gap * (n + 1)) / n)
@@ -859,7 +868,6 @@ class VolumeTriangle(QWidget):
 
     def paintEvent(self, _):
         from PySide6.QtGui import QPainter, QColor, QPolygonF
-        from PySide6.QtCore import QPointF
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height(); base = h - 2
         def tri(x_to, color):
@@ -1034,7 +1042,7 @@ class RenderWorker(_PoolWorker):
                 if err:
                     self.log.emit(f"  [{done}/{total}] FAILED: {title}")
                 else:
-                    self.log.emit(f"  [{done}/{total}] done -> {out_path}")
+                    self.log.emit(f"  [{done}/{total}] done -> {out_path.replace(chr(92), '/')}")
                     self.item_done.emit(row)
         finally:
             if self._abort:
@@ -1087,43 +1095,63 @@ class BGAWorker(_PoolWorker):
         self._begin_run()
         ff = ffmpeg_path()
         fps, size = 30, (720, 720)
-        jobs = []; skipped = 0
+        seq_jobs = []       # (job_tuple) for image-sequence/static BGAs
+        vid_jobs = []       # (job_tuple) for video BGAs (muxed)
+        skipped = 0
         for it in self.items:
             info = detect_bga(it["path"])
+            title = it["tags"].get("Title", "untitled")
+            safe = _safe_output_stem(title)
+            out_path = os.path.join(self.out_dir, safe + ".mp4")
             if info["type"] in ("sequence", "static"):
-                title = it["tags"].get("Title", "untitled")
-                safe = _safe_output_stem(title)
-                out_path = os.path.join(self.out_dir, safe + ".mp4")
-                jobs.append((it["path"], out_path, ff, bms_core._LIBRARY_ROOT,
-                             fps, size, self.encode_opts, self.workers))
+                seq_jobs.append((it["path"], out_path, ff, bms_core._LIBRARY_ROOT,
+                                 fps, size, self.encode_opts, self.workers))
+            elif info["type"] == "video":
+                # video BGA: mux the existing video with our audio (job = 7-tuple, no fps)
+                vid_jobs.append((it["path"], out_path, ff, bms_core._LIBRARY_ROOT,
+                                 size, self.encode_opts, self.workers))
             else:
                 skipped += 1
-        if not jobs:
-            self.log.emit(f"No queued charts have an image BGA ({skipped} skipped)."); self.done.emit(); return
-        total = len(jobs); done = 0
+        # tag each job with which worker function renders it, so results are handled with
+        # the right tuple shape (video jobs return a 4th 'warnings' element)
+        tagged = [("seq", j) for j in seq_jobs] + [("vid", j) for j in vid_jobs]
+        if not tagged:
+            self.log.emit(f"No queued charts have a renderable BGA ({skipped} skipped)."); self.done.emit(); return
+        total = len(tagged); done = 0
         self.total_known.emit(total)
         self.log.emit(f"Rendering {total} BGA video(s) with {self.workers} worker(s)… "
-                      f"({skipped} skipped — video/no BGA)")
+                      f"({len(vid_jobs)} video BGA, {len(seq_jobs)} image BGA, {skipped} skipped)")
         import multiprocessing as _mp
         ctx = _mp.get_context("spawn")
         ex = ProcessPoolExecutor(max_workers=self.workers, mp_context=ctx)
         try:
-            futs = {ex.submit(render_bga_video_job, j): j for j in jobs}
+            futs = {}
+            for kind, j in tagged:
+                fn = render_bga_muxed_job if kind == "vid" else render_bga_video_job
+                futs[ex.submit(fn, j)] = (kind, j)
             for fut in as_completed(futs):
                 if self._abort:
                     break
                 done += 1
-                src_path = futs[fut][0]          # job tuple starts with the chart path
+                kind, jtuple = futs[fut]
+                src_path = jtuple[0]             # job tuple starts with the chart path
+                warns = []
                 try:
-                    out_path, title, err = fut.result()
+                    result = fut.result()
+                    if kind == "vid":
+                        out_path, title, err, warns = result
+                    else:
+                        out_path, title, err = result
                 except Exception as e:
                     self.log.emit(f"  [{done}/{total}] worker crashed: {e}")
                     self.item_done.emit(done); continue
+                for w in warns:                 # surface per-chart warnings in the log
+                    self.log.emit(f"      WARNING — {title}: {w}")
                 if err:
                     reason = err.strip().splitlines()[-1] if err.strip() else "unknown error"
                     self.log.emit(f"  [{done}/{total}] FAILED: {title} — {reason}")
                 else:
-                    self.log.emit(f"  [{done}/{total}] done -> {out_path}")
+                    self.log.emit(f"  [{done}/{total}] done -> {out_path.replace(chr(92), '/')}")
                     self.item_rendered.emit(src_path)   # remove this one from the queue
                 self.item_done.emit(done)
         finally:
@@ -1296,6 +1324,7 @@ class BGAExportDialog(QDialog):
 
         # ---------------- video column ----------------
         vbox = QGroupBox("Video"); vlay = QVBoxLayout(vbox)
+        self._video_group = vbox
         self.v_combo = QComboBox()
         for label, _key in self.VIDEO_CODECS:
             self.v_combo.addItem(label)
@@ -1343,6 +1372,15 @@ class BGAExportDialog(QDialog):
         alay.addStretch(1)
         cols.addWidget(abox, 1)
 
+        # ---------------- lossless remux toggle ----------------
+        self.remux_chk = QCheckBox("Lossless remux (copy video, no re-encode)")
+        self.remux_chk.setToolTip(
+            "Copy the BGA video stream as-is instead of re-encoding it, preserving the "
+            "original quality exactly. The video's codec and resolution follow the source, "
+            "output is always .mkv, and audio must be lossless. If the video is shorter "
+            "than the song the picture simply ends (black) while the audio continues.")
+        root.addWidget(self.remux_chk)
+
         # ---------------- threads + priority ----------------
         prow = QHBoxLayout()
         prow.addWidget(QLabel("Threads:"))
@@ -1367,6 +1405,7 @@ class BGAExportDialog(QDialog):
 
         self.v_combo.currentIndexChanged.connect(self._sync_video)
         self.a_combo.currentIndexChanged.connect(self._sync_audio)
+        self.remux_chk.toggled.connect(self._sync_remux)
         # keep each slider and its manual spinbox in lock-step (both directions)
         self.v_bitrate.valueChanged.connect(
             lambda v: self._mirror(self.v_bitrate_spin, v))
@@ -1374,7 +1413,7 @@ class BGAExportDialog(QDialog):
             lambda v: self._mirror(self.v_bitrate, v))
         self.a_slider.valueChanged.connect(self._on_audio_slider)
         self.a_spin.valueChanged.connect(lambda v: self._mirror(self.a_slider, v))
-        self._sync_video(); self._sync_audio()
+        self._sync_video(); self._sync_audio(); self._sync_remux()
 
     @staticmethod
     def _mirror(widget, value):
@@ -1435,6 +1474,29 @@ class BGAExportDialog(QDialog):
             _set(64, 320, 8, cur if cur >= 64 else 192, True, " kbps")
             self.a_slider_lbl.setText("Bitrate:")
 
+    def _sync_remux(self):
+        """Lossless-remux mode copies the source video verbatim, so the entire Video
+        codec panel is inapplicable (grey it out), and only lossless audio makes sense
+        (disable the lossy entries and snap the selection to a lossless one)."""
+        on = self.remux_chk.isChecked()
+        # grey out the whole Video group
+        self._video_group.setEnabled(not on)
+        # audio: allow only lossless (FLAC / WAV); disable the lossy entries in the combo
+        lossless_keys = {"flac", "wav"}
+        model = self.a_combo.model()
+        for i, (_label, key) in enumerate(self.AUDIO_CODECS):
+            item = model.item(i)
+            if item is not None:
+                item.setEnabled((key in lossless_keys) if on else True)
+        if on and self._audio_key() not in lossless_keys:
+            # snap to FLAC (first lossless option) so a lossy codec isn't left selected
+            for i, (_label, key) in enumerate(self.AUDIO_CODECS):
+                if key == "flac":
+                    self.a_combo.setCurrentIndex(i); break
+            self._sync_audio()
+        self.a_combo.setToolTip(
+            "Lossless remux requires lossless audio (FLAC or WAV)." if on else "")
+
     def _update_audio_label(self, v):
         # the spinbox shows the number now; the label only carries the caption,
         # which _sync_audio already sets per-codec, so nothing to do here
@@ -1450,6 +1512,7 @@ class BGAExportDialog(QDialog):
             "audio": a,
             "abitrate": self.a_slider.value() if a not in ("flac", "wav") else 192,
             "flac_level": self.a_slider.value() if a == "flac" else 8,
+            "remux": self.remux_chk.isChecked(),   # lossless: copy video, no re-encode
         }
         return opts, self.prio.currentText(), self.threads.value()
 
@@ -1467,7 +1530,6 @@ class _CodecPerfGraphic(QWidget):
         self.update()
 
     def paintEvent(self, _e):
-        from PySide6.QtGui import QPainter, QColor, QPalette
         q, s, sp = self._perf
         # all three bars read the same way: a LONGER bar is always better. The middle
         # metric is file-size EFFICIENCY (longer = smaller files for the same quality),
@@ -1595,7 +1657,6 @@ class ArtViewerDialog(QDialog):
         the theme toggles, so an already-open viewer's arrows update live."""
         if not hasattr(self, "_prev"):
             return
-        from PySide6.QtWidgets import QStyle
         icon = getattr(self.parent(), "_themed_media_icon", None)
         if icon:
             self._prev.setIcon(icon(QStyle.SP_ArrowLeft))
@@ -1627,7 +1688,6 @@ class ArtViewerDialog(QDialog):
         self._rescale()
 
     def _show_art_menu(self, pos):
-        from PySide6.QtWidgets import QMenu
         menu = QMenu(self)
         act_copy = menu.addAction("Copy image to clipboard")
         act = menu.exec(self._img.mapToGlobal(pos))
@@ -1657,7 +1717,6 @@ class ArtViewerDialog(QDialog):
         try:
             from PIL import Image
             import io as _io
-            from PySide6.QtGui import QImage
             resample = Image.LANCZOS if key == "lanczos" else Image.BICUBIC
             im = Image.open(self._path).convert("RGBA")
             iw, ih = im.size
@@ -2133,7 +2192,6 @@ class MainWindow(QMainWindow):
         logo.setCursor(Qt.PointingHandCursor)
         logo.setToolTip("Open the BMS Renderer GitHub page")
         def _open_repo(_e):
-            from PySide6.QtGui import QDesktopServices
             from PySide6.QtCore import QUrl
             QDesktopServices.openUrl(QUrl("https://github.com/nyannurs/BMS-Renderer"))
         logo.mousePressEvent = _open_repo
@@ -2174,7 +2232,6 @@ class MainWindow(QMainWindow):
         default. The style stays Fusion app-wide (set at startup), so only the palette
         changes — that makes the light<->dark switch fully reversible in one click."""
         from PySide6.QtWidgets import QApplication
-        from PySide6.QtGui import QPalette, QColor
         app = QApplication.instance()
         if dark:
             pal = QPalette()
@@ -2275,7 +2332,6 @@ class MainWindow(QMainWindow):
     def _is_dark_theme(self):
         """True when the window background is darker than its text — i.e. a dark/Night
         theme is active — so we can invert the black logo to white."""
-        from PySide6.QtGui import QPalette
         pal = self.palette()
         bg = pal.color(QPalette.ColorRole.Window)
         # perceived luminance; < 128 means a dark background
@@ -2283,7 +2339,6 @@ class MainWindow(QMainWindow):
 
     def _invert_pixmap(self, pm):
         """Invert RGB (keep alpha) so a black wordmark becomes white on dark themes."""
-        from PySide6.QtGui import QImage
         img = pm.toImage().convertToFormat(QImage.Format_ARGB32)
         img.invertPixels(QImage.InvertRgb)     # leaves the alpha channel untouched
         from PySide6.QtGui import QPixmap as _QPixmap
@@ -2343,7 +2398,6 @@ class MainWindow(QMainWindow):
         self._start_logo_pulse()
 
     def _start_logo_pulse(self):
-        from PySide6.QtCore import QTimer
         import math
         base = self._base_logo_pixmap()
         if base is None:
@@ -2389,14 +2443,12 @@ class MainWindow(QMainWindow):
     def _refresh_media_icons(self):
         """(Re)apply themed icons to the transport buttons — called at build and on every
         theme switch. Play/pause is delegated to _update_play_icon so its state is kept."""
-        from PySide6.QtWidgets import QStyle
         if hasattr(self, "prev_btn"):
             self.prev_btn.setIcon(self._themed_media_icon(QStyle.SP_MediaSkipBackward))
             self.stop_btn.setIcon(self._themed_media_icon(QStyle.SP_MediaStop))
             self.next_btn.setIcon(self._themed_media_icon(QStyle.SP_MediaSkipForward))
             self._update_play_icon()   # sets play/pause with the right themed glyph
         if hasattr(self, "song_art_prev"):
-            from PySide6.QtWidgets import QStyle
             self.song_art_prev.setIcon(self._themed_media_icon(QStyle.SP_ArrowLeft))
             self.song_art_next.setIcon(self._themed_media_icon(QStyle.SP_ArrowRight))
 
@@ -2423,7 +2475,6 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.songs_only)
         bar.addWidget(QLabel("Search:"))
         self.lib_search = QLineEdit()
-        from PySide6.QtCore import QTimer
         self._lib_search_timer = QTimer(self); self._lib_search_timer.setSingleShot(True)
         self._lib_search_timer.setInterval(220)
         self._lib_search_timer.timeout.connect(self._apply_lib_filter)
@@ -2966,7 +3017,6 @@ class MainWindow(QMainWindow):
         # now that the current song is playing, pre-render the NEXT one in the background
         # so hitting next / auto-advance is instant (gapless). Deferred a beat so it never
         # competes with starting the current song.
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(400, self._prefetch_next)
 
     def _build_wave_envelope(self, audio):
@@ -3136,6 +3186,13 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
+    def _save_toggle_state(self, key, value):
+        """Persist a transport toggle (shuffle/loop) so it survives a restart."""
+        try:
+            cfg = load_config(); cfg[key] = bool(value); save_config(cfg)
+        except Exception:
+            pass
+
     def _on_volume(self, level):
         # a manual (or programmatic non-mute) volume change above 0 clears mute
         if level > 0:
@@ -3222,6 +3279,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "wave"):
             self.wave.clear()
         self._update_play_icon()
+        if hasattr(self, "now_lbl"):
+            self.now_lbl.setSong("")             # clear the song title (was left behind)
         if hasattr(self, "now_src_lbl"):
             self.now_src_lbl.setText("")
         self._write_nowplaying("", "", "")       # clear the OBS now-playing file
@@ -3384,7 +3443,20 @@ class MainWindow(QMainWindow):
     def _next_track(self):
         self._advance(+1)
 
+    # seconds into the song past which "previous" restarts the current track instead of
+    # skipping back one — the standard music-player behaviour (Spotify/iTunes use ~3s)
+    PREV_RESTART_THRESHOLD = 3.0
+
     def _prev_track(self):
+        # If we're already a few seconds into the current song, "previous" restarts it
+        # (like most music players); pressing it again from the start goes to the actual
+        # previous track. Below the threshold, it goes straight back a track.
+        p = self.player
+        if p is not None and p.duration_seconds() > 0:
+            pos = p.position_seconds()
+            if pos > self.PREV_RESTART_THRESHOLD:
+                p.seek_seconds(0.0)
+                return
         self._advance(-1)
 
     def _install_media_keys(self):
@@ -3447,7 +3519,6 @@ class MainWindow(QMainWindow):
             self.log("Couldn't open the current default audio device.")
 
     def _update_play_icon(self):
-        from PySide6.QtWidgets import QStyle
         playing = self.player is not None and self.player.state == "playing"
         self.play_btn.setIcon(self._themed_media_icon(
             QStyle.SP_MediaPause if playing else QStyle.SP_MediaPlay))
@@ -3579,7 +3650,6 @@ class MainWindow(QMainWindow):
             src = QPixmap(art_path)
             if not src.isNull():
                 src = src.scaled(self.TILE, self.TILE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                from PySide6.QtGui import QPainter
                 p = QPainter(base)
                 p.drawPixmap((self.TILE - src.width()) // 2,
                              (self.TILE - src.height()) // 2, src)
@@ -3872,7 +3942,6 @@ class MainWindow(QMainWindow):
             return
         # songs-only group row (has children) → add all its charts
         if item.childCount() > 0 and self.songs_only.isChecked():
-            from PySide6.QtWidgets import QMenu
             m = QMenu(self)
             act = m.addAction("Add all charts for this song to Queue")
             if m.exec(self.ltable.viewport().mapToGlobal(pos)) == act:
@@ -3892,7 +3961,6 @@ class MainWindow(QMainWindow):
             return
         # level header (has children, no song path) → "Add all in this level"
         if item.childCount() > 0 and item.data(0, Qt.UserRole) is None:
-            from PySide6.QtWidgets import QMenu
             m = QMenu(self)
             act = m.addAction("Add all in this level to Queue")
             if m.exec(self.ttree.viewport().mapToGlobal(pos)) == act:
@@ -3915,7 +3983,6 @@ class MainWindow(QMainWindow):
         if not songs:
             return
         n = len(songs)
-        from PySide6.QtWidgets import QMenu
         m = QMenu(self)
         act_play = m.addAction("Play") if n == 1 else None
         act_queue = m.addAction(f"Add {n} selected to Queue" if n > 1 else "Add to Queue")
@@ -3969,7 +4036,6 @@ class MainWindow(QMainWindow):
                 self._show_playlist(name)
 
     def _add_songs_new_playlist(self, songs):
-        from PySide6.QtWidgets import QInputDialog
         name, ok = QInputDialog.getText(self, "New playlist", "Playlist name:")
         if not ok or not name.strip():
             return
@@ -3996,7 +4062,6 @@ class MainWindow(QMainWindow):
             if editable:
                 e.setStyleSheet("")
             else:
-                from PySide6.QtGui import QPalette
                 pal = self.palette()
                 base = pal.color(QPalette.ColorRole.AlternateBase).name()
                 txt = pal.color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text).name()
@@ -4081,6 +4146,26 @@ class MainWindow(QMainWindow):
         # the whole chart, which can be large)
         self._update_bga_indicator(s.get("path"))
 
+    def _show_file_path_menu(self, pos):
+        """Right-click menu on the File field: copy the FULL (un-elided) path, or open its
+        containing folder — handy for grabbing the chart's folder to fetch its files."""
+        full = getattr(self, "_info_file_full", "") or ""
+        if not full or full == "—":
+            return
+        from PySide6.QtWidgets import QMenu, QApplication
+        menu = QMenu(self)
+        act_copy = menu.addAction("Copy full path")
+        act_open = menu.addAction("Open containing folder")
+        act = menu.exec(self.info_fields["File"].mapToGlobal(pos))
+        if act == act_copy:
+            QApplication.clipboard().setText(full.replace("\\", "/"))
+        elif act == act_open:
+            import os as _os
+            folder = _os.path.dirname(full)
+            if _os.path.isdir(folder):
+                from PySide6.QtCore import QUrl
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
     def _elide_path(self, label, text):
         """Middle-elide `text` with '…' to fit the label's current width, so long paths
         don't overflow. Falls back to the raw text if metrics aren't available yet."""
@@ -4125,8 +4210,8 @@ class MainWindow(QMainWindow):
             self.bga_indicator.setText("○ Static BGA only (single image)")
             self.bga_indicator.setStyleSheet("color:#999;")
         elif kind == "video":
-            self.bga_indicator.setText("○ Video BGA (not rendered as a sequence)")
-            self.bga_indicator.setStyleSheet("color:#999;")
+            self.bga_indicator.setText("● Video BGA — can be rendered")
+            self.bga_indicator.setStyleSheet("color:#3fae50;")     # green (both themes)
         else:
             self.bga_indicator.setText("○ No BGA to render")
             self.bga_indicator.setStyleSheet("color:#999;")
@@ -4396,7 +4481,6 @@ class MainWindow(QMainWindow):
         bar.addStretch(1)
         lay.addLayout(bar)
 
-        from PySide6.QtWidgets import QStackedWidget
         self.pl_stack = QStackedWidget()
         self.pltree = QTreeWidget()
         self.pltree.setColumnCount(len(self.PCOLS))
@@ -4498,7 +4582,6 @@ class MainWindow(QMainWindow):
             return "—"
 
     def _pl_new(self):
-        from PySide6.QtWidgets import QInputDialog
         name, ok = QInputDialog.getText(self, "New playlist", "Playlist name:")
         if not ok or not name.strip():
             return
@@ -4511,7 +4594,6 @@ class MainWindow(QMainWindow):
         self.log(f"Created playlist '{name}'.")
 
     def _pl_rename(self):
-        from PySide6.QtWidgets import QInputDialog
         old = self.pl_pick.currentText()
         if not old:
             return
@@ -4692,7 +4774,6 @@ class MainWindow(QMainWindow):
         # gather the full selection (resolved owned songs)
         sel = self._pl_selected_songs()
         n = len(sel)
-        from PySide6.QtWidgets import QMenu
         m = QMenu(self)
         act_play = m.addAction("Play") if n == 1 else None
         act_queue = m.addAction(f"Add {n} selected to Queue" if n > 1 else "Add to Queue") if sel else None
@@ -4741,7 +4822,6 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.table_pick)
         add_btn = QPushButton("Add table by URL…"); add_btn.clicked.connect(self._add_table_by_url)
         ref_btn = QPushButton("Refresh"); ref_btn.clicked.connect(self._refresh_table)
-        from PySide6.QtWidgets import QStyle
         ref_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
         bar.addWidget(add_btn); bar.addWidget(ref_btn)
         bar.addSpacing(16)
@@ -4754,7 +4834,6 @@ class MainWindow(QMainWindow):
         bar.addStretch(1)
         lay.addLayout(bar)
 
-        from PySide6.QtWidgets import QStackedWidget
         self.t_stack = QStackedWidget()
         self.ttree = QTreeWidget()
         self.ttree.setColumnCount(len(self.TCOLS))
@@ -4800,7 +4879,6 @@ class MainWindow(QMainWindow):
             self._on_table_pick(self.table_pick.currentText())
 
     def _add_table_by_url(self):
-        from PySide6.QtWidgets import QInputDialog
         url, ok = QInputDialog.getText(self, "Add table", "Paste the difficulty-table URL:")
         if not ok or not url.strip():
             return
@@ -4975,7 +5053,6 @@ class MainWindow(QMainWindow):
         topbar.addWidget(QLabel("(album view plays left-to-right)"))
         topbar.addStretch(1)
         lay.addLayout(topbar)
-        from PySide6.QtWidgets import QStackedWidget
         self.q_stack = QStackedWidget()
         self.qtable = QTreeWidget()                  # QTreeWidget like the other tabs,
         self.qtable.setColumnCount(len(self.QCOLS))  # so header resize behaves identically
@@ -5061,6 +5138,11 @@ class MainWindow(QMainWindow):
                 lbl.setMaximumWidth(230)     # long values elide/clip instead of stretching
             self.info_fields[k] = lbl; iform.addRow(k + ":", lbl)
             lbl.installEventFilter(self)        # right-positioned full-value tooltip
+        # The File label shows a middle-elided path, so selecting/copying its text grabs
+        # the "…" version. Give it a right-click "Copy full path" that copies the real,
+        # un-elided path (stashed in _info_file_full) to the clipboard.
+        self.info_fields["File"].setContextMenuPolicy(Qt.CustomContextMenu)
+        self.info_fields["File"].customContextMenuRequested.connect(self._show_file_path_menu)
         col.addWidget(info)
 
         # song-folder art picker (per-song cover, with prev/next + slider)
@@ -5073,7 +5155,6 @@ class MainWindow(QMainWindow):
         self.song_art_preview.mousePressEvent = lambda e: self._open_art_viewer()
         pv.addWidget(self.song_art_preview, 0, Qt.AlignHCenter)
         nav = QHBoxLayout()
-        from PySide6.QtWidgets import QStyle
         self.song_art_prev = QPushButton()
         self.song_art_prev.setIcon(self._themed_media_icon(QStyle.SP_ArrowLeft))
         self.song_art_prev.setObjectName("iconBtn")
@@ -5135,7 +5216,6 @@ class MainWindow(QMainWindow):
 
     # ---- transport bar ----
     def _build_transport(self):
-        from PySide6.QtWidgets import QStyle
         bar = QHBoxLayout()
         st = self.style()
         # native standard media icons (no emoji glyphs), inverted to white on dark themes
@@ -5218,6 +5298,13 @@ class MainWindow(QMainWindow):
             b.setObjectName("toggleBtn")
             b.setFixedHeight(28)
             bar.addWidget(b, 0, Qt.AlignVCenter)
+        # restore the last on/off state, and persist it whenever it changes, so Shuffle
+        # and Loop stay toggled the way the user left them across restarts
+        _cfg = load_config()
+        self.shuffle_cb.setChecked(bool(_cfg.get("shuffle", False)))
+        self.loop_cb.setChecked(bool(_cfg.get("loop", False)))
+        self.shuffle_cb.toggled.connect(lambda v: self._save_toggle_state("shuffle", v))
+        self.loop_cb.toggled.connect(lambda v: self._save_toggle_state("loop", v))
         # everything on the transport row sits vertically centred on a common baseline
         bar.setAlignment(Qt.AlignVCenter)
         # wire playback controls to player.py
@@ -5228,7 +5315,6 @@ class MainWindow(QMainWindow):
         self.dev_btn.clicked.connect(self._redetect_device)
         self._install_media_keys()
         # position/finish poll, like the Tk app's after()-driven _tick
-        from PySide6.QtCore import QTimer
         self._timer = QTimer(self); self._timer.timeout.connect(self._tick)
         if self.player is not None:
             self._timer.start(120)
@@ -5318,7 +5404,6 @@ class MainWindow(QMainWindow):
         if not sel_rows:
             return
         n = len(sel_rows)
-        from PySide6.QtWidgets import QMenu
         m = QMenu(self)
         act_play = m.addAction("Play") if n == 1 else None
         # send selected queue items to a playlist (new or existing)
@@ -5563,7 +5648,6 @@ def main():
             # Qt's event loop otherwise starves Python's signal handlers; a cheap idle
             # timer hands control back to the interpreter periodically so a SIGINT
             # delivered mid-run is actually seen.
-            from PySide6.QtCore import QTimer
             _sig_timer = QTimer()
             _sig_timer.start(200)
             _sig_timer.timeout.connect(lambda: None)

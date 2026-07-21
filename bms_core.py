@@ -196,7 +196,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.6.0"
 CHANGELOG = []
 
 # ============================================================================
@@ -1683,6 +1683,152 @@ def bga_timeline(path):
     return out, total_seconds, missing, layer_out
 
 
+def video_bga_info(path):
+    """For a chart whose BGA is a video, find what's needed to render it by muxing the
+    video with the rendered audio. Reuses bga_timeline's tempo/measure accumulator so the
+    video's start time lines up with the audio exactly. Returns a dict:
+        {"video_file": abs_path,      # the BGA video on disk (first one placed on ch04)
+         "start_sec":  float,          # when the video is triggered, in seconds
+         "total_sec":  float,          # chart length (for duration handling)
+         "has_image_overlay": bool,    # True if ch07 places a real IMAGE sequence over
+                                       #   the video (Phase-2 compositing territory)
+         "warnings":   [str, ...]}     # human-readable notes for the log
+    or None if no video BGA is found.
+
+    The poor/miss layer (06/0A) is intentionally not considered — those are gameplay
+    overlays, not part of the BGA to render.
+    """
+    d = parse_bms(path)
+    header, bars = d["header"], d["bars"]
+    bpm_table, stop_table = d["bpm_table"], d["stop_table"]
+    base = d.get("base", 36)
+    folder = os.path.dirname(path)
+
+    bmp_table = {}
+    for line in read_bms_text(path).splitlines():
+        line = line.strip()
+        m = re.match(r"#BMP([0-9A-Za-z]{2})\s+(.+)", line, re.IGNORECASE)
+        if m:
+            try:
+                bmp_table[_decode_id(m.group(1), base)] = m.group(2).strip()
+            except ValueError:
+                pass
+    if not bars or not bmp_table:
+        return None
+
+    max_measure = max(bars.keys())
+    base_events, layer_events = [], []       # (seconds, bmp_id)
+    try:
+        base_bpm = float(header.get("BPM", 120)) or 120.0
+    except (ValueError, TypeError):
+        base_bpm = 120.0
+    bpm = base_bpm
+    sample_pos = 0.0
+    for measure in range(max_measure + 1):
+        bar = bars.get(measure, {})
+        ratio = 1.0
+        if "02" in bar:
+            try:
+                ratio = float(bar["02"][-1]) or 1.0
+            except (ValueError, IndexError):
+                ratio = 1.0
+        resolution = 1
+        tracked = {}
+        for chan, payloads in bar.items():
+            if chan not in ("03", "08", "09", "04", "07"):
+                continue
+            for payload in payloads:
+                pairs = [payload[i:i+2] for i in range(0, len(payload) - len(payload) % 2, 2)]
+                n = len(pairs)
+                if n == 0:
+                    continue
+                resolution = resolution * n // gcd(resolution, n)
+                tracked.setdefault(chan, []).append(pairs)
+        for step in range(resolution):
+            stop_here = 0.0
+            for chan, lines in tracked.items():
+                for pairs in lines:
+                    n = len(pairs)
+                    if (step * n) % resolution != 0:
+                        continue
+                    pair = pairs[(step * n) // resolution]
+                    if pair == "00" or pair == "":
+                        continue
+                    try:
+                        val = _decode_id(pair, base)
+                    except ValueError:
+                        continue
+                    if chan == "03":
+                        try: bpm = float(int(pair.upper(), 16))
+                        except ValueError: pass
+                    elif chan == "08":
+                        if val in bpm_table: bpm = bpm_table[val]
+                    elif chan == "09":
+                        stop_here = stop_table.get(val, 0.0)
+                    elif chan == "04":
+                        base_events.append((sample_pos / SR, val))
+                    elif chan == "07":
+                        layer_events.append((sample_pos / SR, val))
+            if bpm <= 0:
+                bpm = base_bpm
+            sample_pos += (SR * 60.0 / bpm) / (resolution / 4.0) * ratio
+            if stop_here != 0.0:
+                sample_pos += (SR * 60.0 / bpm) * (stop_here / 192.0 * 4.0)
+    total_sec = sample_pos / SR
+
+    # first video event on the base layer = the video BGA and its start time
+    video_file, start_sec = None, 0.0
+    for t, bid in base_events:
+        fn = bmp_table.get(bid, "")
+        if os.path.splitext(fn)[1].lower() in VIDEO_EXTS:
+            vpath = _find_bga_file(folder, fn)
+            if vpath:
+                video_file, start_sec = vpath, t
+                break
+    if video_file is None:
+        return None
+
+    warnings = []
+    # multiple distinct video files placed on ch04 → we only render the first
+    distinct_vids = {bmp_table.get(b, "") for _, b in base_events
+                     if os.path.splitext(bmp_table.get(b, ""))[1].lower() in VIDEO_EXTS}
+    if len(distinct_vids) > 1:
+        warnings.append(f"chart places {len(distinct_vids)} video BGAs; rendering only the first")
+
+    # a real IMAGE overlay on ch07 = Phase-2 compositing territory (we warn, render base)
+    has_image_overlay = any(
+        os.path.splitext(bmp_table.get(b, ""))[1].lower() in IMAGE_EXTS
+        for _, b in layer_events)
+    if has_image_overlay:
+        warnings.append("chart has an image overlay layer (ch07) over the video; "
+                        "compositing not yet supported — rendering base video only")
+    if start_sec > 0.05:
+        warnings.append(f"video BGA starts at {start_sec:.2f}s (offset honored)")
+
+    return {"video_file": video_file, "start_sec": start_sec, "total_sec": total_sec,
+            "has_image_overlay": has_image_overlay, "warnings": warnings}
+
+
+def _find_bga_file(folder, filename):
+    """Resolve a BGA file (video or image) referenced in a chart to an actual path on
+    disk, tolerant of case and of the extension differing from what the chart names (BMS
+    charts often say '.bmp' but ship '.mp4'/'.wmv', or vice versa)."""
+    if not filename:
+        return None
+    cand = os.path.join(folder, filename)
+    if os.path.exists(cand):
+        return cand
+    stem = os.path.splitext(filename)[0].lower()
+    try:
+        for entry in os.listdir(folder):
+            estem, eext = os.path.splitext(entry)
+            if estem.lower() == stem and eext.lower() in (VIDEO_EXTS + IMAGE_EXTS):
+                return os.path.join(folder, entry)
+    except OSError:
+        pass
+    return None
+
+
 def _is_nvenc_args(args):
     """True if the ffmpeg arg list selects an NVENC (hardware) video encoder."""
     return any(isinstance(a, str) and a.endswith("_nvenc") for a in args)
@@ -2135,6 +2281,193 @@ def render_bga_video_job(job):
         return (out_path, title, None)
     except Exception:
         return (out_path, title, traceback.format_exc())
+
+
+def _ffmpeg_error_reason(stderr_text):
+    """Pull the meaningful error out of ffmpeg's stderr. ffmpeg prints its banner and a
+    stream dump before the actual error, and ends with a generic 'Conversion failed!';
+    the useful line is usually just above that. Returns a short human-readable reason."""
+    if not stderr_text:
+        return "unknown error"
+    lines = [ln.strip() for ln in stderr_text.splitlines() if ln.strip()]
+    # keywords that mark the real cause
+    for ln in reversed(lines):
+        low = ln.lower()
+        if any(k in low for k in (
+                "could not", "cannot", "invalid", "not supported", "unsupported",
+                "does not contain", "incompatible", "error", "failed to",
+                "no such", "permission denied", "codec")):
+            if ln.lower() != "conversion failed!":
+                return ln[:200]
+    # otherwise fall back to the last non-generic line
+    for ln in reversed(lines):
+        if ln.lower() != "conversion failed!":
+            return ln[:200]
+    return "conversion failed"
+
+
+def render_bga_muxed_job(job):
+    """Render ONE chart whose BGA is a VIDEO by muxing that video with the freshly
+    rendered audio (Phase 1: base video layer only; image overlays on ch07 are detected
+    and warned about, not composited). Runs in a worker process.
+
+    job = (in_path, out_path, ffmpeg, library_root, size, opts, n_workers)  (trailing
+    items optional, mirroring render_bga_video_job). Returns (out_path, title, err_or_None,
+    warnings_list) — note the 4-tuple: the extra slot carries per-chart warnings for the
+    log so timing/overlay edge cases surface without failing the render.
+
+    Behaviour, per the agreed spec:
+      • the video is delayed by its chart-triggered start time (-itsoffset), so it lines
+        up with the audio rather than assuming it starts at t=0;
+      • output length follows the AUDIO (the song is the point);
+      • if the video ends before the song, the tail goes to BLACK (not a frozen frame);
+      • dimensions are forced even (H.264 requirement) without changing aspect ratio;
+      • the video's own embedded audio (some WMVs carry one) is dropped — we always use
+        the rendered chart audio;
+      • codec/quality/container come from the SAME encode-options dict the image-sequence
+        BGA dialog produces (via _bga_encode_args), so it inherits all that flexibility.
+    """
+    n_workers = 1
+    if len(job) >= 7:
+        in_path, out_path, ff, lib_root, size, _opts, n_workers = job[:7]
+    elif len(job) == 6:
+        in_path, out_path, ff, lib_root, size, _opts = job[:6]
+    else:
+        in_path, out_path, ff, lib_root, size = job[:5]
+        _opts = None
+    title = os.path.basename(in_path)
+    warnings = []
+    try:
+        import subprocess
+        set_library_root(lib_root)
+        assert_safe_output(out_path)
+        if not ff:
+            raise RuntimeError("ffmpeg is required for video-BGA export")
+
+        info = video_bga_info(in_path)
+        if not info or not info.get("video_file"):
+            raise RuntimeError("no video BGA found in chart")
+        warnings.extend(info.get("warnings", []))
+
+        # 1) audio
+        audio, _ = render_bms(in_path)
+        tmp_wav = out_path + ".tmp.wav"
+        sf.write(tmp_wav, audio, SR, format="WAV")
+        audio_seconds = len(audio) / SR
+
+        start_sec = max(0.0, float(info["start_sec"]))
+        target = max(size)
+        remux = bool((_opts or {}).get("remux"))
+        remux_ok = False
+
+        if remux:
+            # ---- LOSSLESS REMUX: copy the video stream verbatim, no re-encode ----
+            # The video is delayed by its start offset with -itsoffset (a timestamp shift,
+            # not a filter, so it stays a stream copy). Output is forced to .mkv, which
+            # accepts the source's native codec (wmv2/vc1/h264/…). Audio is written lossless
+            # (FLAC). We deliberately do NOT cap the video length or pad it: if the video is
+            # shorter than the song, its stream simply ends and players show black while the
+            # audio continues — the "organic black tail" with zero re-encoding. If the video
+            # is LONGER, it's trimmed to the song via -to on the output (cut at the nearest
+            # copyable point; may differ by up to one keyframe, which is inherent to copy).
+            mkv_out = os.path.splitext(out_path)[0] + ".mkv"
+            a_key = (_opts or {}).get("audio", "flac")
+            if a_key == "wav":
+                a_args = ["-c:a", "pcm_s16le"]
+            else:
+                a_args = ["-c:a", "flac", "-compression_level",
+                          str(int((_opts or {}).get("flac_level", 8)))]
+            cmd = [ff, "-y", "-fflags", "+genpts"]
+            if start_sec > 0.001:
+                cmd += ["-itsoffset", f"{start_sec:.3f}"]
+            cmd += ["-i", info["video_file"],           # 0: BGA video (offset)
+                    "-i", tmp_wav,                       # 1: rendered audio
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy"]                      # <-- no re-encode
+            cmd += a_args
+            cmd += ["-to", f"{audio_seconds:.3f}"]       # don't run past the song
+            cmd += [mkv_out]
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               **_no_window_kwargs())
+            if p.returncode == 0:
+                remux_ok = True
+                out_path = mkv_out
+            else:
+                # the source couldn't be stream-copied into mkv — DON'T fail the chart;
+                # fall through to the re-encode path and note it in the log
+                reason = _ffmpeg_error_reason(p.stderr.decode("utf-8", "replace"))
+                warnings.append(f"lossless remux not possible ({reason}); "
+                                f"re-encoded this one instead")
+                try:
+                    if os.path.exists(mkv_out):
+                        os.remove(mkv_out)
+                except OSError:
+                    pass
+
+        if not remux_ok:
+            # ---- RE-ENCODE PATH (full codec/size flexibility, or remux fallback) ----
+            # video filter chain:
+            #   - tpad=start: prepend BLACK for the pre-trigger offset (so an offset video
+            #     starts black, then plays — matching real BGA behaviour). We use tpad
+            #     rather than -itsoffset because tpad's added black frames are encodable in
+            #     one pass; -itsoffset alone can leave a duplicated first frame on some
+            #     encoders.
+            #   - scale to fit `target` keeping aspect ratio, then pad to even dims.
+            vf = []
+            if start_sec > 0.001:
+                vf.append(f"tpad=start_duration={start_sec:.3f}:start_mode=add:color=black")
+            vf.append(f"scale='min({target},iw)':'min({target},ih)':"
+                      f"force_original_aspect_ratio=decrease")
+            vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")   # force even dimensions
+            # end the video with BLACK if it's shorter than the song
+            vf.append("tpad=stop=-1:stop_mode=add:color=black")
+            vfilter = ",".join(vf)
+
+            # if we fell back from remux, opts still say remux; force a real encoder
+            enc_opts = dict(_opts or {})
+            if enc_opts.get("remux"):
+                enc_opts["remux"] = False
+                enc_opts.setdefault("video", "default")
+            enc_args, real_out = _bga_encode_args(enc_opts, out_path)
+            out_path = real_out
+
+            def _run(v_args, out):
+                cmd = [ff, "-y",
+                       "-i", info["video_file"],           # 0: BGA video
+                       "-i", tmp_wav,                       # 1: rendered audio
+                       "-map", "0:v:0", "-map", "1:a:0",    # video from BGA, audio from us
+                       "-vf", vfilter,
+                       "-t", f"{audio_seconds:.3f}"]        # hard cap to song length
+                cmd += v_args
+                cmd += [out]                                # output path LAST
+                p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   **_no_window_kwargs())
+                return p.returncode, p.stderr.decode("utf-8", "replace")
+
+            rc, err_txt = _run(enc_args, out_path)
+
+            # NVENC can be absent on the user's machine; fall back to software
+            if rc != 0 and _is_nvenc_args(enc_args):
+                warnings.append("hardware encoder unavailable — retrying with software x264")
+                sw_opts = dict(enc_opts)
+                sw_opts["video"] = {"x264_nvenc": "x264",
+                                    "hevc_nvenc": "hevc"}.get(sw_opts.get("video"), "x264")
+                enc_args, real_out = _bga_encode_args(sw_opts, out_path)
+                out_path = real_out
+                rc, err_txt = _run(enc_args, out_path)
+
+            if rc != 0:
+                if os.path.exists(tmp_wav):
+                    try: os.remove(tmp_wav)
+                    except OSError: pass
+                raise RuntimeError("ffmpeg failed: " + _ffmpeg_error_reason(err_txt))
+
+        if os.path.exists(tmp_wav):
+            try: os.remove(tmp_wav)
+            except OSError: pass
+        return (out_path, title, None, warnings)
+    except Exception:
+        return (out_path, title, traceback.format_exc(), warnings)
 
 
 def render_one_job(job):
