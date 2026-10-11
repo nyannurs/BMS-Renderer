@@ -5,23 +5,23 @@ Developer documentation for contributors. Start here, then read `PUBLIC_02_ENGIN
 **Version:** defined by `APP_VERSION` in `bms_core.py` (single source of truth). Entry point: `python bms_renderer_qt.py`.
 
 ## What it does
-BMS Renderer manages a large library of BMS charts. Each song lives in its own folder with one or more chart files plus the keysound audio and background-animation (BGA) images it references. The app scans the library into a SQLite cache, lets you browse/search/preview charts, plays a chart in-app by rendering it to audio on the fly, renders charts offline to tagged FLAC/WAV/OGG/MP3, and optionally renders the BGA image sequence to an MP4/MKV video with the audio muxed in.
+BMS Renderer manages a large library of BMS charts. Each song lives in its own folder with one or more chart files plus the keysound audio and background-animation (BGA) images it references. The app scans the library into a SQLite cache, lets you browse/search/preview charts, plays a chart in-app by rendering it to audio on the fly, renders charts offline to tagged FLAC/WAV/OGG/MP3, and optionally renders the chart's background animation (BGA) to video with the audio muxed in — either by encoding an image sequence frame by frame, or, when the BGA *is* a video file, by muxing that existing video with the rendered audio (optionally as a lossless stream copy).
 
 ## File map
 | File | Role |
 |------|------|
 | `bms_core.py` | **Engine.** Pure logic, no GUI, no audio device. BMS parsing, audio rendering, BGA rendering, tagging, scanning, caching, persistence, difficulty-table fetching. Unit-tested in isolation. |
-| `bms_renderer_qt.py` | **PyQt5 GUI.** Main window, dialogs, custom widgets, background workers, and the entry point. |
+| `bms_renderer_qt.py` | **PySide6 GUI.** Main window, dialogs, custom widgets, background workers, and the entry point. |
 | `player.py` | **Audio playback.** Wraps sounddevice/PortAudio in a feeder-thread streaming model. |
 | `discord_rpc.py` | **Optional** Discord Rich Presence. The app runs fine without it. |
 | `test_bms_core.py` | Unit tests for the engine (`python3 -m unittest test_bms_core`). |
-| `bms_renderer.py` | Original Tkinter implementation, kept as a behavioural reference. |
 
 ## Architecture
 - **The engine (`bms_core.py`) never imports Qt and never touches an audio device.** It only produces data — parsed charts, numpy audio buffers, and files on disk. This keeps it independently testable.
 - The GUI keeps the main thread free: scanning, offline rendering, BGA detection, thumbnail loading, table fetching, and the per-play render all run on `QThread` workers that call the engine and emit signals back.
-- **Offline renders run in separate processes** (`ProcessPoolExecutor`). The per-song job functions (`render_one_job`, `render_bga_video_job`) are top-level functions so they can be pickled and shipped to worker processes; each process re-imports the engine and re-establishes the library root.
+- **Offline renders run in separate processes** (`ProcessPoolExecutor`). The per-song job functions (`render_one_job`, `render_bga_video_job`, `render_bga_muxed_job`) are top-level functions so they can be pickled and shipped to worker processes; each process re-imports the engine and re-establishes the library root.
 - **In-app playback** is separate: a worker renders one chart to a numpy buffer, which `player.Player` streams to the speakers.
+- **Render progress crosses the process boundary by file.** Because jobs run in separate processes, each job writes its own 0–1 completion fraction to a small file in a temporary directory, and the progress dialog polls that directory. This is what lets a single slow encode show real movement instead of jumping from 0% to 100% when it finishes.
 
 ## The BMS format (essentials)
 A BMS file is a text file (usually Shift-JIS) of `#`-prefixed commands. Header commands define metadata and resource tables (`#TITLE`, `#WAVxx file`, `#BMPxx file`, `#BPMxx`, `#STOPxx`, `#LNOBJ`, and `#RANDOM/#IF/#SWITCH/#CASE` control flow). Channel commands place objects on the timeline as `#MMMCC:payload`, where the payload is a run of 2-char base-36 objects and the measure is divided into N = payload-length/2 equal slots (`00` = empty).
@@ -37,7 +37,7 @@ Two non-obvious rules the engine implements: `#LNOBJ`-marked lane notes are sile
 The engine holds a module-global library root (`set_library_root`). It serves two purposes: `assert_safe_output` raises if a render would write *into* the library (renders must never modify the library), and because renders run in separate processes, each job re-establishes the root from its job tuple. Any new render job must do the same.
 
 ## Persistence
-All under the program directory: `bms_cache.db` (SQLite metadata cache), `bms_config.json`, `tables.json`, and `Playlists/` (one JSON file per playlist). Config keys include `library`, `output`, `render_threads`, `lib_col_widths`, `window_geometry_qt`, `dark_mode`, `art_viewer_scaling`, `art_viewer_geometry`, `table_sort`, `nowplaying_output`, `nowplaying_format`, and `song_visualizer`.
+All under the program directory: `bms_cache.db` (SQLite metadata cache), `bms_config.json`, `tables.json`, and `Playlists/` (one JSON file per playlist). Config keys include `library`, `output`, `render_threads`, `lib_col_widths`, `lib_sort`, `window_geometry_qt`, `dark_mode`, `art_viewer_scaling`, `art_viewer_geometry`, `shuffle`, `loop`, `nowplaying_output`, `nowplaying_format`, and `song_visualizer`.
 
 ## Conventions
 The engine stays Qt-free and audio-device-free. Render job functions stay picklable and top-level. UI uses native Qt icons (`QStyle.SP_*`), not emoji. Encode/quality options are designed so that unchanged settings reproduce the exact prior output — when adding an option, preserve this.

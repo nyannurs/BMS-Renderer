@@ -19,7 +19,6 @@ dist/
 .idea/
 Thumbs.db
 .DS_Store
-Test Suite/
 nowplaying.txt
 nowplaying.html
 nowplaying.json

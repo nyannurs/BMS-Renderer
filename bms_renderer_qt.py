@@ -38,7 +38,7 @@ from bms_core import (
     set_library_root, render_bga_video_job, render_bga_muxed_job, detect_bga, pick_playable_chart,
     render_bms, SR, fetch_table, load_tables_file, save_tables_file, TABLES_PATH,
     load_playlists, save_one_playlist, delete_playlist_file, program_dir,
-    pick_discovery_art,
+    pick_discovery_art, nvenc_available, nvenc_reason, predicted_container,
 )
 # ---------------------------------------------------------------------------
 # Embedded assets (logo wordmark + window icon), base64 PNG. Kept in-source so
@@ -126,6 +126,44 @@ def _safe_output_stem(title):
     return safe
 
 
+def _assign_output_stems(items):
+    """Give every item in a render batch its own output filename stem.
+
+    Output files are named after the chart's #TITLE, and the difficulties of one BMS song
+    almost always share a title. Two items with the same stem then write to the same
+    file — AND to the same ffmpeg scratch file — so one render silently overwrote the
+    other while both reported success. On a real 126k-chart library, 72.5% of song
+    folders contain charts that collide this way, so the "Add all charts for this song to
+    Queue" action lost work most of the time.
+
+    A title that is unique within the batch is left completely alone, so ordinary output
+    filenames don't change. Only where two items collide does each get its own chart
+    FILENAME appended — "Black Lotus [7another]" — which is unique inside a song folder
+    and tells you which chart you're looking at. If even that repeats (the same chart
+    filename in two different folders, e.g. duplicated packs), a numeric suffix settles
+    it. Comparison is case-insensitive because Windows filenames are.
+
+    Returns a list of stems parallel to `items`.
+    """
+    base = [_safe_output_stem(it.get("tags", {}).get("Title", "untitled")) for it in items]
+    seen = {}
+    for s in base:
+        seen[s] = seen.get(s, 0) + 1
+    used, out = set(), []
+    for it, stem in zip(items, base):
+        if seen[stem] > 1:
+            chart = _safe_output_stem(
+                os.path.splitext(os.path.basename(it.get("path", "")))[0])
+            if chart:
+                stem = f"{stem} [{chart}]"
+        final, n = stem, 2
+        while final.casefold() in used:
+            final = f"{stem} ({n})"; n += 1
+        used.add(final.casefold())
+        out.append(final)
+    return out
+
+
 def _black_cover_bytes():
     """JPEG bytes for a 1000x1000 black square (cached). A clean 'no real art' cover
     without writing any file — same as the Tk app's helper."""
@@ -153,7 +191,7 @@ def _app_icon():
         from PySide6.QtGui import QPixmap, QIcon
         import base64
         icon = QIcon()
-        for sz, b64 in ICON_SIZES_B64.items():
+        for b64 in ICON_SIZES_B64.values():
             pm = QPixmap()
             pm.loadFromData(base64.b64decode(b64))
             if not pm.isNull():
@@ -495,13 +533,16 @@ class _SeekBar(QWidget):
         self._pos = max(0.0, min(1.0, frac)); self.update()
 
     def _frac(self, x):
+        # x comes from e.position().x() — a float. QMouseEvent.x() (the Qt5 spelling)
+        # still works in Qt6 but is deprecated and slated for removal, and it truncated
+        # to int; position() is the supported accessor and seeks sub-pixel accurately.
         return max(0.0, min(1.0, x / max(1, self.width())))
 
     def mousePressEvent(self, e):
-        self.seek.emit(self._frac(e.x()))
+        self.seek.emit(self._frac(e.position().x()))
 
     def mouseMoveEvent(self, e):
-        self.seek.emit(self._frac(e.x()))
+        self.seek.emit(self._frac(e.position().x()))
 
     def set_envelope(self, _env):
         """No-op by default so callers can treat any bar uniformly; WaveformBar overrides."""
@@ -852,7 +893,7 @@ class VolumeTriangle(QWidget):
         self.update(); self.changed.emit(self._level)
 
     def mousePressEvent(self, e):
-        self._set_from_x(e.x())
+        self._set_from_x(e.position().x())
 
     def wheelEvent(self, e):
         # scroll up = louder, down = quieter, in small steps
@@ -864,7 +905,7 @@ class VolumeTriangle(QWidget):
         e.accept()
 
     def mouseMoveEvent(self, e):
-        self._set_from_x(e.x())
+        self._set_from_x(e.position().x())
 
     def paintEvent(self, _):
         from PySide6.QtGui import QPainter, QColor, QPolygonF
@@ -946,9 +987,56 @@ class _PoolWorker(QThread):
         super().__init__()
         self.priority = priority
         self._abort = False             # set by abort() to stop after the current item
+        # Per-job progress files live here. Jobs run in separate processes, so each one
+        # writes its own 0..1 fraction to a small file and the progress dialog polls the
+        # directory — that's what lets a single slow encode (AV1) show real movement
+        # instead of jumping 0% -> 100% when it finishes.
+        import tempfile as _tf
+        try:
+            self.progress_dir = _tf.mkdtemp(prefix="bmsrender_")
+        except Exception:
+            self.progress_dir = None
+
+    def _job_progress_path(self, idx):
+        """Path this job should report its fraction to (None disables reporting)."""
+        if not self.progress_dir:
+            return None
+        return os.path.join(self.progress_dir, f"{idx}.prog")
+
+    def _cleanup_progress(self):
+        if not self.progress_dir:
+            return
+        try:
+            import shutil as _sh
+            _sh.rmtree(self.progress_dir, ignore_errors=True)
+        except Exception:
+            pass
+        self.progress_dir = None
 
     def abort(self):
         self._abort = True
+
+    def _resolve_cover(self, item):
+        """Resolve the cover art bytes for one queued item. Lives on the shared base
+        because BOTH workers need it now: the audio worker always, and the BGA worker
+        for its audio-only fallback (so those files get the same art they'd get from a
+        normal audio render). Requires the subclass to set self.cover_cfg."""
+        from bms_core import process_cover, _PIL_OK
+        cfg = getattr(self, "cover_cfg", None)
+        if cfg == "__BLACK__":
+            return _black_cover_bytes()
+        # per-song art (set via the picker / "assign black square") takes effect when
+        # no whole-queue cover is set
+        per = item.get("art")
+        if not cfg and per == "__BLACK__":
+            return _black_cover_bytes()
+        path = cfg if cfg else per
+        if path and path != "__BLACK__" and os.path.isfile(path) and _PIL_OK:
+            try:
+                return process_cover(path)[0]        # (jpeg_bytes, size, quality)
+            except Exception:
+                return None
+        return None
 
     def _begin_run(self):
         """Common run() preamble: drop this thread's priority and apply the user-chosen
@@ -983,6 +1071,11 @@ class _PoolWorker(QThread):
 
 
 class RenderWorker(_PoolWorker):
+    # Path of a chart that rendered OK, so the owner can drop it from the queue by
+    # IDENTITY. Mirrors BGAWorker.item_rendered — see _on_audio_item_rendered for why
+    # a row number can't be used here.
+    item_rendered = Signal(str)
+
     def __init__(self, items, out_dir, fmt, workers, cover_cfg=None,
                  quality=None, priority="Normal"):
         super().__init__(priority=priority)
@@ -990,34 +1083,15 @@ class RenderWorker(_PoolWorker):
         self.cover_cfg = cover_cfg      # None | "__BLACK__" | path to whole-queue art
         self.quality = quality          # None = current default encode settings
 
-    def _resolve_cover(self, item):
-        from bms_core import process_cover, _PIL_OK
-        cfg = self.cover_cfg
-        if cfg == "__BLACK__":
-            return _black_cover_bytes()
-        # per-song art (set via the picker / "assign black square") takes effect when
-        # no whole-queue cover is set
-        per = item.get("art")
-        if not cfg and per == "__BLACK__":
-            return _black_cover_bytes()
-        path = cfg if cfg else per
-        if path and path != "__BLACK__" and os.path.isfile(path) and _PIL_OK:
-            try:
-                data, _sz, _q = process_cover(path)
-                return data
-            except Exception:
-                return None
-        return None
-
     def run(self):
         self._begin_run()
         ext = {"FLAC": ".flac", "WAV": ".wav", "OGG": ".ogg", "MP3": ".mp3"}.get(self.fmt, ".flac")
         ff = ffmpeg_path() if self.fmt in ("OGG", "MP3", "FLAC") else None
-        jobs = {}
-        for row, it in enumerate(self.items):
-            title = it["tags"].get("Title", "untitled")
-            safe = _safe_output_stem(title)
-            jobs[(it["path"], os.path.join(self.out_dir, safe + ext))] = (row, it)
+        # Batch-unique output names: several queued charts routinely share a #TITLE
+        # (the difficulties of one song), and they used to collide on one filename.
+        stems = _assign_output_stems(self.items)
+        jobs = [(row, it, os.path.join(self.out_dir, stem + ext))
+                for row, (it, stem) in enumerate(zip(self.items, stems))]
         total = len(jobs); done = 0
         self.log.emit(f"Rendering {total} song(s) with {self.workers} worker process(es)…")
         # Use a 'spawn' context for the pool. On Linux the default 'fork' duplicates
@@ -1026,11 +1100,16 @@ class RenderWorker(_PoolWorker):
         import multiprocessing as _mp
         ctx = _mp.get_context("spawn")
         ex = ProcessPoolExecutor(max_workers=self.workers, mp_context=ctx)
+        # Bound BEFORE the try: the abort branch in `finally` iterates it, so a failure
+        # inside submit() would otherwise raise NameError there and bury the real error.
+        futs = {}
         try:
             futs = {ex.submit(render_one_job,
-                              (p, o, self.fmt, it["tags"], self._resolve_cover(it), ff,
-                               bms_core._LIBRARY_ROOT, self.quality)): (row, it)
-                    for (p, o), (row, it) in jobs.items()}
+                              (it["path"], o, self.fmt, it["tags"],
+                               self._resolve_cover(it), ff,
+                               bms_core._LIBRARY_ROOT, self.quality,
+                               self._job_progress_path(row))): (row, it)
+                    for (row, it, o) in jobs}
             for fut in as_completed(futs):
                 if self._abort:
                     break
@@ -1043,7 +1122,8 @@ class RenderWorker(_PoolWorker):
                     self.log.emit(f"  [{done}/{total}] FAILED: {title}")
                 else:
                     self.log.emit(f"  [{done}/{total}] done -> {out_path.replace(chr(92), '/')}")
-                    self.item_done.emit(row)
+                    self.item_done.emit(row)              # advances the progress bar
+                    self.item_rendered.emit(it["path"])   # removes it from the queue
         finally:
             if self._abort:
                 # Hard-stop: cancel not-yet-started futures AND terminate the worker
@@ -1081,53 +1161,108 @@ class _BGADetectWorker(QThread):
 
 
 class BGAWorker(_PoolWorker):
-    """Renders queued charts that have an image BGA to MP4s, in parallel. Video/none
-    BGAs are skipped. Mirrors the Tk app's _render_bga_queue."""
+    """Renders queued charts' BGAs in parallel: image-sequence BGAs are encoded to
+    video, video BGAs are muxed with the rendered audio. Charts with no BGA can
+    optionally still be rendered as audio-only files instead of being skipped."""
     total_known = Signal(int)       # emitted once the skip-filter decides the count
     item_rendered = Signal(str)     # path of a chart that rendered OK (for removal)
 
-    def __init__(self, items, out_dir, workers, encode_opts=None, priority="Normal"):
+    def __init__(self, items, out_dir, workers, encode_opts=None, priority="Normal",
+                 audio_fmt=None, cover_cfg=None, bga_kinds=None):
         super().__init__(priority=priority)
         self.items, self.out_dir, self.workers = items, out_dir, workers
         self.encode_opts = encode_opts        # None = original default behavior
+        # used only for the "render charts with no BGA as audio" fallback, so those
+        # files come out identical to what the tab's normal audio render would produce
+        self.audio_fmt = audio_fmt
+        self.cover_cfg = cover_cfg
+        # {chart_path: "sequence"|"static"|"video"|"none"} already worked out by
+        # _bga_counts() when the export dialog was built. detect_bga() parses the whole
+        # chart (~10ms each on a real library), and this worker used to redo all of it
+        # from scratch — so a 200-chart queue was classified twice for no reason. Any
+        # path missing from the map is still classified here, so passing None is safe.
+        self.bga_kinds = bga_kinds or {}
 
     def run(self):
         self._begin_run()
         ff = ffmpeg_path()
         fps, size = 30, (720, 720)
-        seq_jobs = []       # (job_tuple) for image-sequence/static BGAs
-        vid_jobs = []       # (job_tuple) for video BGAs (muxed)
+        opts = self.encode_opts or {}
+        # Lossless remux copies a video BGA's stream verbatim — an image-sequence BGA
+        # has no stream to copy, so it MUST be encoded. Strip the flag for those jobs so
+        # they use the (still-live) Video settings rather than inheriting remux.
+        seq_opts = dict(opts)
+        seq_opts.pop("remux", None)
+        want_audio_only = bool(opts.get("audio_only_rest"))
+        aud_ext = {"FLAC": ".flac", "WAV": ".wav",
+                   "OGG": ".ogg", "MP3": ".mp3"}.get(self.audio_fmt, ".flac")
+        aud_ff = ffmpeg_path() if self.audio_fmt in ("OGG", "MP3", "FLAC") else None
+
+        # Batch-unique output names — several queued charts routinely share a #TITLE
+        # (the difficulties of one song) and used to collide on a single filename.
+        stems = _assign_output_stems(self.items)
+        seq_jobs, vid_jobs, aud_jobs = [], [], []
         skipped = 0
-        for it in self.items:
-            info = detect_bga(it["path"])
-            title = it["tags"].get("Title", "untitled")
-            safe = _safe_output_stem(title)
+        for it, safe in zip(self.items, stems):
+            kind = self.bga_kinds.get(it["path"])
+            if kind is None:                      # not pre-classified — work it out now
+                kind = detect_bga(it["path"]).get("type", "none")
+            info = {"type": kind}
             out_path = os.path.join(self.out_dir, safe + ".mp4")
             if info["type"] in ("sequence", "static"):
                 seq_jobs.append((it["path"], out_path, ff, bms_core._LIBRARY_ROOT,
-                                 fps, size, self.encode_opts, self.workers))
+                                 fps, size, seq_opts, self.workers,
+                                 self._job_progress_path(len(seq_jobs) + len(vid_jobs)
+                                                         + len(aud_jobs))))
             elif info["type"] == "video":
-                # video BGA: mux the existing video with our audio (job = 7-tuple, no fps)
+                # video BGA: mux the existing video with our audio
                 vid_jobs.append((it["path"], out_path, ff, bms_core._LIBRARY_ROOT,
-                                 size, self.encode_opts, self.workers))
+                                 size, opts, self.workers,
+                                 self._job_progress_path(len(seq_jobs) + len(vid_jobs)
+                                                         + len(aud_jobs))))
+            elif want_audio_only and self.audio_fmt:
+                # no BGA to render — fall back to a plain audio file so a single batch
+                # covers the whole queue instead of silently dropping these charts
+                aud_out = os.path.join(self.out_dir, safe + aud_ext)
+                # quality is None: the BGA dialog has no audio-quality control for this
+                # fallback, so these use the encoder defaults (which is what the old
+                # constructor argument always resolved to — no caller ever set it).
+                aud_jobs.append((it["path"], aud_out, self.audio_fmt, it["tags"],
+                                 self._resolve_cover(it), aud_ff,
+                                 bms_core._LIBRARY_ROOT, None,
+                                 self._job_progress_path(len(seq_jobs) + len(vid_jobs)
+                                                         + len(aud_jobs))))
             else:
                 skipped += 1
         # tag each job with which worker function renders it, so results are handled with
         # the right tuple shape (video jobs return a 4th 'warnings' element)
-        tagged = [("seq", j) for j in seq_jobs] + [("vid", j) for j in vid_jobs]
+        tagged = ([("seq", j) for j in seq_jobs] + [("vid", j) for j in vid_jobs]
+                  + [("aud", j) for j in aud_jobs])
         if not tagged:
-            self.log.emit(f"No queued charts have a renderable BGA ({skipped} skipped)."); self.done.emit(); return
+            self.log.emit(f"Nothing to render from this queue ({skipped} skipped — "
+                          f"no BGA, and audio-only fallback is off).")
+            self.done.emit(); return
         total = len(tagged); done = 0
         self.total_known.emit(total)
-        self.log.emit(f"Rendering {total} BGA video(s) with {self.workers} worker(s)… "
-                      f"({len(vid_jobs)} video BGA, {len(seq_jobs)} image BGA, {skipped} skipped)")
+        bits = []
+        if vid_jobs:
+            bits.append(f"{len(vid_jobs)} video BGA")
+        if seq_jobs:
+            bits.append(f"{len(seq_jobs)} image BGA")
+        if aud_jobs:
+            bits.append(f"{len(aud_jobs)} audio-only")
+        if skipped:
+            bits.append(f"{skipped} skipped")
+        self.log.emit(f"Rendering {total} item(s) with {self.workers} worker(s)… "
+                      f"({', '.join(bits)})")
         import multiprocessing as _mp
         ctx = _mp.get_context("spawn")
         ex = ProcessPoolExecutor(max_workers=self.workers, mp_context=ctx)
         try:
             futs = {}
             for kind, j in tagged:
-                fn = render_bga_muxed_job if kind == "vid" else render_bga_video_job
+                fn = {"vid": render_bga_muxed_job,
+                      "aud": render_one_job}.get(kind, render_bga_video_job)
                 futs[ex.submit(fn, j)] = (kind, j)
             for fut in as_completed(futs):
                 if self._abort:
@@ -1175,7 +1310,15 @@ class ScanWorker(QThread):
     progress = Signal(int, int)         # (done, total) for the loading bar
 
     def __init__(self, folder):
-        super().__init__(); self.folder = folder
+        super().__init__(); self.folder = folder; self._stop = False
+
+    def stop(self):
+        """Ask the scan to finish early (the window is closing). A 126k-chart scan
+        otherwise has no interruption point at all, so closing mid-scan left this thread
+        running while the app tore down around it. scan_library commits the work it has
+        already done and deliberately SKIPS its vanished-chart cleanup, so stopping
+        part-way can never wipe the cache."""
+        self._stop = True
 
     def run(self):
         import time
@@ -1199,9 +1342,15 @@ class ScanWorker(QThread):
             conn = db_connect()
             try:
                 songs, stats = scan_library(self.folder, conn, log=self.log.emit,
-                                            progress=_prog)
+                                            progress=_prog,
+                                            should_stop=lambda: self._stop)
             finally:
                 conn.close()
+            if stats.get("aborted"):
+                # Stopped because the window is closing. Do NOT emit: the song list is
+                # empty by design here, and handing that to _scan_done would blank the
+                # library view on the way out.
+                return
             for s in songs:
                 s["search"] = (s["title"] + " " + (s.get("artist") or "")).lower()
             self.log.emit(f"Done in {time.time()-t0:.1f}s — {stats['total']} charts.")
@@ -1274,6 +1423,35 @@ class TableFetchWorker(QThread):
             self.fetched.emit(self.url, None, str(e))
 
 
+def _bga_counts(items):
+    """Classify queued items by BGA type so the export dialog can say what's actually in
+    the batch BEFORE the user configures it (and decide whether remux may lock the video
+    settings).
+
+    Returns (counts, kinds):
+      counts : {"video": n, "sequence": n, "none": n} for the dialog's summary line
+      kinds  : {chart_path: "sequence"|"static"|"video"|"none"} — hand this to BGAWorker
+               so it doesn't classify the whole batch a SECOND time. detect_bga parses
+               the entire chart (~10ms each on a real library), so re-deriving it in the
+               worker doubled the cost of every BGA render for nothing.
+    """
+    counts = {"video": 0, "sequence": 0, "none": 0}
+    kinds = {}
+    for it in items:
+        try:
+            kind = detect_bga(it["path"]).get("type") or "none"
+        except Exception:
+            kind = "none"
+        kinds[it["path"]] = kind
+        if kind == "video":
+            counts["video"] += 1
+        elif kind in ("sequence", "static"):
+            counts["sequence"] += 1
+        else:
+            counts["none"] += 1
+    return counts, kinds
+
+
 class BGAExportDialog(QDialog):
     """Settings dialog for 'Render All BGA in Queue': pick video + audio codecs,
     bitrate/compression, process priority. 'Default' on both reproduces the original
@@ -1312,12 +1490,35 @@ class BGAExportDialog(QDialog):
         "vp9":        (4, 4, 2),
     }
 
-    def __init__(self, parent=None, default_threads=4):
+    def __init__(self, parent=None, default_threads=4, bga_counts=None):
         super().__init__(parent)
         self._default_threads = max(1, int(default_threads))
+        # {"video": n, "sequence": n, "none": n} — what's actually in the batch. Drives
+        # the summary line, whether remux may grey the video panel, and whether the
+        # audio-only fallback option is relevant.
+        self._counts = dict(bga_counts or {})
+        self._n_video = int(self._counts.get("video", 0))
+        self._n_seq = int(self._counts.get("sequence", 0))
+        self._n_none = int(self._counts.get("none", 0))
         self.setWindowTitle("Render All BGA — Export Settings")
         self.setMinimumWidth(620)
         root = QVBoxLayout(self)
+
+        # ---------------- what's in this batch ----------------
+        if self._counts:
+            bits = []
+            if self._n_video:
+                bits.append(f"{self._n_video} video BGA")
+            if self._n_seq:
+                bits.append(f"{self._n_seq} image-sequence BGA")
+            if self._n_none:
+                bits.append(f"{self._n_none} without a BGA")
+            total = self._n_video + self._n_seq + self._n_none
+            summary = QLabel(f"{total} queued — " + ", ".join(bits) if bits
+                             else f"{total} queued")
+            summary.setObjectName("mutedLabel")
+            summary.setWordWrap(True)
+            root.addWidget(summary)
 
         cols = QHBoxLayout()
         root.addLayout(cols)
@@ -1328,6 +1529,25 @@ class BGAExportDialog(QDialog):
         self.v_combo = QComboBox()
         for label, _key in self.VIDEO_CODECS:
             self.v_combo.addItem(label)
+        # NVENC needs an actual NVIDIA GPU. ffmpeg lists these encoders whether or not
+        # the hardware exists, so we probe once and disable the entries that would only
+        # fail and silently fall back to software.
+        try:
+            _vmodel = self.v_combo.model()
+            for _i, (_lbl, _k) in enumerate(self.VIDEO_CODECS):
+                if _k.endswith("_nvenc"):
+                    _enc = "hevc_nvenc" if _k.startswith("hevc") else "h264_nvenc"
+                    if not nvenc_available(_enc):
+                        _it = _vmodel.item(_i)
+                        if _it is not None:
+                            _it.setEnabled(False)
+                            _why = nvenc_reason(_enc)
+                            _it.setToolTip(
+                                "Requires an NVIDIA GPU — hardware encoding test failed "
+                                "on this system."
+                                + (f"\n\nffmpeg said:\n{_why}" if _why else ""))
+        except Exception:
+            pass
         vlay.addWidget(self.v_combo)
 
         self.v_bitrate_lbl = QLabel("Bitrate:")
@@ -1339,6 +1559,11 @@ class BGAExportDialog(QDialog):
         self.v_bitrate_spin = QSpinBox()
         self.v_bitrate_spin.setRange(1000, 20000); self.v_bitrate_spin.setSingleStep(500)
         self.v_bitrate_spin.setValue(6000); self.v_bitrate_spin.setSuffix(" kbps")
+        _br_tip = ("Higher = better quality, bigger files. 4000–8000 kbps suits most "
+                   "BGA video at 720p. Image-sequence BGAs with fast animation need "
+                   "more, or they go blocky.")
+        for _w in (self.v_bitrate, self.v_bitrate_spin, self.v_bitrate_lbl):
+            _w.setToolTip(_br_tip)
         vrow.addWidget(self.v_bitrate, 1); vrow.addWidget(self.v_bitrate_spin)
         vlay.addLayout(vrow)
 
@@ -1373,13 +1598,37 @@ class BGAExportDialog(QDialog):
         cols.addWidget(abox, 1)
 
         # ---------------- lossless remux toggle ----------------
-        self.remux_chk = QCheckBox("Lossless remux (copy video, no re-encode)")
+        self.remux_chk = QCheckBox("Lossless remux (copy video BGAs, no re-encode)")
+        # Deliberately does NOT repeat "image-sequence BGAs are still encoded with the
+        # Video settings" — remux_note says that below, in batch-specific terms, the
+        # moment this is ticked. What's kept here is what appears NOWHERE else: that the
+        # source's codec/resolution override the Video panel, and the short-video black
+        # tail. Both only matter BEFORE you tick, which is exactly when remux_note is
+        # empty, so this tooltip is the only place they can be read.
         self.remux_chk.setToolTip(
-            "Copy the BGA video stream as-is instead of re-encoding it, preserving the "
-            "original quality exactly. The video's codec and resolution follow the source, "
-            "output is always .mkv, and audio must be lossless. If the video is shorter "
-            "than the song the picture simply ends (black) while the audio continues.")
+            "Video BGAs only. Their stream is copied untouched, so codec and resolution "
+            "come from the source rather than the Video settings, and the output is .mkv."
+            "\n\n"
+            "If a video is shorter than the song the picture ends (black) while the audio "
+            "continues.")
         root.addWidget(self.remux_chk)
+        # explains, in-place, what remux will and won't touch for THIS batch
+        self.remux_note = QLabel("")
+        self.remux_note.setObjectName("mutedLabel")
+        self.remux_note.setWordWrap(True)
+        root.addWidget(self.remux_note)
+
+        # ---------------- charts without a BGA ----------------
+        self.audio_only_chk = QCheckBox(
+            "Also render charts with no BGA as audio-only files")
+        self.audio_only_chk.setChecked(True)
+        self.audio_only_chk.setToolTip(
+            "Charts with no BGA can't produce a video. They are rendered as plain audio "
+            "instead, in the format set on the tab you started from. Unticked, they are "
+            "skipped.")
+        if self._counts and not self._n_none:
+            self.audio_only_chk.setVisible(False)   # nothing it could apply to
+        root.addWidget(self.audio_only_chk)
 
         # ---------------- threads + priority ----------------
         prow = QHBoxLayout()
@@ -1392,10 +1641,22 @@ class BGAExportDialog(QDialog):
                                 "full ffmpeg process, so more threads = faster but heavier.")
         prow.addWidget(self.threads)
         prow.addSpacing(16)
-        prow.addWidget(QLabel("Process priority:"))
+        self._prio_lbl = QLabel("Process priority:")
+        prow.addWidget(self._prio_lbl)
         self.prio = QComboBox(); self.prio.addItems(self.PRIORITIES)
         self.prio.setCurrentText("Normal")
+        _prio_tip = ("How much CPU the encoders claim. Lower keeps the rest of your PC "
+                     "responsive while rendering; higher finishes sooner.")
+        self.prio.setToolTip(_prio_tip); self._prio_lbl.setToolTip(_prio_tip)
         prow.addWidget(self.prio); prow.addStretch(1)
+        prow.addSpacing(16)
+        # live indicator of the container the current settings will actually produce
+        self.out_fmt_lbl = QLabel("")
+        self.out_fmt_lbl.setToolTip(
+            "The container these settings will produce. Only the all-default combination "
+            "stays .mp4; anything else uses .mkv, which accepts codec pairings .mp4 "
+            "cannot hold — Ogg audio among them.")
+        prow.addWidget(self.out_fmt_lbl)
         root.addLayout(prow)
 
         # ---------------- buttons ----------------
@@ -1404,7 +1665,9 @@ class BGAExportDialog(QDialog):
         root.addWidget(bb)
 
         self.v_combo.currentIndexChanged.connect(self._sync_video)
+        self.v_combo.currentIndexChanged.connect(self._sync_output_fmt)
         self.a_combo.currentIndexChanged.connect(self._sync_audio)
+        self.a_combo.currentIndexChanged.connect(self._sync_output_fmt)
         self.remux_chk.toggled.connect(self._sync_remux)
         # keep each slider and its manual spinbox in lock-step (both directions)
         self.v_bitrate.valueChanged.connect(
@@ -1414,6 +1677,7 @@ class BGAExportDialog(QDialog):
         self.a_slider.valueChanged.connect(self._on_audio_slider)
         self.a_spin.valueChanged.connect(lambda v: self._mirror(self.a_slider, v))
         self._sync_video(); self._sync_audio(); self._sync_remux()
+        self._sync_output_fmt()
 
     @staticmethod
     def _mirror(widget, value):
@@ -1423,7 +1687,6 @@ class BGAExportDialog(QDialog):
 
     def _on_audio_slider(self, v):
         self._mirror(self.a_spin, v)
-        self._update_audio_label(v)
 
     # -- adaptive controls --------------------------------------------------
     def _video_key(self):
@@ -1454,12 +1717,15 @@ class BGAExportDialog(QDialog):
                 wdg.setValue(val); wdg.setEnabled(enabled)
                 wdg.blockSignals(False)
             self.a_spin.setSuffix(suffix)
+        self._set_audio_tip("")
         if key == "wav":
             _set(0, 1, 1, 0, False, "")
             self.a_slider_lbl.setText("WAV is uncompressed — no bitrate")
         elif key == "flac":
             _set(0, 8, 1, 8, True, "")          # compression level, default 8
             self.a_slider_lbl.setText("Compression level:")
+            self._set_audio_tip("0-8. Higher = smaller file, slower encode. Quality is "
+                                "identical at every level — FLAC is lossless.")
         elif key == "default":
             _set(64, 320, 8, 192, False, " kbps")
             self.a_slider_lbl.setText("Bitrate (default baseline):")
@@ -1474,33 +1740,57 @@ class BGAExportDialog(QDialog):
             _set(64, 320, 8, cur if cur >= 64 else 192, True, " kbps")
             self.a_slider_lbl.setText("Bitrate:")
 
-    def _sync_remux(self):
-        """Lossless-remux mode copies the source video verbatim, so the entire Video
-        codec panel is inapplicable (grey it out), and only lossless audio makes sense
-        (disable the lossy entries and snap the selection to a lossless one)."""
-        on = self.remux_chk.isChecked()
-        # grey out the whole Video group
-        self._video_group.setEnabled(not on)
-        # audio: allow only lossless (FLAC / WAV); disable the lossy entries in the combo
-        lossless_keys = {"flac", "wav"}
-        model = self.a_combo.model()
-        for i, (_label, key) in enumerate(self.AUDIO_CODECS):
-            item = model.item(i)
-            if item is not None:
-                item.setEnabled((key in lossless_keys) if on else True)
-        if on and self._audio_key() not in lossless_keys:
-            # snap to FLAC (first lossless option) so a lossy codec isn't left selected
-            for i, (_label, key) in enumerate(self.AUDIO_CODECS):
-                if key == "flac":
-                    self.a_combo.setCurrentIndex(i); break
-            self._sync_audio()
-        self.a_combo.setToolTip(
-            "Lossless remux requires lossless audio (FLAC or WAV)." if on else "")
+    def _set_audio_tip(self, text):
+        for w in (self.a_slider, self.a_spin, self.a_slider_lbl):
+            w.setToolTip(text)
 
-    def _update_audio_label(self, v):
-        # the spinbox shows the number now; the label only carries the caption,
-        # which _sync_audio already sets per-codec, so nothing to do here
-        pass
+    def _sync_remux(self):
+        """Lossless remux copies VIDEO BGAs verbatim. Image-sequence BGAs have no video
+        stream to copy, so they must still be encoded — which means the Video panel has
+        to stay usable whenever the batch contains any. Only when the batch is purely
+        video BGAs is the Video panel genuinely inapplicable and greyed out."""
+        on = self.remux_chk.isChecked()
+        # if we weren't told what's in the batch, assume a sequence BGA could be present
+        # and keep the controls live rather than locking settings the user still needs
+        seq_present = self._n_seq > 0 or not self._counts
+        self._video_group.setEnabled((not on) or seq_present)
+
+        if not on:
+            self.remux_note.setText("")
+        elif not self._counts:
+            # we weren't told what's in the batch — state the rule, don't assert contents
+            self.remux_note.setText(
+                "Video BGAs are copied losslessly; image-sequence BGAs are still encoded "
+                "using the Video settings above.")
+        elif seq_present and self._n_video:
+            self.remux_note.setText(
+                f"The Video settings above apply to the {self._n_seq} image-sequence BGA. "
+                f"The {self._n_video} video BGA are copied losslessly and ignore those "
+                f"settings.")
+        elif seq_present:
+            self.remux_note.setText(
+                "No video BGAs in this batch — nothing to copy, so everything is "
+                "encoded with the Video settings above.")
+        elif self._n_video:
+            self.remux_note.setText(
+                "All BGAs in this batch are video and will be copied losslessly, so the "
+                "Video settings above don't apply.")
+        else:
+            self.remux_note.setText(
+                "No BGAs in this batch — there is nothing for lossless remux to copy.")
+        self._sync_output_fmt()
+
+    def _sync_output_fmt(self):
+        """Show the container the current settings will actually produce, so the .mp4 ->
+        .mkv switch is never a surprise after the fact."""
+        if not hasattr(self, "out_fmt_lbl"):
+            return
+        try:
+            opts, _p, _t = self.options()
+            ext = predicted_container(opts)
+        except Exception:
+            ext = ".mp4"
+        self.out_fmt_lbl.setText(f"Output: <b>{ext}</b>")
 
     # -- result -------------------------------------------------------------
     def options(self):
@@ -1513,6 +1803,7 @@ class BGAExportDialog(QDialog):
             "abitrate": self.a_slider.value() if a not in ("flac", "wav") else 192,
             "flac_level": self.a_slider.value() if a == "flac" else 8,
             "remux": self.remux_chk.isChecked(),   # lossless: copy video, no re-encode
+            "audio_only_rest": self.audio_only_chk.isChecked(),
         }
         return opts, self.prio.currentText(), self.threads.value()
 
@@ -1773,16 +2064,21 @@ class RenderProgressDialog(QDialog):
     An Abort button emits `aborted` so the owner can stop the worker."""
     aborted = Signal()
 
-    def __init__(self, parent, title, total):
+    def __init__(self, parent, title, total, progress_dir=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(420)
         self._total = max(1, total); self._done = 0
+        self._progress_dir = progress_dir
+        self._frac = 0.0
         from PySide6.QtWidgets import QProgressBar
         lay = QVBoxLayout(self)
         self.label = QLabel(f"Rendering 0 of {total}…")
         lay.addWidget(self.label)
-        self.bar = QProgressBar(); self.bar.setRange(0, self._total); self.bar.setValue(0)
+        # 0..1000 rather than 0..items, so a single in-flight job can show real partial
+        # progress instead of the bar sitting at 0% until it completes
+        self.bar = QProgressBar(); self.bar.setRange(0, 1000); self.bar.setValue(0)
+        self.bar.setFormat("%p%")
         self.bar.setStyleSheet(
             "QProgressBar { border:1px solid #999; border-radius:3px; text-align:center;"
             " height:20px; }"
@@ -1796,6 +2092,39 @@ class RenderProgressDialog(QDialog):
         lay.addLayout(btnrow)
         self._closable = False
         self._aborted = False
+        # poll the workers' per-job progress files. Each running job writes its own
+        # 0..1 fraction; summing them and dividing by the item count gives smooth,
+        # honest overall progress even when only one long item is encoding.
+        self._poll = QTimer(self)
+        self._poll.setInterval(200)
+        self._poll.timeout.connect(self._poll_progress)
+        if self._progress_dir:
+            self._poll.start()
+
+    def _poll_progress(self):
+        total_frac = 0.0
+        try:
+            for name in os.listdir(self._progress_dir):
+                if not name.endswith(".prog"):
+                    continue
+                try:
+                    with open(os.path.join(self._progress_dir, name),
+                              "r", encoding="utf-8") as f:
+                        total_frac += float(f.read().strip() or 0.0)
+                except (OSError, ValueError):
+                    pass
+        except OSError:
+            return                      # dir gone (job finished/cleaned up)
+        self._apply_fraction(total_frac / self._total)
+
+    def _apply_fraction(self, frac):
+        """Never let the bar go backwards: jobs that report nothing still advance it via
+        the completed-item count, so take whichever is further along."""
+        by_items = self._done / float(self._total)
+        frac = max(0.0, min(1.0, max(frac, by_items)))
+        if frac >= self._frac:
+            self._frac = frac
+            self.bar.setValue(int(round(frac * 1000)))
 
     def _on_abort(self):
         self._aborted = True
@@ -1806,27 +2135,29 @@ class RenderProgressDialog(QDialog):
 
     def set_total(self, total):
         self._total = max(1, total); self._done = min(self._done, self._total)
-        self.bar.setRange(0, self._total); self.bar.setValue(self._done)
+        self._apply_fraction(self._frac)
         self.label.setText(f"Rendering {self._done} of {total}…")
 
     def set_value(self, done):
-        """Set absolute progress (used by the BGA worker which counts up itself)."""
+        """Set absolute item progress (used by the BGA worker which counts up itself)."""
         self._done = min(self._total, done)
-        self.bar.setValue(self._done)
+        self._apply_fraction(self._frac)
         self.label.setText(f"Rendering {self._done} of {self._total}…")
 
     def step(self, n=1):
         self._done = min(self._total, self._done + n)
-        self.bar.setValue(self._done)
+        self._apply_fraction(self._frac)
         self.label.setText(f"Rendering {self._done} of {self._total}…")
 
     def finish(self):
         self._closable = True
+        self._poll.stop()
         if self._aborted:
             self.label.setText(f"Aborted — {self._done} of {self._total} rendered.")
         else:
             self._done = self._total
-            self.bar.setValue(self._total)
+            self._frac = 1.0
+            self.bar.setValue(1000)
             self.label.setText(f"Done — {self._total} rendered.")
         self.accept()
 
@@ -1859,6 +2190,8 @@ class AudioExportDialog(QDialog):
 
         self.threads = QSpinBox(); self.threads.setRange(1, max_threads)
         self.threads.setValue(threads)
+        self.threads.setToolTip("How many songs to render at once. More threads finish "
+                                "the batch faster but use more CPU and RAM.")
         form.addRow("Threads:", self.threads)
 
         # format-specific quality control (adapts to the format)
@@ -1875,7 +2208,10 @@ class AudioExportDialog(QDialog):
         form.addRow(self.q_lbl, qrow)
 
         prow = QHBoxLayout()
-        prow.addWidget(QLabel("Process priority:"))
+        _apl = QLabel("Process priority:")
+        _apl.setToolTip("How much CPU the renderers claim. Lower keeps the rest of your "
+                        "PC responsive while rendering; higher finishes sooner.")
+        prow.addWidget(_apl)
         self.prio = QComboBox(); self.prio.addItems(self.PRIORITIES)
         self.prio.setCurrentText("Normal")
         prow.addWidget(self.prio); prow.addStretch(1)
@@ -1963,7 +2299,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.queue = []                 # {path, tags:{...}, mode, notes}
         self._worker = None
-        self._removed = 0
         self.player = Player(samplerate=SR) if (_SD_OK and Player) else None
         self._play_cache = {}           # path -> rendered audio buffer (session cache)
         self._play_worker = None
@@ -1999,13 +2334,10 @@ class MainWindow(QMainWindow):
                 pass
         self._build()
         self._sync_render_settings()
-        # apply the saved theme (both light and dark palettes are built explicitly)
-        from PySide6.QtWidgets import QApplication
-        _app = QApplication.instance()
-        # Both themes are built explicitly in _apply_theme (hand-picked light AND dark
-        # palettes), so we don't capture the OS/default palette — on Qt6 that palette
-        # follows the OS theme and can't be trusted as a "light" baseline.
-        self._default_style = _app.style().objectName()
+        # Apply the saved theme. Both light and dark palettes are built explicitly in
+        # _apply_theme (hand-picked), so we deliberately don't capture the OS/default
+        # palette — on Qt6 it follows the OS theme and can't be trusted as a "light"
+        # baseline.
         if bool(load_config().get("dark_mode", False)):
             self._apply_theme(True)
         else:
@@ -2355,8 +2687,15 @@ class MainWindow(QMainWindow):
         w, h = img.width(), img.height()
         try:
             import numpy as np
-            ptr = img.bits(); ptr.setsize(img.byteCount())
-            arr = np.frombuffer(ptr, np.uint8).reshape(h, w, 4)  # BGRA in memory
+            # PySide6/Qt6: bits() hands back a memoryview sized correctly already, and
+            # there is no byteCount(). The old PyQt5 incantation here was
+            # `ptr.setsize(img.byteCount())`, and BOTH of those were removed in Qt6 — so
+            # this whole branch raised AttributeError on every call and silently fell
+            # through to the per-pixel loop below, making a 60-frame pulse take ~1.2s of
+            # blocked GUI instead of ~35ms. Index rows by bytesPerLine (Qt pads scanlines
+            # to a 4-byte boundary) and trim to the real width.
+            arr = np.frombuffer(img.bits(), np.uint8).reshape(
+                h, img.bytesPerLine() // 4, 4)[:, :w, :]         # BGRA in memory
             s = max(0.0, min(1.0, strength))
             cr, cg, cb = color
             rgb = arr[:, :, :3].astype(np.float32)               # B,G,R order
@@ -2389,7 +2728,6 @@ class MainWindow(QMainWindow):
     def _on_update_available(self, tag):
         """An update is live on GitHub: start the blue pulse, show the caption under the
         logo, and change the tooltip. The click action (open repo) is unchanged."""
-        self._update_tag = tag
         self.logo_label.setToolTip(
             f"Update available: {tag} — click to open the GitHub page")
         if hasattr(self, "update_lbl"):
@@ -2463,7 +2801,11 @@ class MainWindow(QMainWindow):
         self._queue_tab_index = self.tabs.count() - 1
 
     # ---- Library tab ----
-    LCOLS = ["Title", "Artist", "BPM", "Mode", "Notes"]
+    # "Charts" is only meaningful in songs-only mode, where a top-level row represents a
+    # SONG and its children are that song's charts. It's appended LAST so the indices of
+    # the existing columns (and therefore saved sort/width settings) never shift.
+    LCOLS = ["Title", "Artist", "BPM", "Mode", "Notes", "Charts"]
+    LCOL_CHARTS = 5
 
     def _build_library_tab(self):
         w = QWidget(); lay = QVBoxLayout(w)
@@ -2506,8 +2848,14 @@ class MainWindow(QMainWindow):
         hdr.setSectionResizeMode(QHeaderView.Interactive)
         hdr.setStretchLastSection(False)
         hdr.setSectionResizeMode(0, QHeaderView.Stretch)   # Title absorbs slack
+        DEFAULT_W = (300, 170, 50, 60, 75, 60)
         saved_w = load_config().get("lib_col_widths")
-        for i, wdt in enumerate(saved_w or (300, 170, 50, 60, 75)):
+        # A saved list from an older version has fewer entries than there are columns
+        # now ("Charts" was added). Applying it as-is would leave the new column at a
+        # junk width, so only trust a saved list that matches the current column count.
+        if not (isinstance(saved_w, (list, tuple)) and len(saved_w) == len(self.LCOLS)):
+            saved_w = DEFAULT_W
+        for i, wdt in enumerate(saved_w):
             self.ltable.setColumnWidth(i, wdt)
         # double-click must PLAY, never expand — Qt expands on double-click by
         # default, so turn that off and let only the arrow toggle expansion
@@ -2632,11 +2980,13 @@ class MainWindow(QMainWindow):
         cfg = load_config(); cfg["lib_col_widths"] = widths; save_config(cfg)
 
     def _row_vals(self, s):
+        # trailing "" is the Charts column: blank for individual charts, filled in only
+        # on the SONG (parent) rows built by _fill_lib_tree in songs-only mode
         return [s.get("title", ""), s.get("artist", ""), str(s.get("bpm", "")),
-                s.get("mode", ""), str(s.get("notes", ""))]
+                s.get("mode", ""), str(s.get("notes", "")), ""]
 
     # column index -> key function for fast in-Python sorting (mirrors _row_vals order:
-    # 0 Title, 1 Artist, 2 BPM, 3 Mode, 4 Notes). BPM/Notes sort numerically.
+    # 0 Title, 1 Artist, 2 BPM, 3 Mode, 4 Notes, 5 Charts). BPM/Notes sort numerically.
     def _lib_sort_key(self, col):
         if col == 1:
             return lambda s: s.get("artist", "").lower()
@@ -2646,6 +2996,11 @@ class MainWindow(QMainWindow):
             return lambda s: s.get("mode", "")
         if col == 4:
             return lambda s: _numkey(s.get("notes"))
+        if col == self.LCOL_CHARTS:
+            # Charts is a per-SONG value that doesn't exist on the flat chart rows this
+            # pre-sort operates on. Fall back to title so the pre-sort stays stable; the
+            # parents' explicit sort keys handle it once interactive sorting kicks in.
+            return lambda s: s.get("title", "").lower()
         return lambda s: s.get("title", "").lower()          # col 0 / default
 
     def _fill_lib_tree(self, rows):
@@ -2653,9 +3008,11 @@ class MainWindow(QMainWindow):
         self.ltable.setUpdatesEnabled(False)
         self.ltable.clear()
         songs_only = self.songs_only.isChecked()
-        # the last column is "Notes" normally, "Chart count" in songs-only mode
-        self.ltable.setHeaderLabels(self.LCOLS[:-1] +
-                                    (["Chart count"] if songs_only else ["Notes"]))
+        # Headers are fixed now: "Notes" always means notes, "Charts" always means how
+        # many charts a song has. The Charts column is simply hidden outside songs-only
+        # mode, where every row IS a chart and the count would be meaningless.
+        self.ltable.setHeaderLabels(self.LCOLS)
+        self.ltable.setColumnHidden(self.LCOL_CHARTS, not songs_only)
         # Pre-sort the data in PYTHON to match the saved sort. Enabling Qt sorting on a
         # freshly-filled tree re-sorts every item via _NumericTreeItem.__lt__ (a Python
         # call per comparison) — ~2.2s for 50k rows, the bulk of the post-scan freeze.
@@ -2680,11 +3037,18 @@ class MainWindow(QMainWindow):
             for s in rows:
                 groups.setdefault(os.path.dirname(s["path"]), []).append(s)
             parents = []
-            for folder, charts in groups.items():
+            for charts in groups.values():
                 charts_sorted = sorted(charts, key=lambda s: _numkey(s.get("notes")))
                 rep = pick_playable_chart(charts_sorted)
-                vals = self._row_vals(rep)[:-1] + [str(len(charts_sorted))]
+                # keep the representative chart's own Notes value, and put the chart
+                # COUNT in its own column (previously the count overwrote Notes, so the
+                # same column meant two different things on parents vs children)
+                vals = self._row_vals(rep)
+                vals[self.LCOL_CHARTS] = str(len(charts_sorted))
                 parent = _NumericTreeItem(vals)
+                # explicit numeric sort key so the Charts column sorts by value
+                parent.setData(self.LCOL_CHARTS, _NumericTreeItem.SORTKEY_ROLE,
+                               float(len(charts_sorted)))
                 parent.setData(0, Qt.UserRole, rep["path"])
                 parent.addChildren([self._child_item(c) for c in charts_sorted])
                 parents.append(parent)
@@ -2762,6 +3126,11 @@ class MainWindow(QMainWindow):
         kind, index = ctx[0], ctx[1]
         try:
             if kind == "queue":
+                # same identity resolution as _advance — a stale index would pre-render
+                # the wrong song, silently losing the gapless advance
+                index = self._live_queue_index(ctx)
+                if index is None:
+                    return None
                 nxt = self._step_index(index, len(self.queue), +1)
                 return self.queue[nxt]["path"] if nxt is not None else None
             if kind == "playlist":
@@ -2797,13 +3166,13 @@ class MainWindow(QMainWindow):
         path = self._next_path_for_prefetch()
         if not path or path in self._play_cache:
             return
-        # don't stack prefetch workers; one at a time is enough to stay a step ahead
+        # Don't stack prefetch workers; one at a time is enough to stay a step ahead.
+        # (Whether the in-flight one is rendering this same track or a different one, the
+        # answer is the same — let it finish. This used to be an if/else where both
+        # branches simply returned.)
         pw = getattr(self, "_prefetch_worker", None)
         if pw is not None and pw.isRunning():
-            if getattr(self, "_prefetch_path", None) == path:
-                return                      # already prefetching this exact track
-            return                          # let the in-flight one finish first
-        self._prefetch_path = path
+            return
         self._prefetch_worker = PlayWorker(path)
         # cache-only: store the result, never begins playback (guarded by path check)
         self._prefetch_worker.ready.connect(self._on_prefetch_ready)
@@ -2874,6 +3243,33 @@ class MainWindow(QMainWindow):
                 return i
         return None
 
+    def _live_queue_index(self, ctx):
+        """Re-derive the CURRENT queue position of the playing song from its path.
+
+        `_playing_ctx` stores the row number captured when playback started, but the
+        queue is a live list: removing a row (via Remove, or automatically once a chart
+        finishes rendering) shifts everything below it up. A stored index then points at
+        a different song, so the wrong track plays next and the info panel shows the
+        wrong details. Matching by PATH can't go stale — the same reasoning
+        _on_bga_item_rendered already uses when it removes rendered charts by identity.
+
+        If the playing song has itself been removed from the queue, we fall back to the
+        last known index (clamped), so playback continues from roughly where it was
+        rather than jumping to an unrelated part of the list.
+        """
+        kind, index = ctx[0], ctx[1]
+        path = ctx[2] if len(ctx) > 2 else None
+        if kind != "queue":
+            return index
+        if path:
+            for i, q in enumerate(self.queue):
+                if q.get("path") == path:
+                    return i
+        # not found: the playing song was removed mid-playback — resume from where it was
+        if not self.queue:
+            return None
+        return max(0, min(int(index), len(self.queue) - 1))
+
     def _advance(self, direction):
         """Move next(+1)/prev(-1) within the list the current song is playing from
         (queue / playlist / table / library), honoring Shuffle. Returns True if it
@@ -2883,6 +3279,9 @@ class MainWindow(QMainWindow):
             return False
         kind, index = ctx[0], ctx[1]
         if kind == "queue":
+            index = self._live_queue_index(ctx)      # resolve by identity, not position
+            if index is None:
+                return False
             nxt = self._step_index(index, len(self.queue), direction)
             if nxt is not None:
                 q = self.queue[nxt]; self.qtable.setCurrentItem(self.qtable.topLevelItem(nxt))
@@ -3048,28 +3447,43 @@ class MainWindow(QMainWindow):
             if N < ncols:
                 self.wave.set_colors([]); return
             colw = N // ncols
-            SR = 44100
+            # Batched rFFT instead of 600 separate ones (which also rebuilt the Hann
+            # window every iteration) — but in CHUNKS, not all at once. Doing the whole
+            # track in a single rFFT is marginally faster still, yet spikes ~190 MB on a
+            # 3-minute song for a purely cosmetic bar; 64 columns at a time gets the same
+            # speed for ~17 MB. Colours are identical to the old per-column loop.
+            frames = mono[:ncols * colw].reshape(ncols, colw)
+            win = np.hanning(colw)
             # band edges (Hz): bass < 250, mid 250–2000, treble > 2000
-            cols = []
-            # precompute frequency bins for the column FFT length
             freqs = np.fft.rfftfreq(colw, d=1.0 / SR)
             lo = freqs < 250
             mid = (freqs >= 250) & (freqs < 2000)
             hi = freqs >= 2000
-            for i in range(ncols):
-                seg = mono[i * colw:(i + 1) * colw]
-                spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
-                r = float(spec[lo].sum()); g = float(spec[mid].sum()); b = float(spec[hi].sum())
-                tot = r + g + b
-                if tot <= 1e-9:
-                    cols.append((20, 20, 20)); continue
-                # normalise to hue, then scale brightness by this column's loudness
-                r, g, b = r / tot, g / tot, b / tot
-                loud = min(1.0, float(np.sqrt((seg ** 2).mean())) * 6.0)
-                bright = 60 + int(195 * loud)      # floor so quiet parts still show colour
-                mx = max(r, g, b) or 1.0
-                cols.append((int(r / mx * bright), int(g / mx * bright), int(b / mx * bright)))
-            self.wave.set_colors(cols)
+            R = np.empty(ncols); G = np.empty(ncols)
+            B = np.empty(ncols); L = np.empty(ncols)
+            CHUNK = 64
+            for s in range(0, ncols, CHUNK):
+                blk = frames[s:s + CHUNK]
+                spec = np.abs(np.fft.rfft(blk * win, axis=1))
+                e = s + len(blk)
+                R[s:e] = spec[:, lo].sum(axis=1)
+                G[s:e] = spec[:, mid].sum(axis=1)
+                B[s:e] = spec[:, hi].sum(axis=1)
+                L[s:e] = np.sqrt((blk ** 2).mean(axis=1))
+            tot = R + G + B
+            quiet = tot <= 1e-9
+            safe = np.where(quiet, 1.0, tot)                      # avoid divide-by-zero
+            rn, gn, bn = R / safe, G / safe, B / safe             # normalise to hue
+            # brightness scaled by each column's loudness, with a floor so quiet parts
+            # still show colour
+            bright = 60 + (195 * np.minimum(1.0, L * 6.0)).astype(np.int64)
+            mx = np.maximum.reduce([rn, gn, bn])
+            mx = np.where(mx > 0, mx, 1.0)
+            cols_arr = np.stack([(rn / mx * bright).astype(np.int64),
+                                 (gn / mx * bright).astype(np.int64),
+                                 (bn / mx * bright).astype(np.int64)], axis=1)
+            cols_arr[quiet] = (20, 20, 20)
+            self.wave.set_colors([tuple(int(v) for v in row) for row in cols_arr])
         except Exception:
             try:
                 self.wave.set_colors([])
@@ -3556,18 +3970,37 @@ class MainWindow(QMainWindow):
                     wkr.wait(5000)
                 except Exception:
                     pass
-        # stop any running lightweight workers. Any QThread still running when the
-        # window is destroyed aborts the process in PySide6 ("QThread: Destroyed while
-        # thread is still running"), so EVERY worker attribute must be awaited here.
-        for attr in ("_thumb_worker", "_play_worker", "_scan", "_bga_probe",
-                     "_prefetch_worker", "_update_checker", "_tfetch", "_tfetch2"):
-            wkr = getattr(self, attr, None)
-            if wkr is not None:
-                try:
-                    if hasattr(wkr, "stop"): wkr.stop()
-                    wkr.wait(200)
-                except Exception:
-                    pass
+        # Stop any running lightweight workers. Any QThread still running when the window
+        # is destroyed aborts the process in PySide6 ("QThread: Destroyed while thread is
+        # still running"), so EVERY worker attribute must be awaited here.
+        #
+        # Two-phase, and deliberately so. Previously each worker was told to stop and
+        # then given 200ms in turn — far too short for the ones that actually need it (a
+        # 126k-chart scan, or a table fetch with a 20s network timeout), while stacking
+        # per-worker timeouts would make closing take many seconds. So: signal them ALL
+        # first so they unwind in parallel, then wait against ONE shared deadline.
+        light = ("_thumb_worker", "_play_worker", "_scan", "_bga_probe",
+                 "_prefetch_worker", "_update_checker", "_tfetch", "_tfetch2")
+        workers = [getattr(self, a, None) for a in light]
+        for wkr in workers:
+            if wkr is None:
+                continue
+            try:
+                if hasattr(wkr, "stop"):
+                    wkr.stop()
+                elif hasattr(wkr, "_cancelled"):
+                    wkr._cancelled = True
+            except Exception:
+                pass
+        deadline = time.monotonic() + 3.0
+        for wkr in workers:
+            if wkr is None:
+                continue
+            try:
+                remain = int(max(0.0, deadline - time.monotonic()) * 1000)
+                wkr.wait(max(remain, 50))
+            except Exception:
+                pass
         for wkr in getattr(self, "_grid_workers", []):
             try:
                 wkr.stop(); wkr.wait(200)
@@ -3677,7 +4110,7 @@ class MainWindow(QMainWindow):
         self.disc_list.clear()
         blank = self._black_tile(None)
         jobs = []
-        for row, (rep, charts) in enumerate(self._disc_items):
+        for row, (rep, _charts) in enumerate(self._disc_items):
             title = rep.get("title", "?") or "?"
             artist = rep.get("artist", "") or ""
             full = title + ("\n" + artist if artist else "")
@@ -4073,26 +4506,53 @@ class MainWindow(QMainWindow):
     def _bind_tags(self, kind, index, tags):
         """Bind the tag fields to a queue/playlist song so edits save back."""
         self._sel_kind, self._sel_index = kind, index
+        # Remember WHICH song this is, not just which row. The queue is mutated while
+        # you browse (adding from Discovery, rows removed as charts finish rendering),
+        # and a stale row number makes the panel show — and tag edits write to — a
+        # different song than the one selected.
+        self._sel_path = None
+        if kind == "queue" and 0 <= index < len(self.queue):
+            self._sel_path = self.queue[index].get("path")
         self._set_tag_fields(tags, editable=True)
+
+    def _live_sel_index(self):
+        """Current queue row of the selected song, re-derived from its path so it can't
+        go stale. Returns None when there's no valid queue selection."""
+        if self._sel_kind != "queue" or self._sel_index is None:
+            return None
+        path = getattr(self, "_sel_path", None)
+        if path:
+            for i, q in enumerate(self.queue):
+                if q.get("path") == path:
+                    return i
+        i = self._sel_index
+        return i if 0 <= i < len(self.queue) else None
 
     def _unbind_tags(self, tags):
         self._sel_kind, self._sel_index = None, None
+        self._sel_path = None
         self._set_tag_fields(tags, editable=False)
 
-    def _on_tag_edit(self, _text=None):
-        if self._sel_kind == "queue" and self._sel_index is not None \
-                and 0 <= self._sel_index < len(self.queue):
-            q = self.queue[self._sel_index]
+    def _on_tag_edit(self, field=None):
+        """Auto-save a tag edit. `field` is the label of the box that changed (None =
+        unknown caller, treated as "could be anything" so behaviour is unchanged)."""
+        _qi = self._live_sel_index()
+        if _qi is not None:
+            q = self.queue[_qi]
             for label, key in self._tag_key_map.items():
                 q["tags"][key] = self.tag_fields[label].text()
-            # Album / Album Artist are session-wide: propagate to all queue items
-            self._session_album = self.tag_fields["Album"].text()
-            self._session_album_artist = self.tag_fields["Alb.Artist"].text()
-            for other in self.queue:
-                other["tags"]["Album"] = self._session_album
-                other["tags"]["AlbumArtist"] = self._session_album_artist
+            # Album / Album Artist are session-wide, so they propagate to every queue
+            # item — but ONLY when one of those two boxes is what changed. This used to
+            # run on every keystroke in ANY field, so typing a Title walked the whole
+            # queue once per character (noticeable with a few hundred items queued).
+            if field in (None, "Album", "Alb.Artist"):
+                self._session_album = self.tag_fields["Album"].text()
+                self._session_album_artist = self.tag_fields["Alb.Artist"].text()
+                for other in self.queue:
+                    other["tags"]["Album"] = self._session_album
+                    other["tags"]["AlbumArtist"] = self._session_album_artist
             q["tags_title"] = q["tags"].get("Title", "")
-            self._refresh_queue_row(self._sel_index)
+            self._refresh_queue_row(_qi)
         elif self._sel_kind == "playlist" and self._sel_index is not None:
             self._save_pl_entry_tags(self._sel_index)
 
@@ -4230,9 +4690,9 @@ class MainWindow(QMainWindow):
         self._song_art_idx = 0
         # if the selected queue item / playlist entry already has a chosen art, point at it
         chosen = None
-        if self._sel_kind == "queue" and self._sel_index is not None \
-                and 0 <= self._sel_index < len(self.queue):
-            chosen = self.queue[self._sel_index].get("art")
+        _qi = self._live_sel_index()
+        if _qi is not None:
+            chosen = self.queue[_qi].get("art")
         elif self._sel_kind == "playlist" and self._sel_index is not None:
             entries = self._playlists.get(self.pl_pick.currentText(), [])
             if 0 <= self._sel_index < len(entries) and isinstance(entries[self._sel_index], dict):
@@ -4308,9 +4768,9 @@ class MainWindow(QMainWindow):
         self._render_song_art()
 
     def _save_song_art_pick(self, path):
-        if self._sel_kind == "queue" and self._sel_index is not None \
-                and 0 <= self._sel_index < len(self.queue):
-            self.queue[self._sel_index]["art"] = path
+        _qi = self._live_sel_index()
+        if _qi is not None:
+            self.queue[_qi]["art"] = path
         elif self._sel_kind == "playlist" and self._sel_index is not None:
             name = self.pl_pick.currentText(); entries = self._playlists.get(name, [])
             if 0 <= self._sel_index < len(entries) and isinstance(entries[self._sel_index], dict):
@@ -4394,7 +4854,9 @@ class MainWindow(QMainWindow):
             n = len(self.queue)
             if n == 0:
                 return
-            i = max(0, min((self._sel_index or 0) + direction, n - 1))
+            # step from the song's CURRENT row, not the possibly-stale stored one
+            cur = self._live_sel_index()
+            i = max(0, min((cur if cur is not None else 0) + direction, n - 1))
             self.qtable.setCurrentItem(self.qtable.topLevelItem(i))
         elif self._sel_kind == "playlist":
             n = self.pltree.topLevelItemCount()
@@ -4514,7 +4976,10 @@ class MainWindow(QMainWindow):
         self.pl_render_btn.clicked.connect(self._pl_render)
         self.pl_bga_btn = QPushButton("Render All BGA in Playlist")
         self.pl_bga_btn.clicked.connect(self._pl_render_bga)
-        self.pl_bga_btn.setEnabled(bool(ffmpeg_path()))   # BGA video needs ffmpeg
+        # NOTE: deliberately NOT disabled when ffmpeg is missing. _pl_render_bga already
+        # checks and explains it, which the Queue tab does too — so both tabs behave the
+        # same. A build-time grey-out also goes stale the moment ffmpeg is installed
+        # while the app is running, and tells the user nothing about why.
         bbar.addWidget(self.pl_bga_btn)                    # left of the audio render button
         bbar.addWidget(self.pl_render_btn)                # rightmost
         lay.addLayout(bbar)
@@ -4710,10 +5175,12 @@ class MainWindow(QMainWindow):
         cover_cfg = ("__BLACK__" if self._art_black else (self._art_path or None))
         self._pl_worker = RenderWorker(items, out_dir, fmt, threads,
                                        cover_cfg, quality=quality, priority=priority)
-        prog = RenderProgressDialog(self, "Rendering Playlist", len(items))
+        prog = RenderProgressDialog(self, "Rendering Playlist", len(items),
+                                    progress_dir=self._pl_worker.progress_dir)
         self._pl_worker.log.connect(self.log)
         self._pl_worker.item_done.connect(lambda _row: prog.step())
         self._pl_worker.done.connect(prog.finish)
+        self._pl_worker.done.connect(self._pl_worker._cleanup_progress)
         prog.aborted.connect(self._pl_worker.abort)
         self._pl_worker.done.connect(lambda: self.pl_render_btn.setEnabled(True))
         self._pl_worker.start()
@@ -4746,22 +5213,38 @@ class MainWindow(QMainWindow):
         if not out_dir or not os.path.isdir(out_dir):
             QMessageBox.information(self, "No output folder", "Choose an output folder first."); return
         if not ffmpeg_path():
-            QMessageBox.information(self, "ffmpeg required", "BGA video export needs ffmpeg on PATH."); return
+            QMessageBox.information(
+                self, "ffmpeg required",
+                "BGA video export needs ffmpeg.\n\nInstall it and add it to PATH, or "
+                "place ffmpeg next to BMS Renderer."); return
         items = self._pl_collect_items()
         if not items:
             self.log("No owned songs in this playlist to render."); return
-        dlg = BGAExportDialog(self, default_threads=self.pl_threads.value())
+        # classify ONCE here; the worker reuses this instead of re-parsing every chart
+        counts, kinds = _bga_counts(items)
+        dlg = BGAExportDialog(self, default_threads=self.pl_threads.value(),
+                              bga_counts=counts)
         if dlg.exec() != QDialog.Accepted:
             return
         opts, priority, threads = dlg.options()
         self.pl_bga_btn.setEnabled(False)
+        # cover_cfg is REQUIRED here: charts with no BGA fall back to plain audio files,
+        # and without it they silently lose the assigned "Album art (whole queue)" cover.
+        # The Queue tab's BGA render always passed it; this one didn't — the same bug the
+        # playlist AUDIO render had before, in a newer entry point.
         self._pl_bga_worker = BGAWorker(items, out_dir, threads,
-                                        encode_opts=opts, priority=priority)
-        prog = RenderProgressDialog(self, "Rendering BGA Videos", len(items))
+                                        encode_opts=opts, priority=priority,
+                                        audio_fmt=self.pl_fmt.currentText(),
+                                        cover_cfg=("__BLACK__" if self._art_black
+                                                   else (self._art_path or None)),
+                                        bga_kinds=kinds)
+        prog = RenderProgressDialog(self, "Rendering BGA", len(items),
+                                    progress_dir=self._pl_bga_worker.progress_dir)
         self._pl_bga_worker.log.connect(self.log)
         self._pl_bga_worker.total_known.connect(prog.set_total)
         self._pl_bga_worker.item_done.connect(prog.set_value)
         self._pl_bga_worker.done.connect(prog.finish)
+        self._pl_bga_worker.done.connect(self._pl_bga_worker._cleanup_progress)
         prog.aborted.connect(self._pl_bga_worker.abort)
         self._pl_bga_worker.done.connect(lambda: self.pl_bga_btn.setEnabled(True))
         self._pl_bga_worker.start()
@@ -4974,7 +5457,9 @@ class MainWindow(QMainWindow):
                 s = idx.get(e.get("md5"))           # only owned charts have a match
                 if not s:
                     continue
-                child = _NumericTreeItem(self._row_vals(s))
+                # _row_vals carries the library tab's trailing "Charts" cell, which this
+                # tree has no column for — trim to this tree's own column count
+                child = _NumericTreeItem(self._row_vals(s)[:len(self.TCOLS)])
                 child.setData(0, Qt.UserRole, s["path"])
                 parent.addChild(child); owned_total += 1
                 self._tbl_play_order.append(s)
@@ -5120,7 +5605,9 @@ class MainWindow(QMainWindow):
                              "Alb.Artist": "AlbumArtist", "Genre": "Genre", "BPM": "BPM"}
         for k in ("Title", "Artist", "Album", "Alb.Artist", "Genre", "BPM"):
             e = QLineEdit(); self.tag_fields[k] = e; form.addRow(k + ":", e)
-            e.textEdited.connect(self._on_tag_edit)
+            # pass WHICH field changed, so only Album/Alb.Artist edits pay the
+            # whole-queue propagation (see _on_tag_edit)
+            e.textEdited.connect(lambda _t, key=k: self._on_tag_edit(key))
             # keep the hover tooltip showing the current full value as the user types
             e.textChanged.connect(lambda t, w=e: w.setToolTip(t))
             e.installEventFilter(self)
@@ -5198,8 +5685,9 @@ class MainWindow(QMainWindow):
         self._song_art_path = None; self._art_slider_sync = False
 
         art = QGroupBox("Album art (whole queue)"); av = QVBoxLayout(art)
-        art.setToolTip("An optional single cover for EVERY song in the render. Overrides the "
-                       "per-song 'Song folder art' above. Leave empty to use each song's own art.")
+        art.setToolTip("One cover applied to every song in the render. Overrides the "
+                       "per-song 'Song folder art' above; leave it empty to use each "
+                       "song's own art.")
         row = QHBoxLayout()
         choose = QPushButton("Choose…"); choose.clicked.connect(self._choose_album_art)
         wclear = QPushButton("Clear"); wclear.clicked.connect(self._clear_whole_queue_art)
@@ -5377,15 +5865,17 @@ class MainWindow(QMainWindow):
         # Custom Playlists tabs stay in sync (their bidirectional wiring still applies)
         self.q_fmt.setCurrentText(fmt)
         self.q_threads.setValue(threads)
-        self.q_render_btn.setEnabled(False); self._removed = 0
+        self.q_render_btn.setEnabled(False)
         cover_cfg = ("__BLACK__" if self._art_black else (self._art_path or None))
         self._worker = RenderWorker(list(self.queue), out_dir, fmt, threads,
                                     cover_cfg, quality=quality, priority=priority)
-        prog = RenderProgressDialog(self, "Rendering Queue", len(self.queue))
+        prog = RenderProgressDialog(self, "Rendering Queue", len(self.queue),
+                                    progress_dir=self._worker.progress_dir)
         self._worker.log.connect(self.log)
         self._worker.item_done.connect(lambda _row: prog.step())
-        self._worker.item_done.connect(self._on_item_done)
+        self._worker.item_rendered.connect(self._on_audio_item_rendered)
         self._worker.done.connect(prog.finish)
+        self._worker.done.connect(self._worker._cleanup_progress)
         self._worker.done.connect(lambda: self.q_render_btn.setEnabled(True))
         prog.aborted.connect(self._worker.abort)
         self._worker.start()
@@ -5461,10 +5951,22 @@ class MainWindow(QMainWindow):
             s = getattr(self, "_path_index", {}).get(q["path"], {})
             if s: self._show_info(s)
 
-    def _on_item_done(self, row):
-        idx = row - self._removed
-        if 0 <= idx < len(self.queue):
-            self.queue.pop(idx); self._removed += 1; self._refresh_queue()
+    def _on_audio_item_rendered(self, path):
+        """Remove a chart from the queue once it has rendered. Matches by PATH.
+
+        This used to subtract a running "removed" counter from the row the job started
+        at. That arithmetic only holds if jobs finish in queue order — but renders run in
+        a parallel process pool and complete out of order, so as soon as a later row
+        finished first the index went wrong: charts that rendered fine were left sitting
+        in the queue, and unrelated ones were removed in their place. (Concretely, with
+        4 charts finishing 3rd-1st-4th-2nd, two were leaked and one wrong row popped.)
+        Identity can't go stale, which is exactly why the BGA render already did this.
+        """
+        for i, it in enumerate(self.queue):
+            if it.get("path") == path:
+                self.queue.pop(i)
+                break
+        self._refresh_queue()
 
     def q_render_all_bga(self):
         if not self.queue:
@@ -5473,30 +5975,46 @@ class MainWindow(QMainWindow):
         if not out_dir or not os.path.isdir(out_dir):
             QMessageBox.information(self, "No output folder", "Choose an output folder first."); return
         if not ffmpeg_path():
-            QMessageBox.information(self, "ffmpeg required", "BGA video export needs ffmpeg on PATH."); return
-        dlg = BGAExportDialog(self, default_threads=self.q_threads.value())
+            QMessageBox.information(
+                self, "ffmpeg required",
+                "BGA video export needs ffmpeg.\n\nInstall it and add it to PATH, or "
+                "place ffmpeg next to BMS Renderer."); return
+        items = list(self.queue)
+        # classify ONCE here; the worker reuses this instead of re-parsing every chart
+        counts, kinds = _bga_counts(items)
+        dlg = BGAExportDialog(self, default_threads=self.q_threads.value(),
+                              bga_counts=counts)
         if dlg.exec() != QDialog.Accepted:
             return
         opts, priority, threads = dlg.options()
         self.q_bga_btn.setEnabled(False)
-        self._bga_worker = BGAWorker(list(self.queue), out_dir, threads,
-                                     encode_opts=opts, priority=priority)
-        prog = RenderProgressDialog(self, "Rendering BGA Videos", len(self.queue))
+        self._bga_worker = BGAWorker(items, out_dir, threads,
+                                     encode_opts=opts, priority=priority,
+                                     audio_fmt=self.q_fmt.currentText(),
+                                     cover_cfg=("__BLACK__" if self._art_black
+                                                else (self._art_path or None)),
+                                     bga_kinds=kinds)
+        prog = RenderProgressDialog(self, "Rendering BGA", len(items),
+                                    progress_dir=self._bga_worker.progress_dir)
         self._bga_worker.log.connect(self.log)
         self._bga_worker.total_known.connect(prog.set_total)
         self._bga_worker.item_done.connect(prog.set_value)
         self._bga_worker.item_rendered.connect(self._on_bga_item_rendered)
         self._bga_worker.done.connect(prog.finish)
+        self._bga_worker.done.connect(self._bga_worker._cleanup_progress)
         prog.aborted.connect(self._bga_worker.abort)
         self._bga_worker.done.connect(lambda: self.q_bga_btn.setEnabled(True))
         self._bga_worker.start()
         prog.exec()
 
     def _on_bga_item_rendered(self, path):
-        """Remove a chart from the queue once its BGA has rendered. Matches by PATH,
-        not row index: BGA jobs finish out of order (parallel `as_completed`) and
-        video/no-BGA charts are skipped entirely, so a positional counter would remove
-        the wrong rows. Removing by identity is order-independent and correct."""
+        """Remove a chart from the queue once it has rendered. Matches by PATH, not row
+        index: jobs finish out of order (parallel `as_completed`) and not every chart
+        produces a file (some are skipped), so a positional counter would remove the
+        wrong rows. Removing by identity is order-independent and correct.
+
+        Note this fires for audio-only fallback renders too, not just BGA videos — those
+        charts did produce an output file, so they leave the queue like any other."""
         for i, it in enumerate(self.queue):
             if it.get("path") == path:
                 self.queue.pop(i)

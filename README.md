@@ -4,7 +4,7 @@
 
 ## This software is entirely vibe-coded.
 
-I built this by exclusively iterating with Claude. I wrote no line of code.
+I built this by exclusively iterating with Claude. I wrote no line of code. I did however architect many different types of workflows, outlined and hand-picked the Python dependencies, hardened the software with in-depth testing using feedback from multiple users, as well as design the logo and overall layout.
 
 ## What is BMS Renderer?
 

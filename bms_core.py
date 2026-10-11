@@ -36,11 +36,6 @@ def _ensure_resampler():
         except Exception:
             _SOXR_OK = False
     return "soxr" if _SOXR_OK else None
-try:
-    from player import Player, SD_OK as _SD_OK
-except Exception:
-    Player = None
-    _SD_OK = False
 
 SR = 44100
 BMS_EXTS = (".bms", ".bme", ".bml", ".pms")
@@ -127,43 +122,76 @@ def pick_discovery_art(bms_path, rng=None):
         return rng.choice(bmps)
     return None
 
-# Embedded window icon (64px PNG, base64). No external file needed.
-_ICON_PNG_B64 = (
-    "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"
-)
-
 import shutil as _shutil
 def ffmpeg_path():
-    """Return the path to ffmpeg if available on PATH, else None.
-    OGG export uses ffmpeg to avoid libsndfile's unreliable Vorbis encoder."""
-    return _shutil.which("ffmpeg")
+    """Return the path to ffmpeg if available, else None.
+
+    Looks on PATH *and* beside the program itself, because binary releases ship
+    ffmpeg next to the .exe: shutil.which() only searches PATH (plus the current
+    working directory on Windows), so a bundled ffmpeg.exe would go undetected
+    whenever the working directory isn't the app folder — e.g. launched from a
+    shortcut with a different 'Start in', or elevated (which sets cwd to system32).
+    OGG export and all video/BGA export depend on this being found."""
+    found = _shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        for name in ("ffmpeg.exe", "ffmpeg"):
+            cand = os.path.join(program_dir(), name)
+            if os.path.isfile(cand):
+                return cand
+    except Exception:
+        pass
+    return None
+
+
+_NVENC_CACHE = {}
+
+
+def nvenc_available(encoder="h264_nvenc"):
+    """True if this machine can actually encode with the given NVENC encoder.
+
+    ffmpeg listing an encoder is NOT proof it works — most builds are compiled with
+    NVENC support regardless of whether an NVIDIA GPU is present. So we run a tiny
+    throwaway encode and check the exit code, which tests the hardware for real.
+
+    The probe frame is deliberately 1280x720 (the size BGA export actually uses).
+    NVENC enforces a MINIMUM resolution — Turing and later require a width of at least
+    145 for H.264, and HEVC is higher still — so probing with a small frame makes real,
+    working hardware report failure. That false negative is worse than no check at all,
+    since it locks the user out of a GPU they have.
+
+    Result is cached per-encoder; the probe runs once and takes a fraction of a second.
+    """
+    if encoder in _NVENC_CACHE:
+        return _NVENC_CACHE[encoder]
+    ok = False
+    ff = ffmpeg_path()
+    if ff:
+        try:
+            import subprocess
+            p = subprocess.run(
+                [ff, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "nullsrc=s=1280x720:d=0.1",
+                 "-c:v", encoder, "-f", "null", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+                **_no_window_kwargs())
+            ok = (p.returncode == 0)
+            _NVENC_CACHE[encoder + ":why"] = (
+                "" if ok else p.stderr.decode("utf-8", "replace").strip()[-300:])
+        except Exception as e:
+            ok = False
+            _NVENC_CACHE[encoder + ":why"] = f"{type(e).__name__}: {e}"
+    else:
+        _NVENC_CACHE[encoder + ":why"] = "ffmpeg not found"
+    _NVENC_CACHE[encoder] = ok
+    return ok
+
+
+def nvenc_reason(encoder="h264_nvenc"):
+    """Why the last nvenc_available() probe failed, for the log. Empty when it worked."""
+    return _NVENC_CACHE.get(encoder + ":why", "")
+
 
 def _no_window_kwargs():
     """Return subprocess kwargs that prevent a console window from flashing on
@@ -196,7 +224,7 @@ TABLES_PATH = os.path.join(program_dir(), "tables.json")
 PLAYLISTS_PATH = os.path.join(program_dir(), "playlists.json")   # legacy, migrated
 PLAYLISTS_DIR = os.path.join(program_dir(), "Playlists")
 
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 CHANGELOG = []
 
 # ============================================================================
@@ -249,6 +277,9 @@ def assert_safe_output(out_path):
 # ---------------------------------------------------------------- BMS parsing
 
 def b36(s):
+    """Base-36 -> int. The app's own decoding goes through _decode_id (which also
+    handles #BASE 62), but this stays as the plain documented helper and is exercised
+    directly by the test suite."""
     return int(s, 36)
 
 # BMS object IDs (the 2-char WAV/BPM/STOP slot ids and channel payload objects) are
@@ -277,9 +308,11 @@ def _decode_id(s, base):
         return b62(s)
     return int(s.upper(), 36)
 
-def read_bms_text(path):
-    with open_readonly(path) as f:
-        data = f.read()
+def decode_bms_bytes(data):
+    """Decode raw chart bytes, Shift-JIS first (the format's usual encoding) then
+    UTF-8/fallbacks. Split out of read_bms_text so a caller that already holds the raw
+    bytes — the library scanner, which needs them for the MD5 anyway — can decode them
+    without reading the file a second time."""
     for enc in ("shift_jis", "cp932", "utf-8", "latin-1"):
         try:
             return data.decode(enc)
@@ -287,15 +320,41 @@ def read_bms_text(path):
             continue
     return data.decode("latin-1", errors="replace")
 
+
+def read_bms_text(path):
+    with open_readonly(path) as f:
+        return decode_bms_bytes(f.read())
+
 # Pre-compiled patterns for the per-line parse loop (runs across every line of every
 # chart during a library scan — 126k+ charts). Python memoises compiled patterns
 # internally, but hoisting the hot ones is explicit and avoids the lookup entirely.
 _RE_CHANNEL = re.compile(r"(\d{3})([0-9A-Za-z]{2}):(.*)")
 _RE_INDEXED = re.compile(r"(WAV|BPM|STOP)([0-9A-Za-z]{2})\s+(.+)", re.IGNORECASE)
 _RE_HEADER  = re.compile(r"([A-Za-z]+)\s+(.+)")
+# BGA scanning (detect_bga / bga_timeline / video_bga_info all read the #BMPxx table)
+_RE_BMP     = re.compile(r"#BMP([0-9A-Za-z]{2})\s+(.+)", re.IGNORECASE)
+_RE_BGA_EV  = re.compile(r"#(\d{3})(04|07):(.*)")
+_RE_BASE62  = re.compile(r"(?im)^\s*#BASE\s+62\b")
 
 
-def parse_bms(path):
+def _bmp_table_from_text(text, base):
+    """Parse the #BMPxx id -> filename table out of already-read chart text. Shared by
+    bga_timeline and video_bga_info, which both need it and used to inline the same loop."""
+    table = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("#"):
+            continue
+        m = _RE_BMP.match(line)
+        if m:
+            try:
+                table[_decode_id(m.group(1), base)] = m.group(2).strip()
+            except ValueError:
+                pass
+    return table
+
+
+def parse_bms(path, text=None):
     """Parse a BMS chart. Returns a dict with:
       header   : generic #KEY value pairs (TITLE, ARTIST, BPM, ...)
       wav_table: wav-id(int) -> filename
@@ -337,11 +396,15 @@ def parse_bms(path):
         return (all(f["active"] for f in if_stack) and
                 all(s["active"] for s in sw_stack))
 
-    text = read_bms_text(path)
+    # `text` lets a caller that already read the file (the scanner, which needs the raw
+    # bytes for the MD5) hand the decoded chart straight in, instead of us reading the
+    # same file a second time. Omitted everywhere else, so behaviour is unchanged.
+    if text is None:
+        text = read_bms_text(path)
     # Object-ID numbering base: 36 (default) or 62 if the chart declares `#BASE 62`.
     # Pre-scanned up-front because ids are decoded during the loop but #BASE can sit
     # anywhere in the header. base62 makes lowercase ids distinct from uppercase.
-    base = 62 if re.search(r"(?im)^\s*#BASE\s+62\b", text) else 36
+    base = 62 if _RE_BASE62.search(text) else 36
 
     for line in text.splitlines():
         line = line.strip()
@@ -525,29 +588,32 @@ def detect_bga(path):
     the whole song; 'video' means at least one referenced BGA file is a video.
     """
     text = read_bms_text(path)
-    base = 62 if re.search(r"(?im)^\s*#BASE\s+62\b", text) else 36
+    base = 62 if _RE_BASE62.search(text) else 36
+    # ONE pass over the lines, collecting both the #BMPxx table and the ids actually
+    # placed on the BGA channels. This used to be two full passes over every line of
+    # the chart; since this runs once per queued chart (and the BGA dialog classifies a
+    # whole queue before it can open), the second walk was pure overhead. Ids are only
+    # collected here — they're resolved against bmp_table after the loop, so a #BMP def
+    # appearing below its first use is still handled exactly as before.
+    #
+    # Both the base layer (channel 04) AND the overlay/layer channel (07) are collected.
+    # Many charts keep a static/empty base and drive the actual animation on layer 07
+    # (composited over the base with black = transparent), so ignoring 07 would wrongly
+    # report 'no BGA' for those charts.
     bmp_table = {}            # id(int) -> filename (from #BMPxx)
+    base_objs = []            # bmp ids actually placed on the timeline (ch 04 + 07)
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("#"):
             continue
-        m = re.match(r"#BMP([0-9A-Za-z]{2})\s+(.+)", line, re.IGNORECASE)
+        m = _RE_BMP.match(line)
         if m:
             try:
                 bmp_table[_decode_id(m.group(1), base)] = m.group(2).strip()
             except ValueError:
                 pass
-    if not bmp_table:
-        return {"type": "none", "frames": 0, "images": 0}
-
-    # collect BGA events from the base layer (channel 04) AND the overlay/layer
-    # channel (07). Many charts keep a static/empty base and drive the actual
-    # animation on layer 07 (composited over the base with black = transparent),
-    # so ignoring 07 would wrongly report 'no BGA' for those charts.
-    base_objs = []            # list of bmp ids actually placed on the timeline
-    for line in text.splitlines():
-        line = line.strip()
-        mm = re.match(r"#(\d{3})(04|07):(.*)", line)
+            continue
+        mm = _RE_BGA_EV.match(line)
         if not mm:
             continue
         payload = mm.group(3).strip()
@@ -558,6 +624,8 @@ def detect_bga(path):
                     base_objs.append(_decode_id(obj, base))
                 except ValueError:
                     pass
+    if not bmp_table:
+        return {"type": "none", "frames": 0, "images": 0}
 
     # Split the placed events into image vs video by their referenced file. A chart
     # can define BOTH a video BGA and a full PNG fallback sequence (the video for
@@ -752,8 +820,7 @@ def _row_to_song(r):
     return {"path": path, "title": title or os.path.basename(path),
             "artist": artist or "", "genre": genre or "", "bpm": bpm or "",
             "mode": mode or "?", "notes": notes if notes is not None else "",
-            "random": bool(random), "md5": md5 or "",
-            "_sig": (size, mtime)}
+            "random": bool(random), "md5": md5 or ""}
 
 # Legacy JSON cache is no longer used; if present we just ignore/remove it.
 def _migrate_old_cache():
@@ -979,29 +1046,57 @@ def _scan_parse_one(item):
     CPU-bound (parse + note-count dominate; file I/O is a few percent). Returns the
     11-column row ready for INSERT OR REPLACE. Never raises: on any error it returns a
     minimal row so one bad chart can't abort the whole scan."""
+    import hashlib
     p, sig = item
+    # Read the chart ONCE. Both things we need from it — the MD5 of the raw bytes and
+    # the parsed contents — used to read the whole file independently (parse_bms via
+    # read_bms_text, then file_md5 again), i.e. two full reads of all 126k charts on a
+    # cold scan. The MD5 is over the same bytes either way, so the value is identical.
+    raw = None
     try:
-        d = parse_bms(p); h = d["header"]
+        with open_readonly(p) as f:
+            raw = f.read()
+    except Exception:
+        raw = None
+    try:
+        md5 = hashlib.md5(raw).hexdigest() if raw is not None else ""
+    except Exception:
+        md5 = ""
+    try:
+        if raw is None:
+            raise OSError("chart could not be read")
+        d = parse_bms(p, text=decode_bms_bytes(raw)); h = d["header"]
         notes = count_playable_notes(d)
         mode = detect_mode_from_bars(d)
         has_random = 1 if d.get("has_random", False) else 0
     except Exception:
         h, notes, mode, has_random = {}, 0, "?", 0
-    try:
-        md5 = file_md5(p)
-    except Exception:
-        md5 = ""
     return (p, sig[0], sig[1],
             h.get("TITLE", os.path.basename(p)),
             h.get("ARTIST", ""), h.get("GENRE", ""),
             h.get("BPM", ""), mode, notes, has_random, md5)
 
 
-def scan_library(root, conn, log=lambda s: None, progress=lambda d, t: None):
+def scan_library(root, conn, log=lambda s: None, progress=lambda d, t: None,
+                 should_stop=None):
     """Incrementally update the SQLite cache for `root`, then return
     (songs list, stats). Only changed/new charts are parsed; vanished charts
-    are deleted. `conn` is an open sqlite3 connection."""
+    are deleted. `conn` is an open sqlite3 connection.
+
+    `should_stop` is an optional callable() -> bool, polled at coarse points so a
+    scan can be cut short (the GUI calls it when the window is closing — a 126k-chart
+    scan otherwise has no way to be interrupted and the app is torn down around it).
+    Work already done is committed, so the next scan picks up where this one left off.
+    CRITICAL: an interrupted scan must NOT run the vanished-chart deletion — we only
+    walked part of the tree, so most of the cache would look 'missing' and be wiped."""
     reused = parsed = removed = 0
+    aborted = False
+
+    def _stop():
+        try:
+            return should_stop is not None and should_stop()
+        except Exception:
+            return False
 
     # existing signatures, read once: path -> (size, mtime)
     existing = {row[0]: (row[1], row[2])
@@ -1022,6 +1117,9 @@ def scan_library(root, conn, log=lambda s: None, progress=lambda d, t: None):
     to_parse = []                        # (path, sig) for new/modified charts only
     stack = [root]
     while stack:
+        if _stop():
+            aborted = True
+            break
         d = stack.pop()
         try:
             with os.scandir(d) as it:
@@ -1056,7 +1154,7 @@ def scan_library(root, conn, log=lambda s: None, progress=lambda d, t: None):
     # segfaults on teardown. Falls back to sequential parsing if a pool can't start
     # (frozen exe edge cases, single-core boxes, or too few charts to be worth it).
     upserts = []
-    use_pool = len(to_parse) >= 200
+    use_pool = (not aborted) and len(to_parse) >= 200
     pool_ok = False
     if use_pool:
         try:
@@ -1078,6 +1176,16 @@ def scan_library(root, conn, log=lambda s: None, progress=lambda d, t: None):
                             conn.commit(); upserts.clear()
                         if done % 500 == 0:
                             progress(reused + done, total)
+                            if _stop():
+                                aborted = True
+                                # ex.map() submits every task up front, so simply
+                                # breaking would leave the `with` block waiting on the
+                                # whole remaining scan. Cancel what hasn't started yet.
+                                try:
+                                    ex.shutdown(wait=False, cancel_futures=True)
+                                except TypeError:
+                                    ex.shutdown(wait=False)
+                                break
                 pool_ok = True
         except Exception as e:
             # any pool failure: fall back to sequential (never leave the scan broken)
@@ -1094,11 +1202,23 @@ def scan_library(root, conn, log=lambda s: None, progress=lambda d, t: None):
                 conn.commit(); upserts.clear()
             if i % 200 == 0:
                 progress(reused + i, total)
+                if _stop():
+                    aborted = True
+                    break
     if upserts:
         conn.executemany(
             "INSERT OR REPLACE INTO charts VALUES (?,?,?,?,?,?,?,?,?,?,?)", upserts)
         conn.commit()
     progress(total, total)
+
+    # Stopped early: everything parsed so far is committed (so the next scan resumes
+    # from here), but we must NOT run the deletion pass below — disk_set only holds the
+    # part of the tree we actually walked, so every unvisited chart would look vanished
+    # and be deleted from the cache.
+    if aborted:
+        log("Library scan stopped early — work done so far was saved.")
+        return [], {"reused": reused, "parsed": parsed, "removed": 0,
+                    "total": total, "aborted": True}
 
     # delete charts no longer on disk
     gone = [p for p in existing if p not in disk_set]
@@ -1136,7 +1256,9 @@ _dir_index._cache = {}
 
 
 def clear_dir_index_cache():
-    """Drop the cached directory listings (call if a song folder changed on disk)."""
+    """Drop the cached directory listings (call if a song folder changed on disk).
+    The app itself never needs this — a song folder is static during a render — but the
+    test suite relies on it to invalidate the cache between temp-folder fixtures."""
     _dir_index._cache.clear()
 
 
@@ -1234,7 +1356,7 @@ def _decode_clip(ap):
     audio = _resample_to_sr(audio, sr)
     return audio
 
-def render_bms(path, log=lambda s: None):
+def render_bms(path, log=lambda s: None, progress=None):
     """Faithful render following the bmx2wav timing model:
        - per-measure native resolution (lcm of all channel lengths in that bar)
        - sample position advances by (SR*60/bpm)/(resolution/4)*ratio per step
@@ -1392,11 +1514,20 @@ def render_bms(path, log=lambda s: None):
         # and it bounds open file handles). Warm renders are fast regardless.
         workers = min(16, max(4, (os.cpu_count() or 4) * 2), len(to_decode))
         with ThreadPoolExecutor(max_workers=workers) as ex:
+            _ndec = max(1, len(to_decode))
+            _idec = 0
             for wid, clip, err in ex.map(_decode_one, to_decode):
                 if err:
                     log(f"  could not read {err}")
                 else:
                     clips[wid] = clip
+                # progress: decoding keysounds is the dominant cost of a cold render,
+                # so give it the first half of the bar. One call per FILE (tens to a
+                # few hundred), never per sample — no measurable overhead.
+                _idec += 1
+                if progress:
+                    try: progress(0.05 + 0.50 * (_idec / _ndec))
+                    except Exception: pass
     if missing:
         log(f"  note: {missing} referenced sounds not found in folder")
 
@@ -1432,13 +1563,23 @@ def render_bms(path, log=lambda s: None):
                 last_end = e
     out = np.zeros((last_end + SR, 2), dtype=np.float32)  # +1s tail
 
-    for wid, positions in onsets.items():
+    _nmix = max(1, len(onsets))
+    for _imix, (wid, positions) in enumerate(onsets.items(), 1):
         clip = clips[wid]; clen = len(clip)
         for s in positions:
             out[s:s + clen] += clip[:len(out) - s]   # tail-safe slice add
+        # hooked on the OUTER loop only (per distinct clip), so the tight inner
+        # per-onset numpy add stays untouched
+        if progress:
+            try: progress(0.55 + 0.40 * (_imix / _nmix))
+            except Exception: pass
 
-    # gentle normalize if overlaps clipped
-    peak = float(np.abs(out).max()) if out.size else 0.0
+    # Gentle normalize if overlaps clipped.
+    # NOT np.abs(out).max(): that materialises a full float32 COPY of the whole mix just
+    # to find one number — ~85 MB for a 4-minute render, times every worker process in a
+    # parallel batch. Comparing the max against the negated min gives the identical value
+    # with no allocation (and measures faster).
+    peak = max(float(out.max()), -float(out.min())) if out.size else 0.0
     if peak > 1.0:
         out /= peak
     return out, header
@@ -1582,15 +1723,7 @@ def bga_timeline(path):
     folder = os.path.dirname(path)
 
     # #BMPxx table (re-read; parse_bms doesn't keep it)
-    bmp_table = {}
-    for line in read_bms_text(path).splitlines():
-        line = line.strip()
-        m = re.match(r"#BMP([0-9A-Za-z]{2})\s+(.+)", line, re.IGNORECASE)
-        if m:
-            try:
-                bmp_table[_decode_id(m.group(1), base)] = m.group(2).strip()
-            except ValueError:
-                pass
+    bmp_table = _bmp_table_from_text(read_bms_text(path), base)
 
     try:
         base_bpm = float(header.get("BPM", 120)) or 120.0
@@ -1679,7 +1812,7 @@ def bga_timeline(path):
         return res, miss
 
     out, missing = _resolve(events)
-    layer_out, layer_missing = _resolve(layer_events)
+    layer_out, _ = _resolve(layer_events)   # overlay misses aren't reported separately
     return out, total_seconds, missing, layer_out
 
 
@@ -1704,15 +1837,7 @@ def video_bga_info(path):
     base = d.get("base", 36)
     folder = os.path.dirname(path)
 
-    bmp_table = {}
-    for line in read_bms_text(path).splitlines():
-        line = line.strip()
-        m = re.match(r"#BMP([0-9A-Za-z]{2})\s+(.+)", line, re.IGNORECASE)
-        if m:
-            try:
-                bmp_table[_decode_id(m.group(1), base)] = m.group(2).strip()
-            except ValueError:
-                pass
+    bmp_table = _bmp_table_from_text(read_bms_text(path), base)
     if not bars or not bmp_table:
         return None
 
@@ -1834,6 +1959,60 @@ def _is_nvenc_args(args):
     return any(isinstance(a, str) and a.endswith("_nvenc") for a in args)
 
 
+def predicted_container(opts):
+    """Return the file extension the BGA export will actually produce ('.mp4' or
+    '.mkv') for a given options dict, so the dialog can show it BEFORE rendering.
+
+    Mirrors the rules in _bga_encode_args: only the all-default combination stays in
+    .mp4; every other codec pairing (and lossless remux) uses .mkv, which accepts any
+    combination — some pairings simply cannot be muxed into .mp4 at all (Ogg being the
+    obvious one), and others only work in recent mp4 extensions that not every player
+    supports."""
+    if not opts:
+        return ".mp4"
+    if opts.get("remux"):
+        return ".mkv"
+    if (opts.get("video", "default") == "default"
+            and opts.get("audio", "default") == "default"):
+        return ".mp4"
+    return ".mkv"
+
+
+class _Progress:
+    """Reports a 0..1 fraction for one render job so the GUI can show real progress.
+
+    Render jobs run in separate PROCESSES (ProcessPoolExecutor), so progress has to
+    cross a process boundary. Rather than wire up a manager/queue — which complicates
+    the spawn-based pool — each job just overwrites a tiny text file with its current
+    fraction, and the progress dialog polls those files on a timer. Cheap, spawn-safe,
+    and a job that never reports simply leaves its file absent (the dialog falls back
+    to per-item counting for those).
+
+    Writes are throttled so a fast inner loop doesn't hammer the disk."""
+
+    def __init__(self, path, step=0.004):
+        self.path = path
+        self.step = step
+        self._last = -1.0
+
+    def set(self, frac):
+        if not self.path:
+            return
+        frac = max(0.0, min(1.0, float(frac)))
+        if frac < 1.0 and (frac - self._last) < self.step:
+            return
+        self._last = frac
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                f.write(f"{frac:.4f}")
+        except OSError:
+            pass
+
+    def done(self):
+        self._last = -1.0
+        self.set(1.0)
+
+
 def _bga_encode_args(opts, out_path):
     """Translate a GUI encode-options dict into ffmpeg output args + the real output
     path (the container/extension may change). `opts` keys:
@@ -1850,14 +2029,12 @@ def _bga_encode_args(opts, out_path):
         return (["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
                  "-c:a", "aac", "-b:a", "192k", "-shortest"], out_path)
 
-    base, _ext = os.path.splitext(out_path)
+    base = os.path.splitext(out_path)[0]
     # any non-default combination uses MKV for maximum codec compatibility
     final_out = base + ".mkv"
 
     v = opts.get("video", "default")
-    a = opts.get("audio", "default")
     vbr = int(opts.get("vbitrate", 6000))
-    abr = int(opts.get("abitrate", 192))
 
     args = []
 
@@ -1885,28 +2062,33 @@ def _bga_encode_args(opts, out_path):
         args += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast"]
 
     # ---- audio ----
-    if a == "default":
-        args += ["-c:a", "aac", "-b:a", "192k"]
-    elif a == "wav":
-        args += ["-c:a", "pcm_s16le"]                       # uncompressed; no bitrate
-    elif a == "flac":
-        lvl = int(opts.get("flac_level", 8))
-        args += ["-c:a", "flac", "-compression_level", str(max(0, min(12, lvl)))]
-    elif a == "ogg":
-        args += ["-c:a", "libvorbis", "-q:a", str(_vorbis_q(abr))]   # VBR
-    elif a == "mp3":
-        args += ["-c:a", "libmp3lame", "-q:a", str(_lame_q(abr))]    # VBR
-    elif a == "aac":
-        args += ["-c:a", "aac", "-b:a", f"{abr}k"]
-    elif a == "opus":
-        # opus needs 48k; resampling is out of scope, so callers should not offer it
-        # at 44.1k — but if it arrives, fall back to aac so we never silently fail
-        args += ["-c:a", "aac", "-b:a", f"{abr}k"]
-    else:
-        args += ["-c:a", "aac", "-b:a", "192k"]
+    args += _audio_encode_args(opts)
 
     args += ["-shortest"]
     return (args, final_out)
+
+
+def _audio_encode_args(opts):
+    """ffmpeg audio args for an export options dict. Shared by the re-encode path and
+    the lossless-remux path so every audio codec behaves identically in both — remux
+    only copies the VIDEO stream, so the audio is freshly encoded either way and there
+    is no reason to restrict which codec it uses."""
+    opts = opts or {}
+    a = opts.get("audio", "default")
+    abr = int(opts.get("abitrate", 192))
+    if a == "wav":
+        return ["-c:a", "pcm_s16le"]                        # uncompressed; no bitrate
+    if a == "flac":
+        lvl = int(opts.get("flac_level", 8))
+        return ["-c:a", "flac", "-compression_level", str(max(0, min(12, lvl)))]
+    if a == "ogg":
+        return ["-c:a", "libvorbis", "-q:a", str(_vorbis_q(abr))]   # VBR
+    if a == "mp3":
+        return ["-c:a", "libmp3lame", "-q:a", str(_lame_q(abr))]    # VBR
+    if a == "aac":
+        return ["-c:a", "aac", "-b:a", f"{abr}k"]
+    # "default", "opus" (needs 48k — out of scope, never silently fail), anything else
+    return ["-c:a", "aac", "-b:a", "192k"]
 
 
 def _vorbis_q(kbps):
@@ -1940,7 +2122,11 @@ def render_bga_video_job(job):
     # scaled down as workers rise, keeping TOTAL pool cache memory roughly constant —
     # this is what prevents OOM when many workers each render a heavy BGA at once).
     n_workers = 1
-    if len(job) >= 8:
+    prog_path = None
+    if len(job) >= 9:
+        (in_path, out_path, ff, lib_root, fps, size, _opts,
+         n_workers, prog_path) = job[:9]
+    elif len(job) == 8:
         in_path, out_path, ff, lib_root, fps, size, _opts, n_workers = job[:8]
     elif len(job) == 7:
         in_path, out_path, ff, lib_root, fps, size, _opts = job[:7]
@@ -1948,7 +2134,9 @@ def render_bga_video_job(job):
         in_path, out_path, ff, lib_root, fps, size = job
         _opts = None
     n_workers = max(1, int(n_workers or 1))
+    prog = _Progress(prog_path)
     title = os.path.basename(in_path)
+    tmp_wav = None          # cleaned up in `finally` — see the note there
     try:
         import subprocess
         from PIL import Image
@@ -1964,7 +2152,7 @@ def render_bga_video_job(job):
         audio_seconds = len(audio) / SR
 
         # 2) BGA timeline (image events in seconds)
-        events, bga_seconds, _missing, layer_events = bga_timeline(in_path)
+        events, bga_seconds, _, layer_events = bga_timeline(in_path)
         duration = max(audio_seconds, bga_seconds)
 
         # 3) choose output dimensions from the BGA's OWN aspect ratio so the image
@@ -2115,9 +2303,10 @@ def render_bga_video_job(job):
               transparent colour, every non-black pixel is FULLY opaque. There is NO
               brightness ramp — a layer's own translucency is baked into its pixels and
               must not be re-derived from luminance, or bright opaque overlays (e.g.
-              the GOTTA CHAOS circles) wash out to faint ghosts. A small tolerance
-              (<=16) treats near-black as transparent to absorb JPEG/BMP noise without
-              keying out real dark content.
+              the GOTTA CHAOS circles) wash out to faint ghosts. The tolerance is TIGHT
+              (BLACK_TOL = 4, see below): only true/near-pure black keys out. Do NOT
+              loosen it — 16 was tried and wrongly erased dark-but-coloured content
+              (dark-brown hair sitting at max-channel ~10 vanished).
 
             The mask is built at SOURCE resolution then scaled together with the RGB,
             so edges anti-alias cleanly (no dark halo) without dimming interior pixels.
@@ -2185,8 +2374,11 @@ def render_bga_video_job(job):
                 # Alpha-composite the overlay (channel 07) over the base. PIL's
                 # alpha_composite is C-optimised (faster than a numpy float blend).
                 # The base RGBA image is cached per base so it isn't re-converted for
-                # every overlay paired with it. Overlay alpha is proportional to
-                # brightness (see _scaled_rgba) so edges blend instead of haloing.
+                # every overlay paired with it. Overlay alpha is the layer's own embedded
+                # alpha, or a BINARY black key when it has none (see _scaled_rgba) —
+                # explicitly NOT a brightness ramp; that approach was tried and reverted.
+                # The key is applied at source resolution and scaled with the RGB, which
+                # is what keeps edges clean instead of haloing.
                 comp = _base_rgba_img(base_path).copy()
                 comp.alpha_composite(_scaled_rgba(layer_path))
                 raw = comp.convert("RGB").tobytes()
@@ -2253,6 +2445,10 @@ def render_bga_video_job(job):
                     while li + 1 < len(lev) and lev[li + 1][0] <= t:
                         li += 1
                     proc.stdin.write(frame_for(ev[ei][1], lev[li][1]))
+                    # real progress: we know exactly how many frames we've fed. Cap at
+                    # 0.97 — ffmpeg still has to flush and finalise the file after the
+                    # last frame, so leave headroom rather than sitting at 100% early.
+                    prog.set(0.97 * (fno + 1) / total_frames)
             except BrokenPipeError:
                 pass                       # ffmpeg exited early; error captured below
             try:
@@ -2273,14 +2469,21 @@ def render_bga_video_job(job):
             enc_args, real_out = _bga_encode_args(sw_opts, out_path)
             out_path = real_out
             rc, err_txt = _run_encode(enc_args)
-        if os.path.exists(tmp_wav):
-            try: os.remove(tmp_wav)
-            except OSError: pass
         if rc != 0:
             raise RuntimeError("ffmpeg failed: " + err_txt[-300:])
+        prog.done()
         return (out_path, title, None)
     except Exception:
         return (out_path, title, traceback.format_exc())
+    finally:
+        # The scratch WAV must go whatever happened. It used to be deleted only on the
+        # paths that reach the end of the try, so any exception in between (a bad option
+        # value, a PIL failure, or a MemoryError while compositing a heavy chart in a big
+        # batch) orphaned a full-length WAV in the user's OUTPUT folder, where it just
+        # accumulated silently.
+        if tmp_wav and os.path.exists(tmp_wav):
+            try: os.remove(tmp_wav)
+            except OSError: pass
 
 
 def _ffmpeg_error_reason(stderr_text):
@@ -2306,6 +2509,55 @@ def _ffmpeg_error_reason(stderr_text):
     return "conversion failed"
 
 
+def _run_ffmpeg_progress(cmd, total_seconds, prog, scale=1.0, base=0.0):
+    """Run an ffmpeg command, translating its -progress stream into a 0..1 fraction.
+
+    ffmpeg reports the output timestamp it has reached (out_time_ms / out_time_us);
+    dividing by the known output duration gives true progress, which is what makes a
+    slow single-file encode (AV1 especially) show movement instead of sitting at 0%
+    until it finishes. Returns (returncode, stderr_text)."""
+    import subprocess
+    cmd = list(cmd)
+    # insert the progress flags right after the binary so they apply to the whole run
+    cmd[1:1] = ["-progress", "pipe:1", "-nostats"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         **_no_window_kwargs())
+    err_chunks = []
+    import threading as _th
+
+    def _drain_err():
+        try:
+            for line in iter(p.stderr.readline, b""):
+                err_chunks.append(line)
+        except Exception:
+            pass
+    t = _th.Thread(target=_drain_err, daemon=True)
+    t.start()
+    total = max(0.001, float(total_seconds or 0))
+    try:
+        for raw in iter(p.stdout.readline, b""):
+            line = raw.decode("utf-8", "replace").strip()
+            secs = None
+            if line.startswith("out_time_ms="):
+                v = line.split("=", 1)[1]
+                if v.isdigit():
+                    secs = int(v) / 1_000_000.0     # ffmpeg reports MICROseconds here
+            elif line.startswith("out_time_us="):
+                v = line.split("=", 1)[1]
+                if v.isdigit():
+                    secs = int(v) / 1_000_000.0
+            if secs is not None and prog is not None:
+                prog.set(base + scale * (secs / total))
+    except Exception:
+        pass
+    p.wait()
+    try:
+        t.join(timeout=1.0)
+    except Exception:
+        pass
+    return p.returncode, b"".join(err_chunks).decode("utf-8", "replace")
+
+
 def render_bga_muxed_job(job):
     """Render ONE chart whose BGA is a VIDEO by muxing that video with the freshly
     rendered audio (Phase 1: base video layer only; image overlays on ch07 are detected
@@ -2327,18 +2579,24 @@ def render_bga_muxed_job(job):
       • codec/quality/container come from the SAME encode-options dict the image-sequence
         BGA dialog produces (via _bga_encode_args), so it inherits all that flexibility.
     """
-    n_workers = 1
-    if len(job) >= 7:
-        in_path, out_path, ff, lib_root, size, _opts, n_workers = job[:7]
+    # `_n_workers` is unpacked but unused: this path has no image caches to size, so it
+    # carries the slot purely to keep the job-tuple shape identical to
+    # render_bga_video_job's. Kept (not dropped) so both job shapes stay interchangeable.
+    prog_path = None
+    if len(job) >= 8:
+        in_path, out_path, ff, lib_root, size, _opts, _n_workers, prog_path = job[:8]
+    elif len(job) == 7:
+        in_path, out_path, ff, lib_root, size, _opts, _n_workers = job[:7]
     elif len(job) == 6:
         in_path, out_path, ff, lib_root, size, _opts = job[:6]
     else:
         in_path, out_path, ff, lib_root, size = job[:5]
         _opts = None
+    prog = _Progress(prog_path)
     title = os.path.basename(in_path)
     warnings = []
+    tmp_wav = None          # cleaned up in `finally` — see the note there
     try:
-        import subprocess
         set_library_root(lib_root)
         assert_safe_output(out_path)
         if not ff:
@@ -2364,19 +2622,17 @@ def render_bga_muxed_job(job):
             # ---- LOSSLESS REMUX: copy the video stream verbatim, no re-encode ----
             # The video is delayed by its start offset with -itsoffset (a timestamp shift,
             # not a filter, so it stays a stream copy). Output is forced to .mkv, which
-            # accepts the source's native codec (wmv2/vc1/h264/…). Audio is written lossless
-            # (FLAC). We deliberately do NOT cap the video length or pad it: if the video is
+            # accepts the source's native codec (wmv2/vc1/h264/…). Audio uses whatever the
+            # dialog selected (_audio_encode_args) — remux only copies the VIDEO stream, so
+            # lossless video does NOT require lossless audio; an earlier version forced FLAC
+            # here and that restriction was deliberately removed as over-constraining.
+            # We deliberately do NOT cap the video length or pad it: if the video is
             # shorter than the song, its stream simply ends and players show black while the
             # audio continues — the "organic black tail" with zero re-encoding. If the video
             # is LONGER, it's trimmed to the song via -to on the output (cut at the nearest
             # copyable point; may differ by up to one keyframe, which is inherent to copy).
             mkv_out = os.path.splitext(out_path)[0] + ".mkv"
-            a_key = (_opts or {}).get("audio", "flac")
-            if a_key == "wav":
-                a_args = ["-c:a", "pcm_s16le"]
-            else:
-                a_args = ["-c:a", "flac", "-compression_level",
-                          str(int((_opts or {}).get("flac_level", 8)))]
+            a_args = _audio_encode_args(_opts)
             cmd = [ff, "-y", "-fflags", "+genpts"]
             if start_sec > 0.001:
                 cmd += ["-itsoffset", f"{start_sec:.3f}"]
@@ -2387,15 +2643,14 @@ def render_bga_muxed_job(job):
             cmd += a_args
             cmd += ["-to", f"{audio_seconds:.3f}"]       # don't run past the song
             cmd += [mkv_out]
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               **_no_window_kwargs())
-            if p.returncode == 0:
+            _rc, _err = _run_ffmpeg_progress(cmd, audio_seconds, prog)
+            if _rc == 0:
                 remux_ok = True
                 out_path = mkv_out
             else:
                 # the source couldn't be stream-copied into mkv — DON'T fail the chart;
                 # fall through to the re-encode path and note it in the log
-                reason = _ffmpeg_error_reason(p.stderr.decode("utf-8", "replace"))
+                reason = _ffmpeg_error_reason(_err)
                 warnings.append(f"lossless remux not possible ({reason}); "
                                 f"re-encoded this one instead")
                 try:
@@ -2429,6 +2684,13 @@ def render_bga_muxed_job(job):
                 enc_opts["remux"] = False
                 enc_opts.setdefault("video", "default")
             enc_args, real_out = _bga_encode_args(enc_opts, out_path)
+            if remux:
+                # We're here because a requested lossless remux failed. The dialog already
+                # told the user ".mkv" (predicted_container reports .mkv whenever remux is
+                # on), but clearing the remux flag can hand _bga_encode_args an all-default
+                # combination, which keeps .mp4 — so the file wouldn't match what was
+                # predicted. Honour the prediction.
+                real_out = os.path.splitext(real_out)[0] + ".mkv"
             out_path = real_out
 
             def _run(v_args, out):
@@ -2440,9 +2702,7 @@ def render_bga_muxed_job(job):
                        "-t", f"{audio_seconds:.3f}"]        # hard cap to song length
                 cmd += v_args
                 cmd += [out]                                # output path LAST
-                p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   **_no_window_kwargs())
-                return p.returncode, p.stderr.decode("utf-8", "replace")
+                return _run_ffmpeg_progress(cmd, audio_seconds, prog)
 
             rc, err_txt = _run(enc_args, out_path)
 
@@ -2457,33 +2717,42 @@ def render_bga_muxed_job(job):
                 rc, err_txt = _run(enc_args, out_path)
 
             if rc != 0:
-                if os.path.exists(tmp_wav):
-                    try: os.remove(tmp_wav)
-                    except OSError: pass
                 raise RuntimeError("ffmpeg failed: " + _ffmpeg_error_reason(err_txt))
 
-        if os.path.exists(tmp_wav):
-            try: os.remove(tmp_wav)
-            except OSError: pass
+        prog.done()
         return (out_path, title, None, warnings)
     except Exception:
         return (out_path, title, traceback.format_exc(), warnings)
+    finally:
+        # Always remove the scratch WAV — see the matching note in render_bga_video_job.
+        if tmp_wav and os.path.exists(tmp_wav):
+            try: os.remove(tmp_wav)
+            except OSError: pass
 
 
 def render_one_job(job):
     """Render ONE song to its final tagged file. Runs in a worker process.
-    `job` = (in_path, out_path, fmt, tags, cover_bytes, ffmpeg, library_root[, quality]).
+    `job` = (in_path, out_path, fmt, tags, cover_bytes, ffmpeg, library_root[, quality
+    [, progress_path]]).
     Returns (out_path, title, None) on success or (out_path, title, error_str)."""
-    if len(job) >= 8:
+    prog_path = None
+    if len(job) >= 9:
+        (in_path, out_path, fmt, tags, cover, ff, lib_root,
+         quality, prog_path) = job[:9]
+    elif len(job) == 8:
         in_path, out_path, fmt, tags, cover, ff, lib_root, quality = job[:8]
     else:
         in_path, out_path, fmt, tags, cover, ff, lib_root = job
         quality = None
     title = tags.get("Title", os.path.basename(in_path))
+    prog = _Progress(prog_path)
     try:
         set_library_root(lib_root)              # restore guard in this subprocess
         assert_safe_output(out_path)            # never write into the library
-        audio, _ = render_bms(in_path)
+        # synthesis is the bulk of an audio render, so it gets 0..0.90 of the bar;
+        # the encode/tag step that follows covers the rest
+        audio, _ = render_bms(in_path, progress=lambda f: prog.set(0.90 * f))
+        prog.set(0.92)
         assert_safe_output(out_path)
         if fmt == "OGG":
             _encode_ogg_ffmpeg(ff, audio, out_path, quality)
@@ -2494,6 +2763,7 @@ def render_one_job(job):
         else:
             sf.write(out_path, audio, SR, format=("WAV" if fmt == "WAV" else "FLAC"))
         write_tags_to_file(out_path, fmt, tags, cover)
+        prog.done()
         return (out_path, title, None)
     except Exception:
         return (out_path, title, traceback.format_exc())

@@ -46,14 +46,16 @@ class Player:
     # small enough that pause/seek still feel responsive.
     BLOCKSIZE = 4096
 
-    def __init__(self, samplerate=44100, on_finished=None):
+    def __init__(self, samplerate=44100):
+        # NOTE: there is deliberately no on_finished callback. The GUI polls
+        # poll_finished() from its transport timer instead, which keeps auto-advance on
+        # the Qt thread rather than on the feeder thread. (An unused on_finished
+        # argument used to sit here and was silently ignored by every caller.)
         self.sr = samplerate
-        self.on_finished = on_finished
         self._buf = None                    # current song: (N, 2) float32
         self._cursor = 0                    # next sample frame to output
         self._lock = threading.Lock()       # guards _buf/_cursor for seek vs feeder
         self._stream = None
-        self._stream_device = None
         self._state = "stopped"             # stopped | playing | paused
         self._finished_pending = False
         self._volume = 1.0
@@ -139,7 +141,6 @@ class Player:
         if self._stream is None:
             want = self._query_default_device()
             self._stream = self._open_stream(want)
-            self._stream_device = want
             self._stream.start()
 
     def _feed_loop(self):
@@ -273,7 +274,6 @@ class Player:
         want = self._query_default_device()
         try:
             self._stream = self._open_stream(want)
-            self._stream_device = want
             self._stream.start()
             with self._lock:
                 self._cursor = pos
